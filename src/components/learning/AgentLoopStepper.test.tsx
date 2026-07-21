@@ -26,6 +26,8 @@ describe('AgentLoopStepper', () => {
 
     expect(screen.getByRole('status').textContent).toContain('工具超时');
     expect(screen.getByTestId('loop-node-act').getAttribute('data-state')).toBe('fault');
+    expect(screen.getByTestId('recovery-card').textContent).toContain('STOP · RECOVER');
+    expect(screen.getByTestId('recovery-card').textContent).toContain('停止 · 恢复 · 复核');
     expect((screen.getByRole('button', { name: '下一步' }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

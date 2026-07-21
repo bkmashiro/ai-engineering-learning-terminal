@@ -1,48 +1,210 @@
 <figure class="system-stack">
-  <svg viewBox="0 0 760 430" role="img" aria-labelledby="stack-title stack-desc">
-    <title id="stack-title">AI工程系统分层图</title>
-    <desc id="stack-desc">从用户任务到Agent策略、模型与检索、工具协议、状态运行时和基础设施；评测与安全贯穿每一层。</desc>
-    <defs>
-      <marker id="stack-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" /></marker>
-    </defs>
-    <rect x="1" y="1" width="758" height="428" rx="18" class="system-stack__canvas" />
-    <text x="42" y="46" class="system-stack__kicker">SYSTEM VIEW · 从需求走到可验证运行</text>
+  <div
+    class="system-stack__frame"
+    role="group"
+    aria-labelledby="system-stack-title"
+    aria-describedby="system-stack-description"
+  >
+    <header class="system-stack__header">
+      <span class="system-stack__heading">SYSTEM VIEW</span>
+      <strong id="system-stack-title">从需求走到可验证运行</strong>
+    </header>
 
-    <g class="system-stack__layers">
-      <g transform="translate(42 70)"><rect width="550" height="48" rx="10" /><text x="18" y="29">01</text><text x="62" y="29">用户任务与交互</text><text x="530" y="29" text-anchor="end">输入 / 反馈</text></g>
-      <g transform="translate(54 126)"><rect width="538" height="48" rx="10" /><text x="18" y="29">02</text><text x="62" y="29">Agent策略与工作流</text><text x="518" y="29" text-anchor="end">决策 / 边界</text></g>
-      <g transform="translate(66 182)"><rect width="526" height="48" rx="10" /><text x="18" y="29">03</text><text x="62" y="29">模型、上下文与检索</text><text x="506" y="29" text-anchor="end">Token / 证据</text></g>
-      <g transform="translate(78 238)"><rect width="514" height="48" rx="10" /><text x="18" y="29">04</text><text x="62" y="29">工具与协议</text><text x="494" y="29" text-anchor="end">Schema / 权限</text></g>
-      <g transform="translate(90 294)"><rect width="502" height="48" rx="10" /><text x="18" y="29">05</text><text x="62" y="29">状态、运行时与队列</text><text x="482" y="29" text-anchor="end">取消 / 重试</text></g>
-      <g transform="translate(102 350)"><rect width="490" height="48" rx="10" /><text x="18" y="29">06</text><text x="62" y="29">存储、网络与基础设施</text><text x="470" y="29" text-anchor="end">持久化 / 部署</text></g>
-    </g>
+    <div class="system-stack__body">
+      <ol class="system-stack__layers" aria-label="AI工程系统分层">
+        <li style="--stack-inset: 0rem">
+          <span class="system-stack__index">01</span>
+          <strong>用户任务与交互</strong>
+          <span class="system-stack__scope">输入 / 反馈</span>
+        </li>
+        <li style="--stack-inset: .65rem">
+          <span class="system-stack__index">02</span>
+          <strong>Agent策略与工作流</strong>
+          <span class="system-stack__scope">决策 / 边界</span>
+        </li>
+        <li style="--stack-inset: 1.3rem">
+          <span class="system-stack__index">03</span>
+          <strong>模型、上下文与检索</strong>
+          <span class="system-stack__scope">Token / 证据</span>
+        </li>
+        <li style="--stack-inset: 1.95rem">
+          <span class="system-stack__index">04</span>
+          <strong>工具与协议</strong>
+          <span class="system-stack__scope">Schema / 权限</span>
+        </li>
+        <li style="--stack-inset: 2.6rem">
+          <span class="system-stack__index">05</span>
+          <strong>状态、运行时与队列</strong>
+          <span class="system-stack__scope">取消 / 重试</span>
+        </li>
+        <li style="--stack-inset: 3.25rem">
+          <span class="system-stack__index">06</span>
+          <strong>存储、网络与基础设施</strong>
+          <span class="system-stack__scope">持久化 / 部署</span>
+        </li>
+      </ol>
 
-    <g class="system-stack__rail">
-      <rect x="620" y="70" width="98" height="328" rx="14" />
-      <path d="M669 104 V359" marker-end="url(#stack-arrow)" />
-      <text x="669" y="97" text-anchor="middle">EVIDENCE</text>
-      <text x="669" y="213" text-anchor="middle" transform="rotate(-90 669 213)">评测 · 安全 · TRACE</text>
-      <text x="669" y="385" text-anchor="middle">REPLAY</text>
-    </g>
-  </svg>
-  <figcaption>课程不是从“调一个模型接口”开始，而是从输入、状态、边界和证据开始。</figcaption>
+      <aside class="system-stack__rail" aria-label="贯穿所有层的验证能力">
+        <span>EVIDENCE</span>
+        <strong>评测 · 安全 · TRACE</strong>
+        <span>REPLAY</span>
+      </aside>
+    </div>
+  </div>
+
+  <figcaption id="system-stack-description">
+    课程不是从“调一个模型接口”开始，而是从输入、状态、边界和证据开始。
+  </figcaption>
 </figure>
 
 <style>
-  .system-stack { margin: 1.2rem 0 2rem; }
-  .system-stack svg { display: block; width: 100%; height: auto; }
-  .system-stack__canvas { fill: var(--sl-color-gray-7); stroke: var(--sl-color-gray-5); }
-  .system-stack__kicker { fill: var(--sl-color-gray-2); font-family: var(--sl-font-mono); font-size: 13px; font-weight: 700; letter-spacing: .05em; }
-  .system-stack__layers rect { fill: var(--sl-color-bg); stroke: var(--sl-color-gray-5); stroke-width: 1.5; }
-  .system-stack__layers g:nth-child(2) rect,
-  .system-stack__layers g:nth-child(4) rect,
-  .system-stack__layers g:nth-child(6) rect { fill: color-mix(in srgb, var(--sl-color-accent) 5%, var(--sl-color-bg)); }
-  .system-stack__layers text { fill: var(--sl-color-text); font-size: 14px; font-weight: 650; }
-  .system-stack__layers text:first-of-type { fill: var(--sl-color-accent-high); font-family: var(--sl-font-mono); font-size: 12px; }
-  .system-stack__layers text:last-of-type { fill: var(--sl-color-gray-2); font-family: var(--sl-font-mono); font-size: 11px; }
-  .system-stack__rail rect { fill: color-mix(in srgb, #16845c 9%, var(--sl-color-bg)); stroke: #16845c; stroke-width: 1.5; stroke-dasharray: 6 5; }
-  .system-stack__rail path { fill: none; stroke: #16845c; stroke-width: 2; }
-  .system-stack__rail marker path { fill: #16845c; }
-  .system-stack__rail text { fill: color-mix(in srgb, #16845c 78%, var(--sl-color-text)); font-family: var(--sl-font-mono); font-size: 11px; font-weight: 750; letter-spacing: .05em; }
-  .system-stack figcaption { margin-top: .6rem; color: var(--sl-color-gray-2); font-size: .78rem; text-align: center; }
+  .system-stack {
+    margin: 1.2rem 0 2rem;
+  }
+
+  .system-stack__frame {
+    padding: clamp(1rem, 3vw, 1.6rem);
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 1rem;
+    background: var(--sl-color-gray-7);
+  }
+
+  .system-stack__header {
+    display: flex;
+    align-items: baseline;
+    gap: .7rem;
+    margin-bottom: 1rem;
+  }
+
+  .system-stack__heading {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 1rem;
+    font-weight: 800;
+    letter-spacing: .04em;
+  }
+
+  .system-stack__header strong {
+    color: var(--sl-color-text);
+    font-size: 1rem;
+    font-weight: 700;
+  }
+
+  .system-stack__body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 8.5rem;
+    gap: 1rem;
+  }
+
+  .system-stack__layers {
+    display: grid;
+    gap: .55rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .system-stack__layers li {
+    display: grid;
+    grid-template-columns: 2rem minmax(0, 1fr) auto;
+    align-items: center;
+    gap: .75rem;
+    min-height: 3.25rem;
+    margin-left: var(--stack-inset);
+    padding: .7rem .9rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: .65rem;
+    background: var(--sl-color-bg);
+  }
+
+  .system-stack__layers li:nth-child(even) {
+    background: color-mix(in srgb, var(--sl-color-accent) 5%, var(--sl-color-bg));
+  }
+
+  .system-stack__index {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: .85rem;
+    font-weight: 800;
+  }
+
+  .system-stack__layers strong {
+    color: var(--sl-color-text);
+    font-size: 1rem;
+    line-height: 1.35;
+  }
+
+  .system-stack__scope {
+    color: var(--sl-color-gray-2);
+    font-family: var(--sl-font-mono);
+    font-size: .9rem;
+    font-weight: 650;
+    white-space: nowrap;
+  }
+
+  .system-stack__rail {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 1rem .75rem;
+    border: 1.5px dashed #16845c;
+    border-radius: .8rem;
+    color: color-mix(in srgb, #16845c 78%, var(--sl-color-text));
+    background: color-mix(in srgb, #16845c 9%, var(--sl-color-bg));
+    text-align: center;
+  }
+
+  .system-stack__rail span {
+    font-family: var(--sl-font-mono);
+    font-size: .85rem;
+    font-weight: 800;
+    letter-spacing: .04em;
+  }
+
+  .system-stack__rail strong {
+    max-width: 6.5rem;
+    font-size: 1rem;
+    line-height: 1.7;
+  }
+
+  .system-stack figcaption {
+    margin-top: .7rem;
+    color: var(--sl-color-gray-2);
+    font-size: .9rem;
+    text-align: center;
+  }
+
+  @media (max-width: 42rem) {
+    .system-stack__header {
+      display: grid;
+      gap: .15rem;
+    }
+
+    .system-stack__body {
+      grid-template-columns: 1fr;
+    }
+
+    .system-stack__layers li {
+      grid-template-columns: 1.8rem minmax(0, 1fr);
+      margin-left: 0;
+    }
+
+    .system-stack__scope {
+      grid-column: 2;
+      white-space: normal;
+    }
+
+    .system-stack__rail {
+      flex-direction: row;
+      text-align: left;
+    }
+
+    .system-stack__rail strong {
+      max-width: none;
+      line-height: 1.4;
+    }
+  }
 </style>

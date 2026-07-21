@@ -96,7 +96,7 @@ const faults: Partial<Record<Scenario, { at: number; message: string; recovery: 
 
 function AgentLoopDiagram({ current, trace, fault }: { current: number; trace: number[]; fault: string | null }) {
   const currentStep = steps[current];
-  const recoveryPath = `M${currentStep.x} ${currentStep.y + 30} C${currentStep.x} 360 400 380 390 397`;
+  const recoveryPath = `M${currentStep.x} ${currentStep.y + 30} C${currentStep.x} 360 396 380 380 398`;
 
   return (
     <div class="loop-lab__diagram">
@@ -176,10 +176,11 @@ function AgentLoopDiagram({ current, trace, fault }: { current: number; trace: n
         })}
 
         {fault ? (
-          <g class="loop-lab__recovery-route">
+          <g class="loop-lab__recovery-route" data-testid="recovery-card">
             <path d={recoveryPath} markerEnd="url(#loop-arrow)" />
-            <rect x="390" y="375" width="188" height="44" rx="12" />
-            <text x="484" y="402" textAnchor="middle">STOP · RECOVER · REVIEW</text>
+            <rect x="380" y="369" width="208" height="56" rx="12" />
+            <text x="484" y="392" textAnchor="middle">STOP · RECOVER</text>
+            <text x="484" y="411" textAnchor="middle" class="loop-lab__recovery-subtitle">停止 · 恢复 · 复核</text>
           </g>
         ) : (
           <g class="loop-lab__success-route">

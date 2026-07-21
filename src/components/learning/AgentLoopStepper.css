@@ -410,6 +410,11 @@
   letter-spacing: 0.04em;
 }
 
+.loop-lab__recovery-route .loop-lab__recovery-subtitle {
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+
 @keyframes loop-flow {
   to { stroke-dashoffset: -32; }
 }
