@@ -1,0 +1,12 @@
+---
+import { glossary } from '../../data/glossary';
+---
+
+<div class="source-list">
+  {glossary.map((entry) => (
+    <article class="source-card" id={entry.english.split(',')[0].toLowerCase().replaceAll(' ', '-')}>
+      <h3>{entry.term} <small>· {entry.english}</small></h3>
+      <p>{entry.definition}</p>
+    </article>
+  ))}
+</div>

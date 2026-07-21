@@ -1,0 +1,22 @@
+---
+const stages = [
+  ['0', '可复现学习', '输入、输出、状态和证据'],
+  ['1', '软件与系统', '网络、并发、状态与存储'],
+  ['2', '机器学习', '数据、指标与实验'],
+  ['3', 'LLM 应用', 'Token、推理与检索'],
+  ['4', 'Agent 工程', '循环、工具与记忆'],
+  ['5', '安全与评测', '权限、回放与故障恢复'],
+  ['6', '综合项目', '生产约束下连接所有层'],
+  ['7', '方向分支', '最后再选择性深入'],
+];
+---
+
+<div class="stage-preview">
+  {stages.map(([number, title, description]) => (
+    <article class="stage-card">
+      <span>STAGE {number}</span>
+      <strong>{title}</strong>
+      <p>{description}</p>
+    </article>
+  ))}
+</div>

@@ -1,40 +1,59 @@
 ---
-title: Welcome to Starlight
-description: Get started building your docs site with Starlight.
-template: splash # Remove or comment out this line to display the site sidebar on this page.
-hero:
-  tagline: Congrats on setting up a new Starlight project!
-  image:
-    file: ../../assets/houston.webp
-  actions:
-    - text: Example Guide
-      link: /guides/example/
-      icon: right-arrow
-    - text: Read the Starlight docs
-      link: https://starlight.astro.build
-      icon: external
-      variant: minimal
+title: AI 工程学习终端
+description: 从共同软件底座到 Agent 工程与就业方向的公开学习路线。
+moduleId: home
+stage: reproducibility
+prerequisites: []
+outcomes:
+  - 理解本站的学习顺序
+  - 找到第一个可执行模块
+estimatedMinutes: 5
+difficulty: intro
+careerDirections: []
+sourceIds:
+  - curriculum-method
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
 ---
 
-import { Card, CardGrid } from '@astrojs/starlight/components';
+import StagePreview from '../../components/content/StagePreview.astro';
 
-## Next steps
+<section class="site-intro">
+  <p class="site-intro__eyebrow">AI ENGINEERING · LEARN BY BUILDING</p>
+  <h1>先建立共同底座，再选择方向。</h1>
+  <p class="site-intro__lead">
+    一套由浅入深的 AI 工程公开课程。每个主题都从心智模型开始，通过图示、最小实现、故障注入和验收标准走到真正可解释的能力。
+  </p>
+  <div class="site-actions">
+    <a class="site-action" href="/roadmap/">查看完整路线</a>
+    <a class="site-action is-secondary" href="/agent/workflow-vs-agent/">开始第一课</a>
+  </div>
+</section>
 
-<CardGrid stagger>
-	<Card title="Update content" icon="pencil">
-		Edit `src/content/docs/index.mdx` to see this page change.
-	</Card>
-	<Card title="Change page layout" icon="document">
-		Delete `template: splash` in `src/content/docs/index.mdx` to display a
-		sidebar on this page.
-	</Card>
-	<Card title="Add new content" icon="add-document">
-		Add Markdown or MDX files to `src/content/docs` to create new pages.
-	</Card>
-	<Card title="Configure your site" icon="setting">
-		Edit your `sidebar` and other config in `astro.config.mjs`.
-	</Card>
-	<Card title="Read the docs" icon="open-book">
-		Learn more in [the Starlight Docs](https://starlight.astro.build/).
-	</Card>
-</CardGrid>
+## 学习不是“看完”，而是完成一次闭环
+
+<ol class="learning-cycle">
+  <li><strong>理解</strong><span>建立最小准确心智模型</span></li>
+  <li><strong>看见</strong><span>用图示观察状态与边界</span></li>
+  <li><strong>动手</strong><span>实现或操作最小实验</span></li>
+  <li><strong>验证</strong><span>注入失败并检查恢复</span></li>
+  <li><strong>讲清</strong><span>解释取舍和适用边界</span></li>
+</ol>
+
+## 从主干到分支
+
+所有方向共享前面的软件、机器学习、LLM 和可靠性基础。就业方向只在最后分叉，避免一开始就把知识切成互不连通的岗位清单。
+
+<StagePreview />
+
+## 第一版已经可以学什么？
+
+### Workflow 与 Agent
+
+判断一个任务究竟需要固定流程，还是需要模型在受控边界内决定下一步。课程包含一个**完全本地、确定性的 Agent Loop 故障注入实验**。
+
+[进入第一课 →](/agent/workflow-vs-agent/)
+
+## 公开边界
+
+本站只发布原创中文解释、图示、实验和必要来源署名，不包含真实投递记录、特定岗位资料、私人项目数据或联系方式。站点无需账户、后端和第三方追踪。

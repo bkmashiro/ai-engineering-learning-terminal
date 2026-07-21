@@ -6,11 +6,13 @@ dist/
 # dependencies
 node_modules/
 
-# logs
+# logs and test artifacts
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+playwright-report/
+test-results/
 
 
 # environment variables

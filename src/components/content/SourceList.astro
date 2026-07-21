@@ -1,0 +1,18 @@
+---
+import { publicSources } from '../../data/sources';
+---
+
+<div class="source-list">
+  {publicSources.map((source) => (
+    <article class="source-card" id={source.id}>
+      <h3><a href={source.canonicalUrl}>{source.title}</a></h3>
+      <p>{source.publisher} · {source.licenseNote}</p>
+      <p class="source-card__meta">
+        <span>语言 {source.sourceLocale}</span>
+        {source.version && <span>版本 {source.version}</span>}
+        <span>核验 {source.accessedAt}</span>
+        <span>用途 {source.usage}</span>
+      </p>
+    </article>
+  ))}
+</div>

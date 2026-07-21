@@ -1,0 +1,112 @@
+---
+title: Workflow 与 Agent
+description: 判断何时使用固定工作流，何时需要受控 Agent，并通过故障注入理解执行循环。
+moduleId: workflow-vs-agent
+stage: agent-core
+prerequisites:
+  - network-streaming
+  - llm-foundations
+outcomes:
+  - 区分 Workflow 与 Agent
+  - 设计有限步、可取消的 Agent Loop
+  - 在工具故障或状态重复时正确停止
+estimatedMinutes: 35
+difficulty: core
+careerDirections:
+  - agent-applications
+  - agent-runtime-evaluation
+  - ai-backend-reliability
+sourceIds:
+  - building-effective-agents
+  - owasp-agent-security
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import WorkflowComparison from '../../../components/content/WorkflowComparison.astro';
+import { AgentLoopStepper } from '../../../components/learning/AgentLoopStepper';
+import { KnowledgeCheck } from '../../../components/learning/KnowledgeCheck';
+
+<Aside type="tip" title="先记住这一句">
+**Workflow 由代码决定路径；Agent 由模型选择下一项动作，但程序必须守住权限、预算和终止条件。**
+</Aside>
+
+## 1. 为什么先问“需不需要 Agent”
+
+Agent 会引入更多不确定性：模型可能选错工具、参数不合法、工具超时、结果无法验证，或者状态一直重复。若一个任务的步骤本来就清楚，固定 Workflow 通常更容易测试、审计和恢复。
+
+<WorkflowComparison />
+
+| 问题 | 更偏 Workflow | 更偏受控 Agent |
+| --- | --- | --- |
+| 步骤是否已知？ | 大部分已知 | 需要根据现场状态选择 |
+| 是否允许探索？ | 很少 | 在明确预算内允许 |
+| 错误能否验证？ | 规则明确 | 需要工具结果与外部检查 |
+| 副作用风险？ | 高风险时优先固定 | 必须加权限、确认和审计 |
+| 终止条件？ | 程序直接定义 | 程序定义预算，模型不能自行取消边界 |
+
+## 2. 一个最小但可靠的 Agent Loop
+
+<Steps>
+1. <strong>Observe：</strong>读取任务、公开状态和工具描述。
+2. <strong>Decide：</strong>模型只返回一个候选动作及结构化参数。
+3. <strong>Act：</strong>程序检查 Schema、权限、幂等键和超时后执行。
+4. <strong>Validate：</strong>程序验证结果，选择接受、重试、降级或停止。
+5. <strong>Update：</strong>写入 trace 和有限状态，检查目标、预算与循环保护。
+</Steps>
+
+```ts title="runner.ts"
+for (let step = 0; step < maxSteps; step += 1) {
+  const proposal = await chooseAction(publicState, allowedTools);
+  const checked = validateProposal(proposal);
+  const result = await executeWithTimeout(checked);
+  const verdict = validateResult(result);
+
+  trace.append({ step, proposal: checked, result, verdict });
+  if (verdict.kind === 'complete') return verdict.output;
+  if (verdict.kind === 'stop') throw new ControlledStop(verdict.reason);
+  publicState = updateState(publicState, verdict);
+}
+throw new ControlledStop('step-budget-exhausted');
+```
+
+<div class="boundary-note">
+<strong>关键边界：</strong>模型可以提出动作，但不能绕过 `allowedTools`、Schema、权限确认、超时、幂等和最大步数。
+</div>
+
+## 3. 动手：给循环注入故障
+
+下面的组件不会调用真实模型或 API。它使用固定状态机模拟四种路径，因此每次操作都可复现。
+
+<AgentLoopStepper client:load />
+
+### 观察重点
+
+- 工具超时时，当前动作必须停止，而不是假装成功；
+- Schema 不合法时，结果不能进入下一状态；
+- 状态重复时，要触发循环保护；
+- trace 记录的是公开决策、工具调用和验证结果，不是模型的私有推理过程。
+
+## 4. 自己实现一次
+
+实现一个不调用真实服务的 TypeScript Runner：
+
+1. 工具只有 `lookup` 与 `saveDraft`；
+2. 每个动作先过 Schema 校验；
+3. `saveDraft` 必须接受幂等键；
+4. 最大执行五步；
+5. 连续两次状态摘要相同就停止；
+6. 输出 trace JSON 和分类错误。
+
+<strong>验收：</strong>正常路径、超时、非法结果和循环四个测试都通过，并且没有未捕获 Promise rejection。
+
+<KnowledgeCheck client:load />
+
+## 5. 下一步
+
+下一模块会把工具契约、状态、短期记忆和持久记忆拆开，避免把“把所有历史塞进上下文”误认为记忆系统。
+
+- 回到[完整学习路线](/roadmap/)
+- 查看[就业方向映射](/directions/)
+- 检查[公开来源](/sources/)

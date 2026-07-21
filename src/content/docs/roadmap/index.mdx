@@ -1,0 +1,43 @@
+---
+title: 完整学习路线
+description: 共同主干优先、最后才分就业方向的 AI 工程学习 DAG。
+moduleId: roadmap
+stage: reproducibility
+prerequisites: []
+outcomes:
+  - 理解各阶段依赖关系
+  - 根据方向筛选但不跳过共同底座
+estimatedMinutes: 12
+difficulty: intro
+careerDirections: []
+sourceIds:
+  - curriculum-method
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { RoadmapGraph } from '../../../components/learning/RoadmapGraph';
+
+这不是按岗位堆出来的题目目录，而是一张能力依赖图。先建立可复现的软件与 AI 基础，再进入 Agent、安全和生产化，最后才根据就业方向选择性深入。
+
+<RoadmapGraph client:visible />
+
+## 如何使用这张路线
+
+1. **先看 Gate，不先看篇数。** 能完成阶段产物，就可以继续。
+2. **允许通过前置测验跳过熟悉主题。** 但要保留可验证证据。
+3. **方向筛选不是删课。** 路线会保留该方向真正依赖的共同节点。
+4. **“计划中”不代表要等待。** 当前可学习节点会直接链接到课程，其余节点逐步公开。
+
+## 每一阶段的完成标准
+
+| 阶段 | 通过条件 |
+| --- | --- |
+| 可复现学习 | 能记录输入、输出、状态、失败和来源 |
+| 软件与系统 | 能解释并实现取消、重试、幂等和持久状态 |
+| 机器学习 | 能发现数据泄漏并做误差分析 |
+| LLM 应用 | 能测量 Token、延迟、检索和答案证据 |
+| Agent 工程 | 能实现有限步、可取消、可审计的执行循环 |
+| 安全与评测 | 能用攻击用例和 trace 证明边界 |
+| 综合项目 | 能说明质量、延迟、成本和风险取舍 |
+| 方向分支 | 能产出一个有测量、有失败边界的专项作品 |

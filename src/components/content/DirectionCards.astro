@@ -1,0 +1,16 @@
+---
+import { careerDirections } from '../../data/directions';
+---
+
+<div class="direction-grid">
+  {careerDirections.map((direction) => (
+    <article class="direction-card" id={direction.id}>
+      <h3>{direction.title}</h3>
+      <p>{direction.summary}</p>
+      <ul>
+        {direction.dailyWork.map((item) => <li>{item}</li>)}
+      </ul>
+      <div class="direction-card__evidence"><strong>建议证据：</strong>{direction.evidence}</div>
+    </article>
+  ))}
+</div>
