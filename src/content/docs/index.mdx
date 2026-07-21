@@ -14,15 +14,19 @@ sourceIds:
   - curriculum-method
 sourceLocale: zh-CN
 lastReviewed: 2026-07-21
+head:
+  - tag: title
+    content: AI 工程学习终端
 ---
 
 import StagePreview from '../../components/content/StagePreview.astro';
+import SystemStackDiagram from '../../components/content/SystemStackDiagram.astro';
 
 <section class="site-intro">
   <p class="site-intro__eyebrow">AI ENGINEERING · LEARN BY BUILDING</p>
-  <h1>先建立共同底座，再选择方向。</h1>
+  <h2>先建立共同底座，再选择方向。</h2>
   <p class="site-intro__lead">
-    一套由浅入深的 AI 工程公开课程。每个主题都从心智模型开始，通过图示、最小实现、故障注入和验收标准走到真正可解释的能力。
+    一套由浅入深的 AI 工程公开课程。每个主题先说明问题和边界，再看图、写最小实现、注入故障，最后按验收标准检查结果。
   </p>
   <div class="site-actions">
     <a class="site-action" href="/roadmap/">查看完整路线</a>
@@ -44,13 +48,17 @@ import StagePreview from '../../components/content/StagePreview.astro';
 
 所有方向共享前面的软件、机器学习、LLM 和可靠性基础。就业方向只在最后分叉，避免一开始就把知识切成互不连通的岗位清单。
 
+<SystemStackDiagram />
+
 <StagePreview />
 
 ## 第一版已经可以学什么？
 
-### Workflow 与 Agent
+### 当前可学习模块
 
-判断一个任务究竟需要固定流程，还是需要模型在受控边界内决定下一步。课程包含一个**完全本地、确定性的 Agent Loop 故障注入实验**。
+- [网络、流式与取消](/foundations/software-systems/network-streaming/)：请求、SSE、超时、取消与重连。
+- [Token、Attention与上下文](/foundations/llm/)：Token预算、Attention和结构化输出。
+- [Workflow与Agent](/agent/workflow-vs-agent/)：架构选择与确定性的Agent Loop故障注入实验。
 
 [进入第一课 →](/agent/workflow-vs-agent/)
 

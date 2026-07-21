@@ -1,0 +1,81 @@
+---
+title: 网络、流式与取消
+description: 用一张请求生命周期图理解HTTP请求、SSE、超时、取消与重连。
+moduleId: network-streaming
+stage: software-systems
+prerequisites:
+  - state-events
+outcomes:
+  - 区分一次请求与持续事件流
+  - 正确处理超时、取消和重连
+  - 解释事件ID与去重的作用
+estimatedMinutes: 25
+difficulty: intro
+careerDirections:
+  - ai-backend-reliability
+  - agent-applications
+sourceIds:
+  - http-semantics
+  - mdn-sse
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import ModulePrerequisites from '../../../../components/content/ModulePrerequisites.astro';
+import NetworkFlowDiagram from '../../../../components/content/NetworkFlowDiagram.astro';
+import Term from '../../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="network-streaming" client:load />
+<ModulePrerequisites moduleId="network-streaming" />
+
+## 1. 先把四件事分开
+
+- **请求（Request）**：客户端提交一次输入，等待服务端接受或返回结果。
+- **响应（Response）**：服务端对这次请求给出的状态、响应头和内容。
+- <Term id="server-sent-events" />：响应不会立刻结束，服务端在同一连接上连续发送事件。
+- <Term id="cancellation" />：调用方决定不再需要结果，并通知下游停止。
+
+<NetworkFlowDiagram />
+
+## 2. 超时不等于取消
+
+<Term id="timeout" />只说明“期限到了”。程序接下来仍要发出取消信号、关闭读取器，并决定当前操作能否安全重试。
+
+```ts title="request-with-timeout.ts"
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort('deadline-exceeded'), 8_000);
+
+try {
+  return await fetch(url, { signal: controller.signal });
+} finally {
+  clearTimeout(timer);
+}
+```
+
+如果操作有写入副作用，重试前还要检查<Term id="idempotency" />。否则第一次调用虽然超时，服务端仍可能已经完成写入，第二次调用会重复执行。
+
+## 3. SSE重连时要保留什么
+
+浏览器与服务端可以用事件ID记录已经收到的位置。连接断开后，客户端带着最后一个事件ID重连；服务端从下一条继续发送。
+
+一次可靠的事件流至少需要：
+
+1. 单调或稳定的事件ID；
+2. 客户端按ID去重；
+3. 明确的完成事件；
+4. 心跳与空闲超时；
+5. 连接关闭后的状态恢复。
+
+<Term id="backpressure" />是另一个问题：如果服务端生成得比客户端处理得快，需要限制发送速度、缓冲上限或主动丢弃非关键更新。
+
+## 4. 小练习
+
+画出一个文本生成流的四条路径：正常完成、用户取消、连接断开后重连、服务端超时。每条路径都标出：
+
+- 哪一方发出停止信号；
+- 最后一个可确认事件ID；
+- 是否允许重试；
+- UI最终显示什么状态。
+
+<strong>验收：</strong>四条路径都能落到确定状态，不存在“连接没了，但任务仍显示进行中”。

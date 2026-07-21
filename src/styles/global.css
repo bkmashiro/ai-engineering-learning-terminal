@@ -92,7 +92,7 @@ body {
   text-transform: uppercase;
 }
 
-.site-intro h1 {
+.site-intro h2 {
   max-width: 18ch;
   margin: 0;
   font-size: clamp(2rem, 6vw, 3.45rem);
@@ -185,6 +185,13 @@ body {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.75rem;
   margin: 1rem 0 2rem;
+}
+
+.stage-preview > .stage-card,
+.direction-grid > .direction-card,
+.comparison-grid > .comparison-card,
+.source-list > .source-card {
+  margin-block: 0 !important;
 }
 
 .stage-card,

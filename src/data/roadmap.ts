@@ -86,7 +86,7 @@ export const roadmapNodes: RoadmapNode[] = [
     artifact: '可重连且去重的事件流',
     directions: ['ai-backend-reliability', 'agent-applications'],
     href: '/foundations/software-systems/network-streaming/',
-    status: 'planned',
+    status: 'available',
   },
   {
     id: 'data-reliability',
@@ -116,7 +116,7 @@ export const roadmapNodes: RoadmapNode[] = [
   },
   {
     id: 'llm-foundations',
-    title: 'Token、Attention 与推理',
+    title: 'Token、Attention 与上下文',
     summary: '理解文本如何进入模型以及推理如何消耗资源。',
     stage: 'llm-applications',
     order: 5,
@@ -125,7 +125,7 @@ export const roadmapNodes: RoadmapNode[] = [
     artifact: 'Token 预算实验',
     directions: ['llm-search-retrieval', 'edge-inference'],
     href: '/foundations/llm/',
-    status: 'planned',
+    status: 'available',
   },
   {
     id: 'retrieval-grounding',

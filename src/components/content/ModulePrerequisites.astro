@@ -1,0 +1,118 @@
+---
+import { roadmapNodes, stageLabels } from '../../data/roadmap';
+
+interface Props {
+  moduleId: string;
+}
+
+const { moduleId } = Astro.props;
+const module = roadmapNodes.find((node) => node.id === moduleId);
+if (!module) throw new Error(`Unknown roadmap module: ${moduleId}`);
+const prerequisites = module.prerequisites.map((id) => {
+  const node = roadmapNodes.find((candidate) => candidate.id === id);
+  if (!node) throw new Error(`Unknown prerequisite: ${id}`);
+  return node;
+});
+---
+
+{prerequisites.length > 0 && (
+  <aside class="module-prerequisites" aria-labelledby={`prerequisites-${moduleId}`}>
+    <div class="module-prerequisites__intro">
+      <span>BEFORE YOU START</span>
+      <strong id={`prerequisites-${moduleId}`}>开始前需要掌握</strong>
+      <small>不熟悉也可以先点开补基础。</small>
+    </div>
+    <div class="module-prerequisites__list">
+      {prerequisites.map((item) => (
+        <a href={item.status === 'available' ? item.href : `/roadmap/#${item.id}`} class="module-prerequisites__item">
+          <span>{stageLabels[item.stage]}</span>
+          <strong>{item.title}</strong>
+          <small>{item.summary}</small>
+          <em>{item.status === 'available' ? '可学习 →' : '路线说明 →'}</em>
+        </a>
+      ))}
+    </div>
+  </aside>
+)}
+
+<style>
+  .module-prerequisites {
+    display: grid;
+    grid-template-columns: minmax(9rem, 0.72fr) minmax(0, 2fr);
+    gap: 0.75rem;
+    margin: 0 0 1rem;
+    padding: 0.8rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.7rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 4%, var(--sl-color-bg));
+  }
+
+  .module-prerequisites__intro {
+    display: grid;
+    align-content: center;
+    gap: 0.12rem;
+    padding: 0.35rem;
+  }
+
+  .module-prerequisites__intro span {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.64rem;
+    font-weight: 750;
+    letter-spacing: 0.07em;
+  }
+
+  .module-prerequisites__intro strong { font-size: 0.9rem; }
+  .module-prerequisites__intro small { color: var(--sl-color-gray-2); font-size: 0.72rem; }
+
+  .module-prerequisites__list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.55rem;
+  }
+
+  .module-prerequisites__item {
+    display: grid;
+    gap: 0.16rem;
+    margin: 0 !important;
+    padding: 0.65rem 0.7rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.55rem;
+    color: var(--sl-color-text);
+    background: var(--sl-color-bg);
+    text-decoration: none;
+    transition: border-color 130ms ease, transform 130ms ease;
+  }
+
+  .module-prerequisites__item:hover {
+    border-color: var(--sl-color-accent);
+    transform: translateY(-1px);
+  }
+
+  .module-prerequisites__item:focus-visible {
+    outline: 3px solid var(--sl-color-accent-low);
+    outline-offset: 2px;
+  }
+
+  .module-prerequisites__item span,
+  .module-prerequisites__item em {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.62rem;
+    font-style: normal;
+    font-weight: 700;
+  }
+
+  .module-prerequisites__item strong { font-size: 0.82rem; }
+  .module-prerequisites__item small { color: var(--sl-color-gray-2); font-size: 0.7rem; line-height: 1.45; }
+  .module-prerequisites__item em { margin-top: 0.18rem; }
+
+  @media (max-width: 46rem) {
+    .module-prerequisites,
+    .module-prerequisites__list { grid-template-columns: 1fr; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .module-prerequisites__item { transition: none; }
+  }
+</style>

@@ -1,0 +1,93 @@
+.module-progress {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.85rem;
+  margin: 0 0 1rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.7rem;
+  background: var(--sl-color-gray-7);
+}
+
+.module-progress__mark {
+  width: 2.55rem;
+  height: 2.55rem;
+}
+
+.module-progress__mark svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke-width: 3;
+}
+
+.module-progress__track { stroke: var(--sl-color-gray-5); }
+
+.module-progress__value {
+  stroke: var(--sl-color-accent);
+  stroke-linecap: round;
+  stroke-dasharray: 113;
+  stroke-dashoffset: 113;
+  transform: rotate(-90deg);
+  transform-origin: center;
+  transition: stroke-dashoffset 220ms ease;
+}
+
+.module-progress__mark path {
+  stroke: var(--sl-color-gray-4);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.module-progress.is-complete .module-progress__value { stroke-dashoffset: 0; }
+.module-progress.is-complete .module-progress__mark path { stroke: var(--sl-color-accent-high); }
+
+.module-progress__copy {
+  display: grid;
+  gap: 0.08rem;
+}
+
+.module-progress__copy span {
+  color: var(--sl-color-accent-high);
+  font-family: var(--sl-font-mono);
+  font-size: 0.65rem;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+}
+
+.module-progress__copy strong { font-size: 0.88rem; }
+.module-progress__copy small { color: var(--sl-color-gray-2); font-size: 0.72rem; }
+
+.module-progress button {
+  min-height: 2.35rem;
+  padding: 0.42rem 0.7rem;
+  border: 1px solid var(--sl-color-accent);
+  border-radius: 0.45rem;
+  color: var(--sl-color-accent-high);
+  background: var(--sl-color-bg);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.module-progress.is-complete button {
+  border-color: var(--sl-color-gray-4);
+  color: var(--sl-color-gray-2);
+}
+
+.module-progress button:focus-visible {
+  outline: 3px solid var(--sl-color-accent-low);
+  outline-offset: 2px;
+}
+
+@media (max-width: 38rem) {
+  .module-progress { grid-template-columns: auto minmax(0, 1fr); }
+  .module-progress button { grid-column: 1 / -1; width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .module-progress__value { transition: none; }
+}

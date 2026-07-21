@@ -1,0 +1,83 @@
+---
+title: Token、Attention与上下文
+description: 理解文本如何进入模型、上下文预算如何分配，以及为什么更多上下文不一定更好。
+moduleId: llm-foundations
+stage: llm-applications
+prerequisites:
+  - ml-experiments
+outcomes:
+  - 区分字符、单词与Token
+  - 解释Attention与上下文窗口
+  - 为输入、证据和输出分配上下文预算
+estimatedMinutes: 30
+difficulty: intro
+careerDirections:
+  - llm-search-retrieval
+  - edge-inference
+sourceIds:
+  - attention-paper
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import ContextWindowDiagram from '../../../../components/content/ContextWindowDiagram.astro';
+import ModulePrerequisites from '../../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="llm-foundations" client:load />
+<ModulePrerequisites moduleId="llm-foundations" />
+
+## 1. 模型看到的不是“句子”
+
+文本会先被切成<Term id="token" />。一个Token可能是一个汉字、词的一部分、标点或代码片段；不同模型的切分规则也可能不同。
+
+所以工程上不能用“字符数”直接代替Token预算。多语言文本、代码和长URL的Token密度往往不同。
+
+## 2. Attention在做什么
+
+<Term id="attention" />让模型在计算当前表示时，组合上下文中不同位置的信息。它不是“模型认真阅读”的拟人说法，也不保证模型一定找对证据。
+
+长上下文会带来三个直接问题：
+
+- 推理时间和显存占用增加；
+- 无关内容会和真正证据竞争；
+- 重要信息的位置与表达方式会影响结果。
+
+## 3. 上下文窗口是一份预算
+
+<Term id="context-window" />同时容纳固定指令、用户输入、检索证据、对话历史、工具结果和模型输出。
+
+<ContextWindowDiagram />
+
+最常见的错误是先塞满历史，再发现没有空间生成完整答案。更稳妥的顺序是：
+
+1. 先预留输出空间；
+2. 保留系统边界和当前任务；
+3. 只加入与问题相关的证据；
+4. 压缩或删除重复历史；
+5. 超预算时明确截断策略。
+
+## 4. 结构化输出为什么仍需校验
+
+<Term id="structured-output" />可以减少解析歧义，但它不是可信执行。程序仍要用<Term id="schema" />检查字段、类型和取值范围，再检查业务权限。
+
+```ts title="validated-output.ts"
+const parsed = actionSchema.safeParse(modelOutput);
+if (!parsed.success) {
+  return { kind: 'stop', reason: 'invalid-schema' };
+}
+return authorize(parsed.data);
+```
+
+## 5. 小练习
+
+假设模型的上下文上限是100个预算单位，请为下面五项分配比例：固定指令、用户输入、检索证据、历史和输出。
+
+然后分别模拟：
+
+- 检索返回十段重复材料；
+- 对话历史突然翻倍；
+- 输出需要从短答案改成长报告。
+
+<strong>验收：</strong>每种变化都有确定的删减顺序，并且输出预留不会降到零。

@@ -77,9 +77,9 @@ export function RoadmapGraph() {
                     </>
                   );
                   return node.status === 'available' ? (
-                    <a class="roadmap__node" href={node.href}>{content}</a>
+                    <a class="roadmap__node" id={node.id} href={node.href}>{content}</a>
                   ) : (
-                    <article class="roadmap__node" aria-label={`${title}，计划中`}>{content}</article>
+                    <article class="roadmap__node" id={node.id} aria-label={`${title}，计划中`}>{content}</article>
                   );
                 })}
               </div>

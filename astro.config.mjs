@@ -4,6 +4,7 @@ import starlight from '@astrojs/starlight';
 import { defineConfig } from 'astro/config';
 
 export default defineConfig({
+  site: 'https://ai-engineering-learning-terminal.pages.dev/',
   integrations: [
     starlight({
       title: 'AI 工程学习终端',
@@ -19,6 +20,13 @@ export default defineConfig({
           items: [
             { label: '学习终端首页', slug: '' },
             { label: '完整学习路线', slug: 'roadmap' },
+          ],
+        },
+        {
+          label: '基础补给',
+          items: [
+            { label: '网络、流式与取消', slug: 'foundations/software-systems/network-streaming' },
+            { label: 'Token、Attention与上下文', slug: 'foundations/llm' },
           ],
         },
         {

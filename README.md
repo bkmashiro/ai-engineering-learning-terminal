@@ -41,6 +41,7 @@ src/content/docs/        公开中文课程
 src/components/content/  静态教学图示与内容组件
 src/components/learning/ 交互实验
 src/data/                typed 路线、方向、术语和来源
+src/lib/                 浏览器本地进度存储边界
 scripts/                 发布前安全门禁
 ```
 
@@ -54,9 +55,19 @@ scripts/                 发布前安全门禁
 
 - 教学网站式的清晰导航和排版；
 - 完整学习路线与方向筛选；
-- `Workflow 与 Agent` 首课；
-- Agent Loop 故障注入实验；
+- 两节基础补给课与 `Workflow 与 Agent` 首课；
+- 系统分层、网络生命周期、上下文预算与架构选择图；
+- 可切换正常/故障路径的 SVG Agent Loop；
+- 带版本号的浏览器本地学习进度；
+- 从 canonical typed data 生成的前置模块链接和术语 Peek；
 - 七个抽象就业方向；
 - 术语和来源索引。
 
-部署与许可证将在人工终验后单独决定。
+## 部署
+
+- Production: <https://ai-engineering-learning-terminal.pages.dev/>
+- Cloudflare Pages 从 `main` 构建
+- 构建命令：`pnpm build`
+- 输出目录：`dist`
+
+许可证将在人工终验后单独决定。
