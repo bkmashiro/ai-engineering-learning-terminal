@@ -5,42 +5,68 @@ type Scenario = 'normal' | 'timeout' | 'invalid-schema' | 'repeated-state';
 
 interface Step {
   id: string;
+  shortLabel: string;
   label: string;
   description: string;
   output: string;
+  x: number;
+  y: number;
 }
 
 const steps: Step[] = [
   {
     id: 'observe',
+    shortLabel: '观察',
     label: '观察输入',
     description: '读取用户目标、当前状态和可用工具。',
     output: '结构化任务 + 状态快照',
+    x: 95,
+    y: 105,
   },
   {
     id: 'decide',
+    shortLabel: '选择',
     label: '选择动作',
     description: '模型只选择下一项公开动作，不直接执行副作用。',
     output: '动作名称 + 参数草案',
+    x: 300,
+    y: 65,
   },
   {
     id: 'act',
+    shortLabel: '工具',
     label: '执行工具',
     description: '程序先验证 Schema、权限和超时，再调用工具。',
     output: '工具结果或分类错误',
+    x: 510,
+    y: 105,
   },
   {
     id: 'validate',
+    shortLabel: '验证',
     label: '验证结果',
     description: '检查结果是否满足契约，是否需要重试或人工确认。',
     output: '接受、重试、降级或停止',
+    x: 510,
+    y: 280,
   },
   {
     id: 'update',
+    shortLabel: '更新',
     label: '更新状态',
     description: '记录 trace，更新有限状态，并判断是否终止。',
     output: '新状态 + 终止条件',
+    x: 300,
+    y: 325,
   },
+];
+
+const edgePaths = [
+  'M145 105 C195 105 210 65 248 65',
+  'M352 65 C405 65 420 105 458 105',
+  'M510 135 L510 250',
+  'M458 280 C410 280 402 325 352 325',
+  'M248 325 C160 325 95 245 95 135',
 ];
 
 const scenarioLabels: Record<Scenario, string> = {
@@ -67,6 +93,104 @@ const faults: Partial<Record<Scenario, { at: number; message: string; recovery: 
     recovery: '触发循环保护，停止执行并交给人工或更保守的工作流。',
   },
 };
+
+function AgentLoopDiagram({ current, trace, fault }: { current: number; trace: number[]; fault: string | null }) {
+  const currentStep = steps[current];
+  const recoveryPath = `M${currentStep.x} ${currentStep.y + 30} C${currentStep.x} 360 400 380 390 397`;
+
+  return (
+    <div class="loop-lab__diagram">
+      <svg viewBox="0 0 620 440" role="img" aria-label="Agent Loop 状态图">
+        <defs>
+          <marker id="loop-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" class="loop-lab__arrowhead" />
+          </marker>
+          <pattern id="loop-grid" width="24" height="24" patternUnits="userSpaceOnUse">
+            <path d="M 24 0 L 0 0 0 24" class="loop-lab__grid-line" fill="none" />
+          </pattern>
+          <filter id="loop-glow" x="-70%" y="-70%" width="240%" height="240%">
+            <feDropShadow dx="0" dy="0" stdDeviation="5" floodOpacity="0.28" />
+          </filter>
+        </defs>
+
+        <rect x="1" y="1" width="618" height="438" rx="18" fill="url(#loop-grid)" class="loop-lab__canvas" />
+
+        <g class="loop-lab__boundary">
+          <rect x="434" y="45" width="152" height="285" rx="18" />
+          <text x="510" y="27" textAnchor="middle">权限 · SCHEMA · 超时</text>
+        </g>
+
+        <path d="M15 105 H43" class="loop-lab__edge is-input" markerEnd="url(#loop-arrow)" />
+        {edgePaths.map((path, index) => (
+          <path
+            d={path}
+            class={[
+              'loop-lab__edge',
+              trace.includes(index + 1) || (index === 4 && trace.includes(4)) ? 'is-visited' : '',
+              current === index + 1 ? 'is-active' : '',
+            ].filter(Boolean).join(' ')}
+            markerEnd="url(#loop-arrow)"
+          />
+        ))}
+
+        <g class="loop-lab__state-store">
+          <circle cx="300" cy="198" r="56" />
+          <circle cx="300" cy="198" r="42" />
+          <path d="M300 142 V95 M300 254 V294" />
+          <text x="300" y="194" textAnchor="middle">STATE</text>
+          <text x="300" y="214" textAnchor="middle">公开状态</text>
+        </g>
+
+        <text x="15" y="88" class="loop-lab__io-label">INPUT</text>
+        <text x="111" y="214" class="loop-lab__loop-label">状态改变后再观察</text>
+
+        {steps.map((step, index) => {
+          const state = fault && index === current
+            ? 'fault'
+            : index === current
+              ? 'active'
+              : trace.includes(index)
+                ? 'visited'
+                : 'idle';
+          return (
+            <g
+              class={`loop-lab__node is-${state}`}
+              transform={`translate(${step.x - 52} ${step.y - 30})`}
+              aria-current={index === current ? 'step' : undefined}
+              data-state={state}
+              data-testid={`loop-node-${step.id}`}
+            >
+              {index === current ? <circle cx="52" cy="30" r="38" class="loop-lab__node-pulse" /> : null}
+              <rect width="104" height="60" rx="14" filter={index === current ? 'url(#loop-glow)' : undefined} />
+              <circle cx="24" cy="30" r="13" class="loop-lab__node-index" />
+              <text x="24" y="35" textAnchor="middle" class="loop-lab__node-number">{index + 1}</text>
+              <text x="45" y="36" class="loop-lab__node-label">{step.shortLabel}</text>
+              {state === 'fault' ? (
+                <g class="loop-lab__fault-mark" transform="translate(88 14)">
+                  <circle r="10" />
+                  <path d="M-4-4 L4 4 M4-4 L-4 4" />
+                </g>
+              ) : null}
+            </g>
+          );
+        })}
+
+        {fault ? (
+          <g class="loop-lab__recovery-route">
+            <path d={recoveryPath} markerEnd="url(#loop-arrow)" />
+            <rect x="390" y="375" width="188" height="44" rx="12" />
+            <text x="484" y="402" textAnchor="middle">STOP · RECOVER · REVIEW</text>
+          </g>
+        ) : (
+          <g class="loop-lab__success-route">
+            <path d="M352 325 C410 340 430 352 455 370" markerEnd="url(#loop-arrow)" />
+            <text x="465" y="389">完成后输出</text>
+          </g>
+        )}
+      </svg>
+    </div>
+  );
+}
 
 export function AgentLoopStepper() {
   const [scenario, setScenario] = useState<Scenario>('normal');
@@ -114,7 +238,7 @@ export function AgentLoopStepper() {
         <div>
           <p class="loop-lab__eyebrow">交互实验 · 确定性模拟</p>
           <h2 id="loop-lab-title">Agent Loop 故障注入</h2>
-          <p>切换场景并逐步执行，观察程序应在哪里停止，而不是让模型无限继续。</p>
+          <p>沿图逐步执行；一旦越过安全边界，路径会转入停止与恢复。</p>
         </div>
         <label class="loop-lab__scenario">
           <span>故障场景</span>
@@ -129,23 +253,7 @@ export function AgentLoopStepper() {
         </label>
       </div>
 
-      <ol class="loop-lab__steps" aria-label="Agent Loop 步骤">
-        {steps.map((step, index) => (
-          <li
-            class={[
-              'loop-lab__step',
-              index === current ? 'is-current' : '',
-              trace.includes(index) ? 'is-visited' : '',
-            ]
-              .filter(Boolean)
-              .join(' ')}
-            aria-current={index === current ? 'step' : undefined}
-          >
-            <span>{index + 1}</span>
-            {step.label}
-          </li>
-        ))}
-      </ol>
+      <AgentLoopDiagram current={current} trace={trace} fault={fault} />
 
       <div class="loop-lab__panel">
         <div>

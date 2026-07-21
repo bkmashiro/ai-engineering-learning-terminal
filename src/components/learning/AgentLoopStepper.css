@@ -224,3 +224,205 @@
     transition: none !important;
   }
 }
+
+.loop-lab__diagram {
+  margin: 1.25rem 0 1rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.75rem;
+  background: var(--sl-color-bg);
+  overflow: hidden;
+}
+
+.loop-lab__diagram svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.loop-lab__canvas {
+  fill: var(--sl-color-bg);
+  stroke: var(--sl-color-gray-5);
+}
+
+.loop-lab__grid-line {
+  stroke: var(--sl-color-gray-6);
+  stroke-width: 0.7;
+}
+
+.loop-lab__edge,
+.loop-lab__state-store path,
+.loop-lab__success-route path {
+  fill: none;
+  stroke: var(--sl-color-gray-4);
+  stroke-width: 2.2;
+}
+
+.loop-lab__edge.is-visited {
+  stroke: color-mix(in srgb, var(--sl-color-accent) 62%, var(--sl-color-gray-4));
+}
+
+.loop-lab__edge.is-active {
+  stroke: var(--sl-color-accent);
+  stroke-width: 3.6;
+  stroke-dasharray: 9 7;
+  animation: loop-flow 0.85s linear infinite;
+}
+
+.loop-lab__arrowhead { fill: var(--sl-color-gray-4); }
+
+.loop-lab__boundary rect {
+  fill: color-mix(in srgb, #f59e0b 5%, transparent);
+  stroke: color-mix(in srgb, #d97706 62%, var(--sl-color-gray-4));
+  stroke-width: 1.5;
+  stroke-dasharray: 7 6;
+}
+
+.loop-lab__boundary text,
+.loop-lab__io-label,
+.loop-lab__loop-label,
+.loop-lab__success-route text {
+  fill: var(--sl-color-gray-2);
+  font-family: var(--sl-font-mono);
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.loop-lab__loop-label { font-size: 11.5px; }
+
+.loop-lab__state-store circle:first-child {
+  fill: color-mix(in srgb, var(--sl-color-accent) 7%, var(--sl-color-bg));
+  stroke: var(--sl-color-gray-5);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 5;
+}
+
+.loop-lab__state-store circle:nth-child(2) {
+  fill: var(--sl-color-gray-7);
+  stroke: color-mix(in srgb, var(--sl-color-accent) 42%, var(--sl-color-gray-5));
+  stroke-width: 1.5;
+}
+
+.loop-lab__state-store text:first-of-type {
+  fill: var(--sl-color-accent-high);
+  font-family: var(--sl-font-mono);
+  font-size: 15px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+}
+
+.loop-lab__state-store text:last-of-type {
+  fill: var(--sl-color-gray-2);
+  font-size: 12px;
+}
+
+.loop-lab__node rect {
+  fill: var(--sl-color-gray-7);
+  stroke: var(--sl-color-gray-5);
+  stroke-width: 1.6;
+  transition: fill 160ms ease, stroke 160ms ease;
+}
+
+.loop-lab__node.is-visited rect {
+  stroke: color-mix(in srgb, var(--sl-color-accent) 45%, var(--sl-color-gray-5));
+}
+
+.loop-lab__node.is-active rect {
+  fill: var(--sl-color-accent-low);
+  stroke: var(--sl-color-accent);
+  stroke-width: 3;
+}
+
+.loop-lab__node.is-fault rect {
+  fill: color-mix(in srgb, #ef4444 10%, var(--sl-color-bg));
+  stroke: #dc2626;
+  stroke-width: 3;
+}
+
+.loop-lab__node-index {
+  fill: var(--sl-color-gray-6);
+  stroke: var(--sl-color-gray-5);
+}
+
+.loop-lab__node.is-active .loop-lab__node-index {
+  fill: var(--sl-color-accent);
+  stroke: var(--sl-color-accent);
+}
+
+.loop-lab__node.is-fault .loop-lab__node-index {
+  fill: #dc2626;
+  stroke: #dc2626;
+}
+
+.loop-lab__node-number,
+.loop-lab__node-label {
+  fill: var(--sl-color-gray-2);
+  font-family: var(--sl-font-mono);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.loop-lab__node.is-active .loop-lab__node-number,
+.loop-lab__node.is-fault .loop-lab__node-number { fill: white; }
+
+.loop-lab__node-label {
+  fill: var(--sl-color-text);
+  font-size: 18px;
+}
+
+.loop-lab__node-pulse {
+  fill: var(--sl-color-accent);
+  opacity: 0.14;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: loop-node-pulse 1.6s ease-out infinite;
+}
+
+.loop-lab__node.is-fault .loop-lab__node-pulse { fill: #ef4444; }
+.loop-lab__fault-mark circle { fill: #dc2626; }
+
+.loop-lab__fault-mark path {
+  fill: none;
+  stroke: white;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.loop-lab__recovery-route path {
+  fill: none;
+  stroke: #dc2626;
+  stroke-width: 3;
+  stroke-dasharray: 8 6;
+  animation: loop-flow 0.9s linear infinite;
+}
+
+.loop-lab__recovery-route rect {
+  fill: color-mix(in srgb, #ef4444 10%, var(--sl-color-bg));
+  stroke: #dc2626;
+  stroke-width: 1.6;
+}
+
+.loop-lab__recovery-route text {
+  fill: color-mix(in srgb, #dc2626 82%, var(--sl-color-text));
+  font-family: var(--sl-font-mono);
+  font-size: 13px;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+}
+
+@keyframes loop-flow {
+  to { stroke-dashoffset: -32; }
+}
+
+@keyframes loop-node-pulse {
+  0% { transform: scale(0.78); opacity: 0.24; }
+  75%, 100% { transform: scale(1.28); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loop-lab__edge.is-active,
+  .loop-lab__node-pulse,
+  .loop-lab__recovery-route path {
+    animation: none;
+  }
+}

@@ -1,0 +1,86 @@
+<figure class="network-flow">
+  <svg viewBox="0 0 760 360" role="img" aria-labelledby="network-title network-desc">
+    <title id="network-title">请求、事件流、超时与取消示意图</title>
+    <desc id="network-desc">客户端向服务端发送请求，服务端持续返回事件；超时或用户取消时，客户端发出中止信号并停止读取。</desc>
+    <defs>
+      <marker id="network-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10z" />
+      </marker>
+      <pattern id="network-grid" width="24" height="24" patternUnits="userSpaceOnUse">
+        <path d="M24 0H0V24" fill="none" />
+      </pattern>
+    </defs>
+    <rect x="1" y="1" width="758" height="358" rx="18" class="network-flow__canvas" />
+
+    <g class="network-flow__lane">
+      <rect x="38" y="58" width="154" height="244" rx="14" />
+      <text x="115" y="91" text-anchor="middle">CLIENT</text>
+      <text x="115" y="114" text-anchor="middle">浏览器 / App</text>
+    </g>
+    <g class="network-flow__lane">
+      <rect x="302" y="58" width="154" height="244" rx="14" />
+      <text x="379" y="91" text-anchor="middle">SERVER</text>
+      <text x="379" y="114" text-anchor="middle">API / Runner</text>
+    </g>
+    <g class="network-flow__lane is-tool">
+      <rect x="566" y="58" width="154" height="244" rx="14" />
+      <text x="643" y="91" text-anchor="middle">TOOL</text>
+      <text x="643" y="114" text-anchor="middle">检索 / 存储</text>
+    </g>
+
+    <g class="network-flow__request">
+      <path d="M192 148 H302" marker-end="url(#network-arrow)" />
+      <text x="247" y="137" text-anchor="middle">1 · REQUEST</text>
+      <circle cx="219" cy="148" r="5" />
+    </g>
+    <g class="network-flow__tool-call">
+      <path d="M456 148 H566" marker-end="url(#network-arrow)" />
+      <text x="511" y="137" text-anchor="middle">2 · CALL</text>
+    </g>
+    <g class="network-flow__event">
+      <path d="M302 206 H192" marker-end="url(#network-arrow)" />
+      <text x="247" y="195" text-anchor="middle">3 · EVENT STREAM</text>
+      <circle cx="285" cy="206" r="5" />
+      <circle cx="263" cy="206" r="5" />
+      <circle cx="241" cy="206" r="5" />
+    </g>
+    <g class="network-flow__cancel">
+      <path d="M192 260 H302" marker-end="url(#network-arrow)" />
+      <text x="247" y="249" text-anchor="middle">4 · ABORT</text>
+      <path d="M228 254 L240 266 M240 254 L228 266" />
+    </g>
+
+    <g class="network-flow__notes">
+      <rect x="64" y="318" width="632" height="27" rx="8" />
+      <text x="380" y="336" text-anchor="middle">超时（Timeout）是期限；取消（Cancellation）是信号。两者都要进入明确的停止路径。</text>
+    </g>
+  </svg>
+  <figcaption>持续连接不等于无限等待。调用方仍需负责超时、取消、重连和事件去重。</figcaption>
+</figure>
+
+<style>
+  .network-flow { margin: 1.4rem 0 2rem; }
+  .network-flow svg { display: block; width: 100%; height: auto; }
+  .network-flow__canvas { fill: var(--sl-color-gray-7); stroke: var(--sl-color-gray-5); }
+  .network-flow__canvas + * { pointer-events: none; }
+  .network-flow svg > defs pattern path { stroke: var(--sl-color-gray-6); }
+  .network-flow__lane rect { fill: var(--sl-color-bg); stroke: var(--sl-color-gray-4); stroke-width: 1.5; }
+  .network-flow__lane text:first-of-type { fill: var(--sl-color-accent-high); font-family: var(--sl-font-mono); font-size: 15px; font-weight: 750; letter-spacing: .08em; }
+  .network-flow__lane text:last-of-type { fill: var(--sl-color-gray-2); font-size: 14px; }
+  .network-flow__request path,
+  .network-flow__tool-call path,
+  .network-flow__event path,
+  .network-flow__cancel path { fill: none; stroke: var(--sl-color-accent); stroke-width: 3; }
+  .network-flow__event path { stroke: #16845c; stroke-dasharray: 9 6; }
+  .network-flow__cancel path { stroke: #dc2626; stroke-dasharray: 6 5; }
+  .network-flow marker path { fill: var(--sl-color-accent); }
+  .network-flow__event circle { fill: #16845c; }
+  .network-flow__request circle { fill: var(--sl-color-accent); }
+  .network-flow__request text,
+  .network-flow__tool-call text,
+  .network-flow__event text,
+  .network-flow__cancel text { fill: var(--sl-color-gray-2); font-family: var(--sl-font-mono); font-size: 12px; font-weight: 700; }
+  .network-flow__notes rect { fill: color-mix(in srgb, var(--sl-color-accent) 8%, var(--sl-color-bg)); stroke: var(--sl-color-gray-5); }
+  .network-flow__notes text { fill: var(--sl-color-text); font-size: 13px; }
+  .network-flow figcaption { margin-top: .6rem; color: var(--sl-color-gray-2); font-size: .78rem; text-align: center; }
+</style>

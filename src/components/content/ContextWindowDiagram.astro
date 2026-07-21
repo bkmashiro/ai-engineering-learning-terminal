@@ -1,0 +1,60 @@
+<figure class="context-window">
+  <svg viewBox="0 0 760 320" role="img" aria-labelledby="context-title context-desc">
+    <title id="context-title">上下文窗口Token预算示意图</title>
+    <desc id="context-desc">固定指令、用户输入、检索证据、历史记录和预留输出共同占用一个有限的上下文窗口。</desc>
+    <rect x="1" y="1" width="758" height="318" rx="18" class="context-window__canvas" />
+
+    <text x="42" y="55" class="context-window__kicker">CONTEXT WINDOW · 100%</text>
+    <text x="718" y="55" text-anchor="end" class="context-window__limit">输入 + 输出共享同一预算</text>
+
+    <g class="context-window__bar">
+      <rect x="42" y="82" width="98" height="70" rx="10" class="is-system" />
+      <rect x="140" y="82" width="112" height="70" class="is-input" />
+      <rect x="252" y="82" width="210" height="70" class="is-retrieval" />
+      <rect x="462" y="82" width="126" height="70" class="is-history" />
+      <rect x="588" y="82" width="130" height="70" rx="10" class="is-output" />
+      <text x="91" y="111" text-anchor="middle">SYSTEM</text><text x="91" y="132" text-anchor="middle">14%</text>
+      <text x="196" y="111" text-anchor="middle">INPUT</text><text x="196" y="132" text-anchor="middle">16%</text>
+      <text x="357" y="111" text-anchor="middle">RETRIEVED EVIDENCE</text><text x="357" y="132" text-anchor="middle">31%</text>
+      <text x="525" y="111" text-anchor="middle">HISTORY</text><text x="525" y="132" text-anchor="middle">19%</text>
+      <text x="653" y="111" text-anchor="middle">OUTPUT</text><text x="653" y="132" text-anchor="middle">20%</text>
+    </g>
+
+    <g class="context-window__attention">
+      <path d="M91 165 C91 220 270 238 357 214" />
+      <path d="M196 165 C220 205 298 224 357 214" />
+      <path d="M525 165 C500 205 424 224 357 214" />
+      <circle cx="357" cy="214" r="27" />
+      <text x="357" y="211" text-anchor="middle">ATTENTION</text>
+      <text x="357" y="226" text-anchor="middle">关联上下文</text>
+    </g>
+
+    <g class="context-window__rule">
+      <rect x="42" y="267" width="676" height="30" rx="8" />
+      <text x="380" y="287" text-anchor="middle">先保留输出空间，再选择证据；不要把“塞入全部历史”当成记忆设计。</text>
+    </g>
+  </svg>
+  <figcaption>Token预算是工程约束。相关证据、历史长度、输出空间和延迟需要一起取舍。</figcaption>
+</figure>
+
+<style>
+  .context-window { margin: 1.4rem 0 2rem; }
+  .context-window svg { display: block; width: 100%; height: auto; }
+  .context-window__canvas { fill: var(--sl-color-gray-7); stroke: var(--sl-color-gray-5); }
+  .context-window__kicker,
+  .context-window__limit { fill: var(--sl-color-gray-2); font-family: var(--sl-font-mono); font-size: 13px; font-weight: 700; letter-spacing: .05em; }
+  .context-window__bar rect { stroke: var(--sl-color-bg); stroke-width: 2; }
+  .context-window__bar .is-system { fill: #315fc7; }
+  .context-window__bar .is-input { fill: #4f7bd9; }
+  .context-window__bar .is-retrieval { fill: #16845c; }
+  .context-window__bar .is-history { fill: #a66a1f; }
+  .context-window__bar .is-output { fill: #7c4db3; }
+  .context-window__bar text { fill: white; font-family: var(--sl-font-mono); font-size: 12px; font-weight: 750; }
+  .context-window__bar text:nth-of-type(even) { opacity: .82; font-size: 11px; }
+  .context-window__attention path { fill: none; stroke: var(--sl-color-gray-4); stroke-width: 1.5; stroke-dasharray: 5 5; }
+  .context-window__attention circle { fill: var(--sl-color-bg); stroke: var(--sl-color-accent); stroke-width: 2; }
+  .context-window__attention text { fill: var(--sl-color-accent-high); font-family: var(--sl-font-mono); font-size: 10px; font-weight: 750; }
+  .context-window__rule rect { fill: color-mix(in srgb, var(--sl-color-accent) 8%, var(--sl-color-bg)); stroke: var(--sl-color-gray-5); }
+  .context-window__rule text { fill: var(--sl-color-text); font-size: 13px; }
+  .context-window figcaption { margin-top: .6rem; color: var(--sl-color-gray-2); font-size: .78rem; text-align: center; }
+</style>

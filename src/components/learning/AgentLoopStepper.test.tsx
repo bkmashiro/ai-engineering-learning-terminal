@@ -9,8 +9,11 @@ describe('AgentLoopStepper', () => {
   it('starts from an observable state and advances one public step at a time', () => {
     render(<AgentLoopStepper />);
 
+    expect(screen.getByRole('img', { name: 'Agent Loop 状态图' })).toBeTruthy();
+    expect(screen.getByTestId('loop-node-observe').getAttribute('aria-current')).toBe('step');
     expect(screen.getByRole('heading', { name: '观察输入' })).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '下一步' }));
+    expect(screen.getByTestId('loop-node-decide').getAttribute('aria-current')).toBe('step');
     expect(screen.getByRole('heading', { name: '选择动作' })).toBeTruthy();
   });
 
@@ -22,6 +25,7 @@ describe('AgentLoopStepper', () => {
     fireEvent.click(screen.getByRole('button', { name: '下一步' }));
 
     expect(screen.getByRole('status').textContent).toContain('工具超时');
+    expect(screen.getByTestId('loop-node-act').getAttribute('data-state')).toBe('fault');
     expect((screen.getByRole('button', { name: '下一步' }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
