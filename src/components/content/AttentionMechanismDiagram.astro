@@ -1,0 +1,153 @@
+<figure class="attention-mechanism">
+  <div class="attention-mechanism__frame" role="group" aria-labelledby="attention-mechanism-title">
+    <header>
+      <span>ONE ATTENTION HEAD</span>
+      <strong id="attention-mechanism-title">从输入表示到加权输出</strong>
+    </header>
+
+    <ol class="attention-mechanism__steps">
+      <li>
+        <span class="attention-mechanism__number">01</span>
+        <strong>输入表示</strong>
+        <code>X ∈ ℝⁿˣᵈ</code>
+        <small>每行对应一个Token位置</small>
+      </li>
+      <li>
+        <span class="attention-mechanism__number">02</span>
+        <strong>三组投影</strong>
+        <code>Q=XW_Q · K=XW_K · V=XW_V</code>
+        <small>Q/K负责匹配，V承载被组合的信息</small>
+      </li>
+      <li>
+        <span class="attention-mechanism__number">03</span>
+        <strong>两两打分</strong>
+        <code>S=QKᵀ/√dₖ</code>
+        <small>S是n×n矩阵</small>
+      </li>
+      <li>
+        <span class="attention-mechanism__number">04</span>
+        <strong>Mask与归一化</strong>
+        <code>A=softmax(S+M)</code>
+        <small>每一行权重之和为1</small>
+      </li>
+      <li>
+        <span class="attention-mechanism__number">05</span>
+        <strong>组合Value</strong>
+        <code>O=AV</code>
+        <small>得到每个位置的新表示</small>
+      </li>
+    </ol>
+  </div>
+  <figcaption>这是一层中的一个Attention Head。多头结果还要拼接并投影，随后经过残差连接、归一化和前馈网络。</figcaption>
+</figure>
+
+<style>
+  .attention-mechanism {
+    margin: 1.5rem 0 2rem;
+  }
+
+  .attention-mechanism__frame {
+    padding: clamp(1rem, 3vw, 1.4rem);
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: .85rem;
+    background: var(--sl-color-gray-7);
+  }
+
+  .attention-mechanism header {
+    display: flex;
+    align-items: baseline;
+    gap: .75rem;
+    margin-bottom: 1rem;
+  }
+
+  .attention-mechanism header span {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: .86rem;
+    font-weight: 800;
+    letter-spacing: .04em;
+  }
+
+  .attention-mechanism header strong {
+    font-size: 1rem;
+  }
+
+  .attention-mechanism__steps {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: .6rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .attention-mechanism__steps li {
+    position: relative;
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: .45rem;
+    padding: .85rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: .65rem;
+    background: var(--sl-color-bg);
+  }
+
+  .attention-mechanism__steps li:not(:last-child)::after {
+    position: absolute;
+    z-index: 2;
+    top: 50%;
+    right: -.52rem;
+    width: .45rem;
+    border-top: 2px solid var(--sl-color-accent);
+    content: '';
+  }
+
+  .attention-mechanism__number {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: .78rem;
+    font-weight: 800;
+  }
+
+  .attention-mechanism__steps strong {
+    font-size: .94rem;
+  }
+
+  .attention-mechanism__steps code {
+    overflow-wrap: anywhere;
+    color: var(--sl-color-text);
+    font-size: .78rem;
+    line-height: 1.55;
+  }
+
+  .attention-mechanism__steps small {
+    color: var(--sl-color-gray-2);
+    font-size: .78rem;
+    line-height: 1.45;
+  }
+
+  .attention-mechanism figcaption {
+    margin-top: .65rem;
+    color: var(--sl-color-gray-2);
+    font-size: .88rem;
+    text-align: center;
+  }
+
+  @media (max-width: 60rem) {
+    .attention-mechanism__steps {
+      grid-template-columns: 1fr;
+    }
+
+    .attention-mechanism__steps li:not(:last-child)::after {
+      top: auto;
+      right: auto;
+      bottom: -.62rem;
+      left: 1.2rem;
+      width: 0;
+      height: .62rem;
+      border-top: 0;
+      border-left: 2px solid var(--sl-color-accent);
+    }
+  }
+</style>

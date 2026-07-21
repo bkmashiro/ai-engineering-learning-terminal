@@ -16,6 +16,12 @@ test('homepage exposes the learning route and keeps the page readable', async ({
     cards.map((card) => card.getBoundingClientRect().height),
   );
   expect(Math.max(...stageHeights) - Math.min(...stageHeights)).toBeLessThan(1);
+
+  await expect(page.locator('.system-stack svg')).toHaveCount(0);
+  const scopeFontSize = await page.locator('.system-stack__scope').first().evaluate((node) =>
+    Number.parseFloat(getComputedStyle(node).fontSize),
+  );
+  expect(scopeFontSize).toBeGreaterThanOrEqual(14);
 });
 
 test('roadmap filters without losing the selected direction prerequisites', async ({ page }) => {
@@ -35,7 +41,21 @@ test('agent lab reports a timeout and stops advancing', async ({ page }) => {
   await page.getByRole('button', { name: '下一步' }).click();
 
   await expect(page.locator('.loop-lab__status')).toContainText('工具超时');
+  await expect(page.getByTestId('recovery-card')).toContainText('STOP · RECOVER');
+  await expect(page.getByTestId('recovery-card')).toContainText('停止 · 恢复 · 复核');
   await expect(page.getByRole('button', { name: '下一步' })).toBeDisabled();
+});
+
+test('foundation lessons render the mechanism and recovery sections', async ({ page }) => {
+  await page.goto('/foundations/software-systems/network-streaming/');
+  await expect(page.getByRole('heading', { name: 'SSE不是“不断返回一点字符串”' })).toBeVisible();
+  await expect(page.getByText('Last-Event-ID', { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole('heading', { name: '故障诊断表' })).toBeVisible();
+
+  await page.goto('/foundations/llm/');
+  await expect(page.getByRole('heading', { name: '缩放点积Attention逐步计算' })).toBeVisible();
+  await expect(page.locator('.attention-mechanism')).toContainText('Q=XW_Q · K=XW_K · V=XW_V');
+  await expect(page.getByRole('heading', { name: 'Attention权重不是解释' })).toBeVisible();
 });
 
 test('lesson keeps progress locally and exposes canonical prerequisite links', async ({ page }) => {

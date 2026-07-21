@@ -1,25 +1,30 @@
 ---
 title: Token、Attention与上下文
-description: 理解文本如何进入模型、上下文预算如何分配，以及为什么更多上下文不一定更好。
+description: 从Tokenizer与Embedding开始，手算缩放点积Attention，再连接到Mask、多头、位置、KV Cache和上下文预算。
 moduleId: llm-foundations
 stage: llm-applications
 prerequisites:
   - ml-experiments
 outcomes:
-  - 区分字符、单词与Token
-  - 解释Attention与上下文窗口
-  - 为输入、证据和输出分配上下文预算
-estimatedMinutes: 30
-difficulty: intro
+  - 用实际Tokenizer而非字符数计算输入预算
+  - 写出Q/K/V投影、缩放点积Attention与因果Mask
+  - 解释多头、位置表示、残差与前馈层各自解决什么问题
+  - 区分Prefill、Decode、KV Cache及其延迟和内存代价
+  - 为系统指令、工具、证据、历史和输出制定可执行预算策略
+estimatedMinutes: 90
+difficulty: core
 careerDirections:
   - llm-search-retrieval
   - edge-inference
 sourceIds:
   - attention-paper
+  - attention-not-explanation
+  - lost-in-the-middle
 sourceLocale: zh-CN
 lastReviewed: 2026-07-21
 ---
 
+import AttentionMechanismDiagram from '../../../../components/content/AttentionMechanismDiagram.astro';
 import ContextWindowDiagram from '../../../../components/content/ContextWindowDiagram.astro';
 import ModulePrerequisites from '../../../../components/content/ModulePrerequisites.astro';
 import Term from '../../../../components/content/Term.astro';
@@ -28,56 +33,614 @@ import { ModuleProgress } from '../../../../components/learning/ModuleProgress';
 <ModuleProgress moduleId="llm-foundations" client:load />
 <ModulePrerequisites moduleId="llm-foundations" />
 
-## 1. 模型看到的不是“句子”
+## 0. 先看完整计算链
 
-文本会先被切成<Term id="token" />。一个Token可能是一个汉字、词的一部分、标点或代码片段；不同模型的切分规则也可能不同。
+一段文本进入自回归语言模型，大致经过：
 
-所以工程上不能用“字符数”直接代替Token预算。多语言文本、代码和长URL的Token密度往往不同。
+```text
+文本
+  → Tokenizer
+  → Token IDs
+  → Token Embedding + Position
+  → N个Transformer Block
+  → 最后一个位置的Logits
+  → 概率分布与采样
+  → 新Token
+  → 把新Token接回输入，继续Decode
+```
 
-## 2. Attention在做什么
+“模型读懂一句话”把太多步骤压成了一句拟人描述。工程上更有用的问题是：输入被切成了什么、张量形状是什么、每一层能访问哪些位置、哪部分计算被缓存、预算在哪一步用完。
 
-<Term id="attention" />让模型在计算当前表示时，组合上下文中不同位置的信息。它不是“模型认真阅读”的拟人说法，也不保证模型一定找对证据。
+还有一个版本边界要先说明：2017年的《Attention Is All You Need》研究的是Encoder–Decoder机器翻译Transformer。今天常见的Decoder-only LLM在归一化位置、激活函数、位置表示和Attention实现上可能不同，但Token表示、Q/K/V、缩放点积、Mask、多头、残差与逐Token解码仍是理解底层机制的主干。
 
-长上下文会带来三个直接问题：
+## 1. Token不是字，也不是词
 
-- 推理时间和显存占用增加；
-- 无关内容会和真正证据竞争；
-- 重要信息的位置与表达方式会影响结果。
+<Term id="token" />是Tokenizer词表中的离散单位。Tokenizer通常试图在“词表大小”和“序列长度”之间取平衡：
 
-## 3. 上下文窗口是一份预算
+- 只有字符或字节，词表小，但序列会很长；
+- 整词词表能缩短常见句子，却无法覆盖所有新词、拼写和代码；
+- 子词方法把常见片段保留为一个Token，把少见内容拆成多个片段；
+- 不同语言、空格、大小写、Unicode规范化和前导换行都会改变切分。
 
-<Term id="context-window" />同时容纳固定指令、用户输入、检索证据、对话历史、工具结果和模型输出。
+下面的切分只是示意，不代表某个具体模型：
+
+```text
+"unbelievable"  → ["un", "believ", "able"]
+"HTTPStatus"    → ["HTTP", "Status"]
+"网络错误"       → ["网络", "错误"] 或 ["网", "络", "错", "误"]
+"https://..."   → 可能拆成很多标点和片段
+```
+
+真正部署时必须调用目标模型对应的Tokenizer。不能用“中文一个字约等于一个Token”或“英文四个字符约一个Token”作为硬限制。这些估算只能做粗略容量预警。
+
+### Tokenizer输出的不是字符串数组
+
+模型最终接收的是整数ID：
+
+```text
+text        = "取消任务"
+token_ids   = [4217, 993, 18]   // 仅示意
+```
+
+序列前后还可能加入特殊Token，Chat Template也可能插入角色标记、分隔符或工具调用格式。API传入的可见文字相同，换一个模板后实际输入Token数可能不同。
+
+工程上至少记录：
+
+```text
+tokenizer_id
+chat_template_version
+input_token_count
+reserved_output_tokens
+truncation_policy
+```
+
+否则一次Prompt改动导致成本或质量变化时，无法判断是正文变长、模板改变还是Tokenizer不同。
+
+## 2. 从Token ID到向量
+
+整数ID本身没有可计算的语义关系。模型用一张可学习矩阵把每个ID查成<Term id="embedding" />：
+
+```text
+EmbeddingTable ∈ ℝ^(vocab_size × d_model)
+X_token        ∈ ℝ^(n × d_model)
+```
+
+`n`是序列长度，`d_model`是每个位置的表示维度。输入有`n`个Token，就得到`n`行向量。
+
+这不是“从数据库查一个固定词义”。Embedding在训练中与其他参数一起更新，它的作用是提供一组可学习坐标。经过多层Transformer后，同一个Token在不同上下文里的隐藏表示会发生变化。
+
+如果只有Token Embedding，Attention看见的是一组向量，却不知道排列顺序。模型还需要<Term id="positional-representation" />：
+
+```text
+X = TokenEmbedding(token_ids) + PositionRepresentation(positions)
+```
+
+原始论文使用不同频率的正弦和余弦位置编码，并把它与Token Embedding相加。后续模型也可能使用学习位置、相对位置或旋转式位置表示。实现不同，但问题不变：交换两个Token的位置，不应得到完全相同的序列表示。
+
+## 3. Attention的输入与形状
+
+考虑一个Attention Head，输入为：
+
+```text
+X ∈ ℝ^(n × d_model)
+```
+
+模型学习三张投影矩阵：
+
+```text
+W_Q ∈ ℝ^(d_model × d_k)
+W_K ∈ ℝ^(d_model × d_k)
+W_V ∈ ℝ^(d_model × d_v)
+```
+
+然后计算<Term id="query-key-value" />：
+
+```text
+Q = XW_Q
+K = XW_K
+V = XW_V
+```
+
+得到：
+
+```text
+Q ∈ ℝ^(n × d_k)
+K ∈ ℝ^(n × d_k)
+V ∈ ℝ^(n × d_v)
+```
+
+每个位置都有自己的Q、K和V。可以把职责写得很具体：
+
+- 当前行的Q提出“这个位置需要匹配什么”；
+- 所有位置的K参与匹配；
+- 匹配结果经过归一化后，用来组合对应的V；
+- 输出仍然是一行新的位置表示，不是一个检索文档ID。
+
+<AttentionMechanismDiagram />
+
+## 4. 缩放点积Attention逐步计算
+
+完整公式是：
+
+```text
+Attention(Q, K, V) = softmax(QK^T / √d_k)V
+```
+
+也就是`softmax(QK^T / √d_k)V`。拆成五步：
+
+### 第一步：计算匹配分数
+
+```text
+S_raw = QK^T
+```
+
+`Q`是`n × d_k`，`K^T`是`d_k × n`，所以：
+
+```text
+S_raw ∈ ℝ^(n × n)
+```
+
+第`i`行第`j`列是位置`i`的Query与位置`j`的Key点积。每一行表示“位置`i`对所有可访问位置的原始匹配分数”。
+
+### 第二步：除以平方根
+
+```text
+S = S_raw / √d_k
+```
+
+如果Q和K各维近似均值0、方差1，点积的方差随`d_k`增长。维度越大，未经缩放的分数幅度通常越大，Softmax更容易落入接近One-hot的饱和区域，梯度变小。除以`√d_k`把分数量级拉回更稳定的范围。
+
+这个缩放不是为了让矩阵维度匹配；矩阵乘法在缩放前已经合法。它处理的是数值尺度。
+
+### 第三步：加入Mask
+
+Decoder-only自回归模型不能让位置`i`看到未来位置`j > i`。<Term id="causal-mask" />在Softmax前把非法位置加上负无穷：
+
+```text
+S_masked[i,j] = -∞, when j > i
+```
+
+例如四个位置的Mask是：
+
+```text
+[ 0  -∞  -∞  -∞ ]
+[ 0   0  -∞  -∞ ]
+[ 0   0   0  -∞ ]
+[ 0   0   0   0 ]
+```
+
+Softmax后，被屏蔽位置权重为0。Padding Mask解决的是“不要读取补齐位置”，Causal Mask解决的是“不要读取未来位置”，二者不能混为一谈。
+
+### 第四步：逐行Softmax
+
+```text
+A = softmax(S_masked)
+```
+
+`A`仍是`n × n`。每一行都是非负权重且和为1。
+
+### 第五步：组合Value
+
+```text
+O = AV
+```
+
+`A`是`n × n`，`V`是`n × d_v`，结果：
+
+```text
+O ∈ ℝ^(n × d_v)
+```
+
+所以Attention不是把最相关位置“复制过来”，而是对所有允许位置的Value做加权和。
+
+## 5. 一个可手算的Attention例子
+
+假设某个Query与三个Key的原始点积是：
+
+```text
+[2, 1, 0]
+```
+
+并且`d_k = 4`。除以`√4 = 2`后：
+
+```text
+scaled scores = [1.0, 0.5, 0.0]
+```
+
+Softmax权重约为：
+
+```text
+[0.506480, 0.307196, 0.186324]
+```
+
+它们之和约为1。再假设三个Value是：
+
+```text
+V₁ = [1, 0]
+V₂ = [0, 2]
+V₃ = [1, 1]
+```
+
+输出是：
+
+```text
+0.506480·V₁ + 0.307196·V₂ + 0.186324·V₃
+≈ [0.692804, 0.800715]
+```
+
+这个例子说明两件事：
+
+1. 最大分数对应的位置影响最大，但其他位置没有自动消失；
+2. Attention输出是Value向量的混合，不是那三个权重本身。
+
+如果第三个位置被Mask，先把第三个分数变成负无穷，再对剩下两项重新Softmax。不能先算三项Softmax，再把第三项权重直接设为0，因为那样剩余权重之和不再是1。
+
+### 实现里最常见的错误
+
+| 错误 | 后果 | 检查方法 |
+|---|---|---|
+| 用`√d_model`而不是当前Head的`√d_k`缩放 | 分数尺度与公式不一致 | 打印每个Head的维度与缩放常量 |
+| 沿错误的轴做Softmax | 权重不是“每个Query对所有Key”归一化 | 检查Attention矩阵每一行之和是否约为1 |
+| Softmax后才应用Mask | 非法位置已经参与了归一化 | 在Softmax前检查未来位置是否为负无穷 |
+| 只屏蔽未来位置，不屏蔽Padding | 模型会组合补齐Token的Value | 分别测试Causal Mask与Padding Mask |
+| 把Attention权重直接乘Q或K | 输出语义和维度都错误 | 最后一步必须是`A @ V` |
+| Decode时缓存整张Attention矩阵 | 内存迅速膨胀且不能直接复用 | 历史缓存保存各层K/V，新Token重新产生Query |
+
+批处理实现通常还会出现`batch × heads × sequence × head_dim`四维张量。调换`heads`和`sequence`有时仍能完成矩阵乘法，却得到完全错误的语义，因此形状断言和小矩阵Golden Test比“能运行”重要。
+
+## 6. 为什么要多头
+
+<Term id="multi-head-attention" />不是把同一张Attention矩阵复制多份。第`h`个Head有自己的投影：
+
+```text
+head_h = Attention(XW_Q^h, XW_K^h, XW_V^h)
+```
+
+各Head结果拼接后，再投影回模型维度：
+
+```text
+MultiHead(X) = Concat(head_1, ..., head_H)W_O
+```
+
+原始论文使用8个Head，并把每个Head的`d_k`和`d_v`设为`d_model / H`，使总计算量与一个全维单头保持在相近量级。这个数值是原论文配置，不是所有模型必须遵守的标准。
+
+多头的价值在于不同投影能在不同表示子空间和位置上建立关系。需要避免两种过度解释：
+
+- 不能规定“Head 1负责语法，Head 2负责事实”；训练不会接受这种人工职责表；
+- 某个Head出现可读模式，不代表它单独决定了最终输出，后面还有投影、残差、其他Head和许多层。
+
+## 7. Attention不是整个Transformer Block
+
+只讲Attention容易给人一种错觉：模型每层只是重新分配上下文权重。原始Transformer的一个子层结构是：
+
+```text
+LayerNorm(x + Sublayer(x))
+```
+
+其中`Sublayer`可能是Multi-Head Attention或前馈网络。Decoder层还会加入Mask。现代架构可能把LayerNorm放在子层之前，但仍能看到三类职责：
+
+### 残差连接（Residual Connection）
+
+```text
+x_next = x + Sublayer(x)
+```
+
+子层学习对当前表示的修正，而不是每层从头重建全部信息。残差也为深层网络提供更直接的梯度路径。
+
+### 归一化（Normalization）
+
+归一化控制激活的数值尺度，提高深层训练稳定性。它不是把Token长度归一化，也不是概率归一化；Softmax和LayerNorm解决不同问题。
+
+### 逐位置前馈网络（Position-wise FFN）
+
+原始论文写成：
+
+```text
+FFN(x) = max(0, xW₁ + b₁)W₂ + b₂
+```
+
+同一组参数独立应用于每个位置。Attention在位置之间混合信息，FFN则对每个位置的通道表示做非线性变换。现代模型可能换激活函数或门控结构，但“跨位置混合”和“逐位置变换”仍是两个不同步骤。
+
+## 8. 为什么长上下文代价高
+
+完整Self-Attention要形成`n × n`分数关系。原始论文给出的每层计算复杂度是：
+
+```text
+O(n²d)
+```
+
+其中`n`是序列长度，`d`是表示维度。把上下文长度翻倍时，两两关系数量接近四倍。优化Kernel可以减少中间矩阵写回和显存流量，局部或稀疏Attention也可以改变实际计算范围，但“所有位置两两交互”的基本版本具有平方项。
+
+长上下文还会增加：
+
+- Prompt处理时间；
+- Attention与中间激活的内存压力；
+- <Term id="kv-cache" />占用；
+- 传入无关或冲突证据的概率；
+- 评测覆盖难度。
+
+所以“模型支持更长窗口”和“模型能稳定利用窗口里任意位置的事实”是两种不同声明。上限是接口容量，不是检索质量保证。
+
+## 9. Prefill、Decode与KV Cache
+
+自回归推理分成<Term id="prefill-decode" />：
+
+### Prefill
+
+模型一次处理已有Prompt的所有Token，建立各层表示和K/V。这个阶段能在Token维度上较充分并行，工作量受输入长度影响明显。
+
+### Decode
+
+模型根据最后位置的Logits选出一个新Token，把它接到序列末尾，再算下一个Token。生成在时间上是串行的：第`t+1`个输出依赖第`t`个已经选定。
+
+### KV Cache
+
+没有缓存时，每生成一个Token都要重新为完整前缀计算K和V。<Term id="kv-cache" />保存历史Token在每一层的K/V，新一步只计算新Token的Q/K/V，再让新Query访问历史缓存。
+
+缓存改变了重复计算，但不是免费：
+
+```text
+KV Cache大小大致随以下因素线性增长：
+层数 × 已缓存Token数 × K/V维度 × 数值字节数 × Batch大小
+```
+
+具体布局还受Multi-Query或Grouped-Query Attention等架构影响。工程上应读取模型配置和推理引擎实际指标，不要只用参数量估算。
+
+如果吞吐突然下降，需要区分：
+
+- Prefill太长，首Token延迟高；
+- Decode序列太长，单请求占用时间长；
+- KV Cache容量不足，Batch无法继续增大；
+- 调度器被少数长请求拖住；
+- 输出Token上限设置过宽。
+
+## 10. 上下文窗口是一个硬约束，不是资料仓库
+
+<Term id="context-window" />要同时容纳：
+
+```text
+系统指令
++ Chat Template与角色标记
++ 用户当前输入
++ 工具定义
++ 对话历史
++ 检索证据
++ 工具结果
++ 预留输出
++ 安全余量
+≤ 模型窗口上限
+```
 
 <ContextWindowDiagram />
 
-最常见的错误是先塞满历史，再发现没有空间生成完整答案。更稳妥的顺序是：
+预算可以写成一个可执行约束：
 
-1. 先预留输出空间；
-2. 保留系统边界和当前任务；
-3. 只加入与问题相关的证据；
-4. 压缩或删除重复历史；
-5. 超预算时明确截断策略。
+```text
+B_input = B_system + B_template + B_user + B_tools + B_history + B_evidence
+B_input + B_output + B_margin ≤ C_context
+```
 
-## 4. 结构化输出为什么仍需校验
+先预留`B_output`和`B_margin`，再分配输入。不能让历史和检索先把窗口塞满，最后把输出截成半个JSON。
 
-<Term id="structured-output" />可以减少解析歧义，但它不是可信执行。程序仍要用<Term id="schema" />检查字段、类型和取值范围，再检查业务权限。
+### 一个32768 Token的例子
+
+假设：
+
+```text
+C_context = 32768
+B_margin  = 1024
+B_output  = 4096
+```
+
+可用输入预算是：
+
+```text
+32768 - 1024 - 4096 = 27648
+```
+
+一份明确分配可以是：
+
+| 部分 | 预算 |
+|---|---:|
+| System与固定边界 | 1536 |
+| 工具定义 | 3072 |
+| 当前用户输入 | 1024 |
+| 检索证据 | 14336 |
+| 对话历史 | 7680 |
+| 合计 | 27648 |
+
+这不是推荐比例，而是一份能被程序检查的方案。任务变了，预算也要变：代码生成可能需要更大输出；证据问答应优先保留来源；工具很多时应按当前步骤只暴露必要定义。
+
+```ts title="context-budget.ts"
+type Budget = {
+  contextLimit: number;
+  outputReserve: number;
+  safetyMargin: number;
+  system: number;
+  tools: number;
+  user: number;
+  evidence: number;
+  history: number;
+};
+
+function assertBudget(b: Budget) {
+  const input = b.system + b.tools + b.user + b.evidence + b.history;
+  const total = input + b.outputReserve + b.safetyMargin;
+  if (total > b.contextLimit) {
+    throw new Error(`context-overflow:${total - b.contextLimit}`);
+  }
+  return { input, total, remaining: b.contextLimit - total };
+}
+```
+
+## 11. 超预算时按信息职责删，不按位置硬切
+
+直接保留最后`N`个Token很简单，但可能把System边界、问题主语或证据标题切掉。更稳妥的顺序是：
+
+1. 固定保留安全边界、当前任务和输出契约；
+2. 删除完全重复的检索片段；
+3. 按问题相关性和来源质量选择证据；
+4. 把较老历史压缩成带版本的摘要；
+5. 只保留当前步骤需要的工具定义；
+6. 对超长工具结果提取结构化字段，原始结果留在外部存储；
+7. 仍然超预算时，明确返回“证据过多”或拆分任务。
+
+每次截断都应该生成记录：
+
+```text
+original_tokens
+kept_tokens
+removed_sections
+summary_version
+retrieval_query
+chunk_ids
+output_reserve
+```
+
+否则模型答错时，只能看到最终Prompt，无法知道哪些关键信息在组装阶段被删除。
+
+### 摘要不是无损压缩
+
+历史摘要会丢信息，也会固化错误。不要每轮都“摘要上一版摘要”，那会产生累积漂移。更可靠的做法是保留原始事件或消息，在需要时从受控范围重新生成摘要，并记录摘要使用的源消息ID。
+
+## 12. 检索证据多，不等于证据好
+
+把十个相似Chunk都放入上下文，既浪费Token，也会重复放大同一来源。检索组装至少要考虑：
+
+- Chunk是否直接回答当前问题；
+- 多个Chunk是否来自同一段落的重叠窗口；
+- 来源之间是否冲突；
+- 标题、日期和实体指代是否保留；
+- 证据位置是否能映射回引用；
+- 没有足够证据时是否允许回答“不知道”。
+
+一个可检查的组装流程是：
+
+```text
+召回候选
+→ 去掉精确重复
+→ 按来源与文档聚类
+→ 重排
+→ 在每个来源内选择互补片段
+→ 加入来源标识
+→ 计算真实Token数
+→ 超预算时重新选择，而不是截断到半句
+```
+
+“Lost in the Middle”一类位置效应提醒我们：信息在窗口里，不等于模型会稳定使用。不要只做一个正例。把同一证据放在开头、中间、结尾，加入相似干扰项，再比较准确率与引用一致性。
+
+## 13. Attention权重不是解释
+
+**Attention权重不是解释。** 它是某一层、某个Head、某个位置在一次前向计算中的中间量。
+
+权重图能帮助检查：
+
+- Causal Mask是否正确；
+- Padding位置是否被屏蔽；
+- 某个Head是否完全塌缩；
+- 输入变化后关联模式是否改变；
+- 实现与预期张量形状是否一致。
+
+但它不能单独证明：
+
+- 某个Token“导致”了最终答案；
+- 模型使用了最高权重位置里的事实；
+- 低权重信息对后续层没有影响；
+- 一个漂亮的Head模式代表整个模型的推理过程。
+
+原因很直接：输出还会经过Value混合、Head拼接、输出投影、残差、FFN和后续许多层。同一个最终Logit来自整条计算图。
+
+更严格的检查需要干预：删除、替换或移动候选证据，固定其他输入，再测最终输出、Logit或任务指标是否稳定变化。可视化是检查工具，不是因果结论。
+
+## 14. 从隐藏状态到下一个Token
+
+最后一层隐藏状态经过输出投影，得到词表大小的Logits：
+
+```text
+logits ∈ ℝ^(vocab_size)
+```
+
+Softmax把Logits转成概率分布。解码策略再决定选哪个Token：
+
+- Greedy每次选最大值，稳定但不一定得到全局更好序列；
+- Temperature改变分布锐度；
+- Top-p只保留累计概率达到阈值的候选集合；
+- 固定随机种子也不保证跨模型版本、硬件和推理实现完全复现。
+
+这一步说明“Attention找到信息”和“模型输出正确Token”之间还有距离。上下文证据可能被正确关联，但输出仍可能受采样、指令冲突或后续层变换影响。
+
+## 15. 结构化输出仍需要程序边界
+
+<Term id="structured-output" />能约束输出格式，不会自动授权业务动作。程序至少分两层验证：
 
 ```ts title="validated-output.ts"
 const parsed = actionSchema.safeParse(modelOutput);
 if (!parsed.success) {
   return { kind: 'stop', reason: 'invalid-schema' };
 }
-return authorize(parsed.data);
+
+const decision = authorize(parsed.data, currentUser, currentState);
+if (!decision.allowed) {
+  return { kind: 'stop', reason: 'forbidden-action' };
+}
+
+return execute(decision.action);
 ```
 
-## 5. 小练习
+<Term id="schema" />检查字段、类型和取值；Authorization检查这个用户在当前状态下能不能做。即使模型生成了完美JSON，也不能跳过第二层。
 
-假设模型的上下文上限是100个预算单位，请为下面五项分配比例：固定指令、用户输入、检索证据、历史和输出。
+## 16. 三个实验，比“理解概念”更可靠
 
-然后分别模拟：
+### 实验A：Tokenizer审计
 
-- 检索返回十段重复材料；
-- 对话历史突然翻倍；
-- 输出需要从短答案改成长报告。
+选择固定的中文、英文、代码、URL和Emoji样本，对目标模型Tokenizer记录：
 
-<strong>验收：</strong>每种变化都有确定的删减顺序，并且输出预留不会降到零。
+```text
+text_hash, tokenizer_id, token_ids, token_count
+```
+
+然后修改空格、换行、大小写和Unicode表示，观察Token数变化。验收标准不是背下平均换算，而是能预测哪些输入会破坏预算，并用真实Tokenizer确认。
+
+### 实验B：Attention手算与Mask
+
+用本课的三个Key例子：
+
+1. 自己计算缩放分数与Softmax；
+2. 屏蔽第三个位置并重新归一化；
+3. 交换第二、第三个Value，只改变输出，不改变权重；
+4. 交换Key则观察权重变化；
+5. 把`d_k`缩放去掉，比较分布锐度。
+
+做到这里，Q/K决定权重、V决定被混合内容的区别才算真正清楚。
+
+### 实验C：上下文位置与干扰
+
+构造20个固定问题，每题只有一段证据。分别运行：
+
+```text
+证据在开头
+证据在中间
+证据在结尾
+证据 + 5段相似干扰
+证据 + 1段冲突材料
+无证据
+```
+
+记录：答案正确率、引用正确率、无答案准确率、输入Token、首Token延迟和总成本。不要只展示一个成功对话。
+
+## 17. 完成本课的检查线
+
+你应当能在白板上完成：
+
+- 给定`X`、`W_Q`、`W_K`、`W_V`，写出Q/K/V形状；
+- 解释为什么`QK^T`是`n × n`，为什么要除以`√d_k`；
+- 在Softmax前正确加入Causal Mask；
+- 手算一个Query对三个Value的加权输出；
+- 说明多头结果如何拼接并投影；
+- 解释Attention、FFN、Residual和Normalization的不同职责；
+- 说明为什么完整Self-Attention含`O(n²d)`项；
+- 区分Prefill与Decode，并解释KV Cache省了什么、占了什么；
+- 为一个32768 Token任务写出硬预算和删减顺序；
+- 设计干预实验，而不是把Attention热力图当成模型解释。
+
+如果只能说“Attention会关注重要词”“上下文越长知道得越多”，这部分还停留在科普层。
