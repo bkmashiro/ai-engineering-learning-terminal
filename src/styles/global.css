@@ -119,6 +119,7 @@ body {
   min-height: 2.75rem;
   align-items: center;
   justify-content: center;
+  gap: 0.45rem;
   padding: 0.55rem 0.95rem;
   border: 1px solid var(--sl-color-accent);
   border-radius: 0.5rem;
@@ -126,6 +127,12 @@ body {
   background: var(--sl-color-accent);
   font-weight: 650;
   text-decoration: none !important;
+}
+
+.site-action svg {
+  width: 1.05rem;
+  height: 1.05rem;
+  flex: none;
 }
 
 .site-action.is-secondary {

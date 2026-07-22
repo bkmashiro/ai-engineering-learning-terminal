@@ -7,7 +7,13 @@ test('homepage exposes the learning route and keeps the page readable', async ({
   await expect(page).toHaveTitle(/AI 工程学习终端/);
   await expect(page.getByRole('heading', { name: '先建立共同底座，再选择方向。' })).toBeVisible();
   await expect(page.getByRole('link', { name: '查看完整路线' })).toHaveAttribute('href', '/roadmap/');
-  await expect(page.getByRole('link', { name: '开始第一课' })).toHaveAttribute('href', '/agent/workflow-vs-agent/');
+  await expect(page.getByRole('link', { name: '从第一课开始' })).toHaveAttribute('href', '/foundations/reproducibility/');
+  await expect(page.getByRole('link', { name: '在 GitHub 查看课程仓库' })).toHaveAttribute(
+    'href',
+    'https://github.com/bkmashiro/ai-engineering-learning-terminal',
+  );
+  await expect(page.getByRole('heading', { name: '课程覆盖' })).toBeVisible();
+  await expect(page.getByText('第一版已经可以学什么？')).toHaveCount(0);
 
   const widths = await page.evaluate(() => ({ viewport: window.innerWidth, document: document.documentElement.scrollWidth }));
   expect(widths.document).toBeLessThanOrEqual(widths.viewport + 1);
@@ -22,6 +28,19 @@ test('homepage exposes the learning route and keeps the page readable', async ({
     Number.parseFloat(getComputedStyle(node).fontSize),
   );
   expect(scopeFontSize).toBeGreaterThanOrEqual(14);
+});
+
+test('sidebar separates learning directions from site references', async ({ page }, testInfo) => {
+  await page.goto('/glossary/');
+  if (testInfo.project.name === 'mobile-chromium') {
+    await page.getByRole('button', { name: '菜单', exact: true }).click();
+  }
+  const sidebar = page.locator('#starlight__sidebar');
+  await expect(sidebar.getByText('方向', { exact: true })).toBeVisible();
+  await expect(sidebar.getByText('参考与本站', { exact: true })).toBeVisible();
+  await expect(sidebar.getByRole('link', { name: '术语表', exact: true })).toBeVisible();
+  await expect(sidebar.getByRole('link', { name: '来源', exact: true })).toBeVisible();
+  await expect(sidebar.getByRole('link', { name: '关于本站', exact: true })).toBeVisible();
 });
 
 test('roadmap filters without losing the selected direction prerequisites', async ({ page }) => {
@@ -81,6 +100,29 @@ test('architecture map and terminology peeks are directly explorable', async ({ 
   await firstTerm.locator('dfn').focus();
   await expect(firstTerm.locator('.term-peek__panel')).toBeVisible();
   await expect(firstTerm.locator('.term-peek__panel')).toContainText('打开术语条目');
+});
+
+test('term peek remains interactive while the pointer crosses into its panel', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'hover-gap behavior is desktop-specific');
+  await page.goto('/agent/workflow-vs-agent/');
+
+  const firstTerm = page.locator('.term-peek').first();
+  const trigger = firstTerm.locator('dfn');
+  const panel = firstTerm.locator('.term-peek__panel');
+  await trigger.hover();
+  await expect(panel).toBeVisible();
+
+  const triggerBox = await trigger.boundingBox();
+  const panelBox = await panel.boundingBox();
+  expect(triggerBox).not.toBeNull();
+  expect(panelBox).not.toBeNull();
+  if (!triggerBox || !panelBox) throw new Error('term peek geometry is unavailable');
+
+  await page.mouse.move(triggerBox.x + triggerBox.width / 2, triggerBox.y + triggerBox.height - 1);
+  await page.mouse.move(panelBox.x + panelBox.width / 2, panelBox.y + 2, { steps: 12 });
+  await expect(panel).toBeVisible();
+  await panel.getByRole('link', { name: /打开术语条目/ }).click();
+  await expect(page).toHaveURL(/\/glossary\/#/);
 });
 
 test('core pages have no automatic WCAG A/AA violations', async ({ page }) => {

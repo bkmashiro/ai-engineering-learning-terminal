@@ -46,9 +46,9 @@ export function ModuleProgress({ moduleId }: ModuleProgressProps) {
         </svg>
       </div>
       <div class="module-progress__copy">
-        <span>LOCAL PROGRESS</span>
-        <strong role="status">{available ? (completed ? '本课已完成' : '本课尚未完成') : '浏览器存储不可用'}</strong>
-        <small>只保存在这个浏览器，不含账号和遥测。</small>
+        <span>课程进度</span>
+        <strong role="status">{available ? (completed ? '本课已完成' : '本课尚未完成') : '暂时无法保存进度'}</strong>
+        <small>{available ? '完成后可随时撤销标记。' : '不会影响课程阅读。'}</small>
       </div>
       <button type="button" onClick={toggle} disabled={!available}>
         {completed ? '撤销完成标记' : '标记本课完成'}

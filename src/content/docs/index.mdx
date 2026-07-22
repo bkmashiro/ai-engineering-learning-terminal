@@ -13,7 +13,7 @@ careerDirections: []
 sourceIds:
   - curriculum-method
 sourceLocale: zh-CN
-lastReviewed: 2026-07-21
+lastReviewed: 2026-07-22
 head:
   - tag: title
     content: AI 工程学习终端
@@ -30,7 +30,19 @@ import SystemStackDiagram from '../../components/content/SystemStackDiagram.astr
   </p>
   <div class="site-actions">
     <a class="site-action" href="/roadmap/">查看完整路线</a>
-    <a class="site-action is-secondary" href="/agent/workflow-vs-agent/">开始第一课</a>
+    <a class="site-action is-secondary" href="/foundations/reproducibility/">从第一课开始</a>
+    <a
+      class="site-action is-secondary"
+      href="https://github.com/bkmashiro/ai-engineering-learning-terminal"
+      target="_blank"
+      rel="noreferrer"
+      aria-label="在 GitHub 查看课程仓库"
+    >
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+        <path fill="currentColor" d="M8 0C3.58 0 0 3.64 0 8.13c0 3.59 2.29 6.64 5.47 7.71.4.08.55-.18.55-.39 0-.19-.01-.82-.01-1.49-2.01.44-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.16.02-.16.02-.16.31.02.48.33.48.33.36.62.94.44 1.17.34.04-.26.14-.44.25-.54-1.6-.18-3.28-.81-3.28-3.61 0-.8.28-1.45.74-1.96-.07-.18-.32-.92.07-1.93 0 0 .61-.2 2 .75A6.8 6.8 0 0 1 8 4.96c.68 0 1.36.09 1.98.27 1.39-.95 2-.75 2-.75.39 1.01.14 1.75.07 1.93.46.51.74 1.16.74 1.96 0 2.81-1.68 3.42-3.29 3.6.26.23.49.67.49 1.35 0 .97-.01 1.75-.01 1.99 0 .22.15.47.55.39A8.15 8.15 0 0 0 16 8.13C16 3.64 12.42 0 8 0Z" />
+      </svg>
+      <span>GitHub</span>
+    </a>
   </div>
 </section>
 
@@ -52,16 +64,12 @@ import SystemStackDiagram from '../../components/content/SystemStackDiagram.astr
 
 <StagePreview />
 
-## 第一版已经可以学什么？
+## 课程覆盖
 
-### 当前可学习模块
+- **共同底座：** 可复现证据、状态机、网络与流式、事务与队列、机器学习实验；
+- **LLM 应用：** Token、Attention、上下文预算、检索、引用与无答案；
+- **Agent 工程：** Workflow 边界、工具契约、状态、记忆与可审计 Runner；
+- **安全与生产：** 威胁模型、可执行评测、回放、SLO、降级、对账与综合项目；
+- **方向分支：** Agent 应用、Runtime 与评测、AI 后端、检索、多模态 GUI Agent、游戏 AI、端侧推理。
 
-- [网络、流式与取消](/foundations/software-systems/network-streaming/)：请求、SSE、超时、取消与重连。
-- [Token、Attention与上下文](/foundations/llm/)：Token预算、Attention和结构化输出。
-- [Workflow与Agent](/agent/workflow-vs-agent/)：架构选择与确定性的Agent Loop故障注入实验。
-
-[进入第一课 →](/agent/workflow-vs-agent/)
-
-## 公开边界
-
-本站只发布原创中文解释、图示、实验和必要来源署名，不包含真实投递记录、特定岗位资料、私人项目数据或联系方式。站点无需账户、后端和第三方追踪。
+[从“可复现与证据”开始 →](/foundations/reproducibility/)

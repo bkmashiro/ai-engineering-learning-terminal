@@ -86,7 +86,7 @@ export default defineConfig({
           ],
         },
         {
-          label: '方向与参考',
+          label: '方向',
           items: [
             { label: '方向总览', slug: 'directions' },
             { label: 'Agent 应用与产品工程', slug: 'directions/agent-applications' },
@@ -96,6 +96,11 @@ export default defineConfig({
             { label: 'GUI、OS 与多模态 Agent', slug: 'directions/gui-multimodal-agents' },
             { label: '游戏 AI 与交互式叙事', slug: 'directions/game-ai-interactive-narrative' },
             { label: '端侧与推理工程', slug: 'directions/edge-inference' },
+          ],
+        },
+        {
+          label: '参考与本站',
+          items: [
             { label: '术语表', slug: 'glossary' },
             { label: '来源', slug: 'sources' },
             { label: '关于本站', slug: 'about' },
