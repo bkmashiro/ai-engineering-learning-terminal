@@ -1,0 +1,150 @@
+<figure class="model-serving-control" aria-labelledby="model-serving-control-caption">
+  <div class="model-serving-control__title">
+    <span>REQUEST PATH</span>
+    <strong>把“模型很慢”拆成可控制的服务阶段</strong>
+  </div>
+
+  <div class="model-serving-control__path" aria-label="模型服务请求路径">
+    <div class="model-serving-control__node">
+      <small>01 · Admission</small>
+      <strong>准入与预算</strong>
+      <span>Deadline、Token上限、租户配额</span>
+    </div>
+    <span class="model-serving-control__arrow" aria-hidden="true">→</span>
+    <div class="model-serving-control__node">
+      <small>02 · Route</small>
+      <strong>版本与供应路径</strong>
+      <span>能力、地区、成本、健康度</span>
+    </div>
+    <span class="model-serving-control__arrow" aria-hidden="true">→</span>
+    <div class="model-serving-control__node model-serving-control__node--queue">
+      <small>03 · Schedule</small>
+      <strong>排队与连续批处理</strong>
+      <span>公平性、KV容量、负载保护</span>
+    </div>
+    <span class="model-serving-control__arrow" aria-hidden="true">→</span>
+    <div class="model-serving-control__node model-serving-control__node--engine">
+      <small>04 · Infer</small>
+      <strong>Prefill → Decode</strong>
+      <span>TTFT、ITL、吞吐、KV Cache</span>
+    </div>
+    <span class="model-serving-control__arrow" aria-hidden="true">→</span>
+    <div class="model-serving-control__node">
+      <small>05 · Deliver</small>
+      <strong>流式输出与验收</strong>
+      <span>取消、完整性、结果分类</span>
+    </div>
+  </div>
+
+  <div class="model-serving-control__feedback">
+    <div>
+      <small>OBSERVE</small>
+      <strong>分阶段指标</strong>
+      <span>Queue、Prefill、Decode、E2E、拒绝率</span>
+    </div>
+    <div>
+      <small>DECIDE</small>
+      <strong>控制策略</strong>
+      <span>扩容、限流、降级、切流、回滚</span>
+    </div>
+    <div>
+      <small>VERIFY</small>
+      <strong>版本证据</strong>
+      <span>模型/Tokenizer/配置、路由原因、成本</span>
+    </div>
+  </div>
+
+  <figcaption id="model-serving-control-caption">
+    数据平面执行一次请求；控制平面用分阶段指标调整准入、路由与发布策略。平均延迟正常不能证明尾延迟、排队和拒绝路径健康。
+  </figcaption>
+</figure>
+
+<style>
+  .model-serving-control {
+    display: grid;
+    gap: 0.85rem;
+    margin: 1.35rem 0;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.85rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 4%, var(--sl-color-bg));
+  }
+
+  .model-serving-control__title,
+  .model-serving-control__node,
+  .model-serving-control__feedback > div {
+    display: grid;
+    gap: 0.2rem;
+  }
+
+  .model-serving-control__title span,
+  .model-serving-control__node small,
+  .model-serving-control__feedback small {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.65rem;
+    font-weight: 750;
+    letter-spacing: 0.06em;
+  }
+
+  .model-serving-control__path {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr) auto) minmax(0, 1fr);
+    align-items: stretch;
+    gap: 0.38rem;
+  }
+
+  .model-serving-control__node,
+  .model-serving-control__feedback > div {
+    min-width: 0;
+    padding: 0.72rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.62rem;
+    background: var(--sl-color-bg);
+  }
+
+  .model-serving-control__node--queue {
+    border-color: color-mix(in srgb, #d97706 52%, var(--sl-color-gray-5));
+  }
+
+  .model-serving-control__node--engine {
+    border-color: color-mix(in srgb, var(--sl-color-accent) 64%, var(--sl-color-gray-5));
+  }
+
+  .model-serving-control__node strong,
+  .model-serving-control__feedback strong { font-size: 0.84rem; }
+  .model-serving-control__node span,
+  .model-serving-control__feedback span,
+  .model-serving-control figcaption {
+    color: var(--sl-color-gray-2);
+    font-size: 0.72rem;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+  }
+
+  .model-serving-control__arrow {
+    align-self: center;
+    color: var(--sl-color-accent-high);
+    font-weight: 800;
+  }
+
+  .model-serving-control__feedback {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.55rem;
+    padding-top: 0.7rem;
+    border-top: 1px dashed var(--sl-color-gray-5);
+  }
+
+  .model-serving-control figcaption { margin: 0; }
+
+  @media (max-width: 64rem) {
+    .model-serving-control__path { grid-template-columns: 1fr; }
+    .model-serving-control__arrow { transform: rotate(90deg); justify-self: center; }
+  }
+
+  @media (max-width: 42rem) {
+    .model-serving-control { padding: 0.75rem; }
+    .model-serving-control__feedback { grid-template-columns: 1fr; }
+  }
+</style>

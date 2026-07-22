@@ -1,0 +1,143 @@
+<figure class="data-asset-lifecycle" aria-labelledby="data-asset-lifecycle-caption">
+  <div class="data-asset-lifecycle__title">
+    <span>VERSIONED DERIVATION GRAPH</span>
+    <strong>每个在线结果都要能追溯、失效并重建</strong>
+  </div>
+
+  <div class="data-asset-lifecycle__graph" aria-label="数据资产版本化派生图">
+    <div class="data-asset-lifecycle__node">
+      <small>SOURCE</small>
+      <strong>来源版本</strong>
+      <span>身份、授权、内容Hash、有效时间</span>
+    </div>
+    <span class="data-asset-lifecycle__arrow" aria-hidden="true">→</span>
+    <div class="data-asset-lifecycle__node">
+      <small>JOB</small>
+      <strong>解析与规范化</strong>
+      <span>代码/配置/环境版本</span>
+    </div>
+    <span class="data-asset-lifecycle__arrow" aria-hidden="true">→</span>
+    <div class="data-asset-lifecycle__node">
+      <small>DERIVED</small>
+      <strong>Chunk / Feature</strong>
+      <span>父版本、Schema、质量结果</span>
+    </div>
+    <span class="data-asset-lifecycle__arrow" aria-hidden="true">→</span>
+    <div class="data-asset-lifecycle__node data-asset-lifecycle__node--published">
+      <small>PUBLISHED</small>
+      <strong>Index Generation</strong>
+      <span>原子指针、可回滚版本</span>
+    </div>
+  </div>
+
+  <div class="data-asset-lifecycle__changes">
+    <div>
+      <small>CHANGE</small>
+      <strong>更新 / 删除 / 权限变化</strong>
+      <span>先产生可审计事件，不直接散改每个派生存储。</span>
+    </div>
+    <span class="data-asset-lifecycle__down" aria-hidden="true">↓</span>
+    <div>
+      <small>IMPACT</small>
+      <strong>沿血缘计算影响集</strong>
+      <span>定位需要失效、重算、撤回和清理的后代版本。</span>
+    </div>
+    <span class="data-asset-lifecycle__down" aria-hidden="true">↓</span>
+    <div>
+      <small>CONVERGE</small>
+      <strong>重建 → 验证 → 切换 → GC</strong>
+      <span>查询只能看到一个完整Generation；旧版本按保留策略清理。</span>
+    </div>
+  </div>
+
+  <figcaption id="data-asset-lifecycle-caption">
+    血缘不是展示图，而是更新、撤回、权限收紧与重建时计算影响范围的执行依据。删除源文件不等于删除了Chunk、Embedding、缓存和历史导出。
+  </figcaption>
+</figure>
+
+<style>
+  .data-asset-lifecycle {
+    display: grid;
+    gap: 0.85rem;
+    margin: 1.35rem 0;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.85rem;
+    background: color-mix(in srgb, #0f766e 4%, var(--sl-color-bg));
+  }
+
+  .data-asset-lifecycle__title,
+  .data-asset-lifecycle__node,
+  .data-asset-lifecycle__changes > div {
+    display: grid;
+    gap: 0.2rem;
+  }
+
+  .data-asset-lifecycle__title span,
+  .data-asset-lifecycle small {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.65rem;
+    font-weight: 750;
+    letter-spacing: 0.06em;
+  }
+
+  .data-asset-lifecycle__graph {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(8rem, 1fr) auto) minmax(8rem, 1fr);
+    align-items: stretch;
+    gap: 0.42rem;
+  }
+
+  .data-asset-lifecycle__node,
+  .data-asset-lifecycle__changes > div {
+    padding: 0.72rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.62rem;
+    background: var(--sl-color-bg);
+  }
+
+  .data-asset-lifecycle__node--published {
+    border-color: color-mix(in srgb, #0f766e 65%, var(--sl-color-gray-5));
+  }
+
+  .data-asset-lifecycle__node strong,
+  .data-asset-lifecycle__changes strong { font-size: 0.84rem; }
+  .data-asset-lifecycle__node span,
+  .data-asset-lifecycle__changes span,
+  .data-asset-lifecycle figcaption {
+    color: var(--sl-color-gray-2);
+    font-size: 0.72rem;
+    line-height: 1.45;
+  }
+
+  .data-asset-lifecycle__arrow,
+  .data-asset-lifecycle__down {
+    align-self: center;
+    color: var(--sl-color-accent-high);
+    font-weight: 800;
+  }
+
+  .data-asset-lifecycle__changes {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr auto 1fr;
+    align-items: stretch;
+    gap: 0.5rem;
+    padding-top: 0.7rem;
+    border-top: 1px dashed var(--sl-color-gray-5);
+  }
+
+  .data-asset-lifecycle figcaption { margin: 0; }
+
+  @media (max-width: 58rem) {
+    .data-asset-lifecycle__graph,
+    .data-asset-lifecycle__changes { grid-template-columns: 1fr; }
+    .data-asset-lifecycle__arrow,
+    .data-asset-lifecycle__down { justify-self: center; }
+    .data-asset-lifecycle__arrow { transform: rotate(90deg); }
+  }
+
+  @media (max-width: 42rem) {
+    .data-asset-lifecycle { padding: 0.75rem; }
+  }
+</style>

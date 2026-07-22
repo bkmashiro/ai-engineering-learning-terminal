@@ -1,0 +1,834 @@
+---
+title: 数据资产生命周期
+description: 用来源身份、不可变版本、派生血缘、变更事件和Generation切换管理数据更新、删除、权限收紧与重建。
+moduleId: data-asset-lifecycle
+stage: software-systems
+prerequisites:
+  - data-reliability
+outcomes:
+  - 为来源、转换任务和派生资产设计稳定身份、不可变版本与数据契约
+  - 从更新、删除和权限变化事件计算影响集并让索引、缓存和导出最终收敛
+  - 用新鲜度、完整性、权限与血缘门禁验证Generation后再原子发布
+estimatedMinutes: 90
+difficulty: core
+careerDirections:
+  - llm-search-retrieval
+  - ai-backend-reliability
+sourceIds:
+  - openlineage-facets
+  - w3c-prov-o
+  - slsa-provenance
+  - rag-paper
+  - nist-ai-600-1
+sourceLocale: zh-CN
+lastReviewed: 2026-07-22
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import DataAssetLifecycleDiagram from '../../../../components/content/DataAssetLifecycleDiagram.astro';
+import ModulePrerequisites from '../../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="data-asset-lifecycle" client:load />
+
+<ModulePrerequisites moduleId="data-asset-lifecycle" />
+
+一个知识库删除了某份过期手册。对象存储里的原文件已经不存在，管理后台也显示“已删除”，但用户仍能检索到旧段落。原因可能是：规范化文本没有清理、Chunk仍在稀疏索引、Embedding仍在向量索引、答案缓存仍保存旧结果、离线评测夹具仍引用旧版本，或者旧Generation仍被某个Worker读取。
+
+另一个系统把文档权限从`public`收紧为`finance-only`。源数据库立即更新，但索引重建需要20分钟。在这20分钟里，搜索服务若仍相信旧Chunk上的公开标签，就会把内容返回给无权限用户。这个问题不能靠“每天全量重建一次”正确解决。
+
+RAG课程可以教你如何分块、召回、重排和引用；本课回答更早也更长期的问题：材料如何成为一个可管理的数据资产？它由哪些来源和转换产生？更新、删除、权限变化、解析器升级和质量退化后，哪些后代必须失效、重建或撤回？何时可以发布新索引，何时必须回滚？
+
+<DataAssetLifecycleDiagram />
+
+## 1. 数据资产不是一个文件，而是一张版本化派生图
+
+“文件在Bucket里”只描述一个存储位置。生产数据资产至少包含三类节点：
+
+- **Entity**：来源版本、规范化文档、Chunk集合、Embedding分片、索引Generation、评测集、导出文件；
+- **Activity**：抓取、解析、脱敏、分块、Embedding、索引构建、验证、发布；
+- **Agent/Owner**：执行任务的服务身份、维护数据契约的Owner、批准权限和保留策略的责任方。
+
+简化派生图：
+
+```text
+source:policy-manual@v7
+  └─ parse@parser-3.2
+      └─ normalized-document@sha256:...
+          └─ chunk@chunker-5/config-91
+              ├─ sparse-index@generation-104
+              ├─ embedding@embed-model-8
+              │   └─ vector-index@generation-208
+              └─ retrieval-eval-set@v12
+```
+
+<Term id="data-lineage" /> 不是“画一张看起来完整的DAG”。它必须支持实际问题：
+
+- `parser-3.2`有漏洞，哪些资产由它产生？
+- 源版本`v7`被撤回，哪些索引、缓存和导出仍可访问？
+- Embedding模型升级，哪些向量必须重算，哪些稀疏索引可以保留？
+- 权限从公开收紧后，当前查询Generation是否仍含旧标签？
+- 一个异常答案使用了哪个文档版本、Chunker配置和索引Generation？
+
+只保存“最后修改时间”和“当前文件路径”无法回答这些问题。
+
+## 2. 身份、版本和位置必须分开
+
+最小来源资产：
+
+```ts
+interface SourceAssetVersion {
+  assetId: string;              // 跨版本稳定业务身份
+  versionId: string;            // 不可变版本身份
+  canonicalLocation: string;    // 当前可读取位置，不作为唯一身份
+  contentSha256: string;
+  mediaType: string;
+  schemaRevision: string;
+  permissionRevision: string;
+  effectiveAt: string;          // 来源声称何时生效
+  observedAt: string;           // 系统何时观察到
+  ingestedAt: string;           // 何时进入当前流水线
+  state: 'active' | 'superseded' | 'withdrawn' | 'tombstoned';
+}
+```
+
+三个常见错误：
+
+1. **URL当版本**：同一URL内容会变化，历史引用漂移；
+2. **Hash当业务身份**：相同内容可能来自不同授权来源，权限和责任人不同；
+3. **覆盖写当前文件**：旧索引无法证明自己基于哪个版本构建。
+
+推荐关系：
+
+```text
+assetId = 稳定业务对象
+versionId = assetId + 来源版本或内容Digest + 契约版本
+location = 可替换的存储指针
+```
+
+版本写入后不可原地修改。修正文档、Schema或权限都产生新版本或新的权限Revision，并通过事件推进派生系统。
+
+## 3. 数据契约要覆盖语义、质量与责任
+
+<Term id="data-contract" /> 不只是JSON Schema。一个可执行契约至少声明：
+
+```ts
+interface DataContract {
+  contractId: string;
+  revision: string;
+  ownerTeam: string;
+  assetNamespace: string;
+  acceptedMediaTypes: string[];
+  schemaRevision: string;
+  requiredFields: string[];
+  semanticRules: string[];
+  qualityThresholds: Record<string, number>;
+  allowedPurposes: string[];
+  defaultScopes: string[];
+  freshnessSloSeconds: number;
+  retentionClass: string;
+  deletionMode: 'source-only' | 'cascade-derived' | 'legal-hold';
+}
+```
+
+契约要回答：
+
+- 谁负责源字段含义和破坏性变更？
+- 空值、重复、编码、语言和时间字段怎样解释？
+- 允许用于检索、训练、评测还是仅归档？
+- 权限标签从哪里来，缺失时是拒绝还是默认公开？
+- 多久未更新算不新鲜？
+- 删除需要传播到哪些派生产物？
+- 哪些最小证据可以保留，哪些内容必须清除？
+
+缺少Owner的契约只是文档；缺少机器Gate的契约只是愿望。
+
+## 4. 时间不是一个`updated_at`
+
+至少区分：
+
+| 时间 | 含义 | 示例 |
+| --- | --- | --- |
+| `effectiveAt` | 来源事实何时生效 | 政策从7月1日起有效 |
+| `observedAt` | 系统何时看到来源版本 | 抓取器7月1日12:05发现 |
+| `ingestedAt` | 版本何时写入原始区 | 12:06完成入库 |
+| `processedAt` | 某派生任务何时完成 | 12:09完成分块 |
+| `publishedAt` | 何时成为在线可见Generation | 12:12切换索引 |
+
+<Term id="data-freshness" /> 的一个基础量：
+
+```text
+freshnessLag = observedAt - sourceEffectiveAt
+```
+
+如果来源12:00生效、系统12:05观察到，则Observation Lag为300秒。但用户真正感知的“在线新鲜度”应计算：
+
+```text
+servingLag = publishedAt - sourceEffectiveAt
+```
+
+只监控抓取成功会漏掉解析、Embedding或发布卡住。不同资产要有不同SLO：分钟级政策更新与月度归档不能共用一个全局阈值。
+
+<Aside type="caution" title="新鲜不等于正确">
+  刚刚发布的错误数据仍然很新鲜。新鲜度、Schema、权限、完整性和内容质量是独立门禁，不能用一个“最近更新时间”代替。
+</Aside>
+
+## 5. 派生任务身份决定能否重建
+
+一个派生资产的身份必须包含：
+
+```text
+derivedVersion = hash(
+  ordered parent version IDs,
+  transform code revision,
+  transform configuration,
+  runtime/environment revision,
+  relevant contract revision
+)
+```
+
+例如Chunk不能只写`documentId`：
+
+```ts
+interface DerivedAssetVersion {
+  assetId: string;
+  versionId: string;
+  kind: 'normalized' | 'chunks' | 'embeddings' | 'index' | 'eval-set';
+  parentVersionIds: string[];
+  transformId: string;
+  transformRevision: string;
+  configRevision: string;
+  environmentRevision: string;
+  schemaRevision: string;
+  contentSha256: string;
+  permissionRevision: string;
+  state: 'candidate' | 'validated' | 'published' | 'invalid' | 'tombstoned';
+}
+```
+
+父版本顺序是否重要要由转换契约声明。训练数据拼接通常顺序有影响；集合式索引可能先按稳定键排序再计算身份。不能让对象存储列举顺序或线程完成顺序偷偷进入版本Hash。
+
+`transformRevision`是代码身份，`configRevision`是参数身份。只记录Git SHA却不记录Chunk大小、重叠窗口或Embedding模型，会得到无法复现的血缘。
+
+## 6. 构建与发布必须是两阶段
+
+不要直接向在线索引逐条覆盖。推荐流程：
+
+```text
+Build candidate generation
+→ verify manifest
+→ validate counts/schema/permissions/quality
+→ run fixed query probes
+→ mark candidate validated
+→ atomically switch published pointer
+→ observe canary
+→ retain previous generation for rollback window
+→ garbage collect when safe
+```
+
+候选Generation Manifest：
+
+```json
+{
+  "generationId": "retrieval-209",
+  "parentGenerationId": "retrieval-208",
+  "sourceSnapshotId": "source-set-711",
+  "contractRevision": "corpus-contract-v6",
+  "parserRevision": "parser-3.2",
+  "chunkerRevision": "chunker-5/config-91",
+  "embeddingRevision": "embed-model-8",
+  "documentCount": 1842,
+  "chunkCount": 21864,
+  "restrictedChunkCount": 491,
+  "tombstoneCount": 7,
+  "manifestSha256": "sha256:example"
+}
+```
+
+验证至少包含：
+
+- Manifest中的父版本都存在且状态可用；
+- 文档、Chunk与权限字段数量合理；
+- 每个Chunk能反向定位来源版本和区间；
+- 已撤回或Tombstone来源不出现在候选中；
+- 固定查询探针返回预期Generation与引用；
+- 新旧Generation差异在预期范围；
+- 当前读路径能原子切换并明确回滚。
+
+构建成功不等于发布成功；发布指针切换成功也不等于用户路径通过。
+
+## 7. 更新：先记录变更，再计算影响集
+
+来源新版本到达时，写入不可变版本和变更事件：
+
+```ts
+interface AssetChangeEvent {
+  eventId: string;
+  assetId: string;
+  previousVersionId: string | null;
+  nextVersionId: string | null;
+  kind: 'created' | 'updated' | 'withdrawn' | 'permission_changed';
+  permissionRevision: string;
+  observedAt: string;
+  reasonCode: string;
+}
+```
+
+事件消费者按幂等`eventId`处理，计算受影响后代。不要让抓取器直接分别调用“删搜索、删向量、删缓存、重建评测集”；任何一步失败都会留下部分状态，且抓取器无法可靠知道所有消费者。
+
+更新路径：
+
+<Steps>
+1. 保存新来源版本，旧版本标为`superseded`但保持可追踪。
+2. 追加变更事件和版本关系。
+3. 血缘服务计算需要失效或重建的后代资产。
+4. 构建新的规范化、Chunk、Embedding与索引候选版本。
+5. 验证候选与变更差异。
+6. 原子切换在线Generation。
+7. 在回滚窗口后按保留策略清理旧版本。
+</Steps>
+
+如果新版本只改了与检索无关的元数据，可以用契约化变更分类减少重建；但这个优化必须由显式字段依赖证明，不能凭字符串比较猜“看起来没变”。
+
+## 8. 删除与撤回必须传播
+
+删除源文件不等于删除数据。一次`withdrawn`或删除请求可能影响：
+
+- 原始和规范化内容；
+- Chunk文本；
+- 稀疏索引倒排表；
+- Embedding与向量索引；
+- Prompt/答案缓存；
+- 导出文件和离线副本；
+- 评测夹具中的引用；
+- 历史答案展示；
+- 备份和法定保留路径。
+
+<Term id="tombstone" /> 是显式传播删除意图的记录：
+
+```ts
+interface Tombstone {
+  assetId: string;
+  versionId: string;
+  scope: 'specific-version' | 'all-versions';
+  requestedAt: string;
+  effectiveImmediately: boolean;
+  reasonCode: string;
+  retentionExceptionId: string | null;
+}
+```
+
+安全顺序：
+
+1. **先阻断读取**：查询入口把Tombstone/撤回集作为强制过滤；
+2. **再重建在线视图**：构建不含被删资产的新Generation；
+3. **传播清理**：删除或加密擦除派生内容、缓存和导出；
+4. **验证不可达**：按文档ID、Chunk ID、内容指纹和固定查询探针检查；
+5. **保留最小证据**：只在策略允许时保留删除事件、Digest和对账状态，不保留应删除的正文；
+6. **完成对账**：所有要求覆盖的存储都报告终态，未知项进入人工处理。
+
+如果存在Legal Hold，系统应明确`retentionExceptionId`和隔离访问边界，而不是静默让删除“成功”但内容仍处处可读。
+
+## 9. 权限收紧要先拒绝，权限放宽要后发布
+
+权限变化不是普通元数据更新。
+
+### 9.1 收紧权限
+
+从`public`改为`finance-only`时：
+
+```text
+先把新Permission Revision加入查询强制拒绝层
+→ 再重建带新标签的Chunk/索引
+→ 验证无权限Principal无法召回
+→ 切换Generation
+→ 清除旧缓存和导出
+```
+
+即使索引重建需要时间，强制拒绝层也应立即缩小可见范围。宁可短暂少返回，不能继续泄露。
+
+### 9.2 放宽权限
+
+从受限改为公开时顺序相反：先构建并验证新Generation，再开放访问。旧索引未准备好时提前放宽只会产生不一致和错误引用。
+
+### 9.3 权限必须参与派生身份
+
+若两个Chunk正文相同但权限不同，它们不能因为内容Hash相同就共享一个无权限区分的缓存键。缓存和索引身份至少包含`permissionRevision`或等价的授权范围Digest。
+
+## 10. 血缘用于影响分析，不用于装饰Dashboard
+
+影响分析从变化节点沿有向边找到后代：
+
+```text
+changed source version
+→ normalized document
+→ chunks
+→ sparse index
+→ embeddings
+→ vector index
+→ cached answers / exports / eval fixtures
+```
+
+边要声明变化类型：
+
+```ts
+interface DerivationEdge {
+  parentVersionId: string;
+  childVersionId: string;
+  dependencyKind: 'content' | 'schema' | 'permission' | 'metadata';
+}
+```
+
+解析器升级影响规范化内容及其后代；权限收紧必须影响所有可能暴露内容的后代；仅Owner显示名变化不一定需要重算Embedding。影响规则需要测试，错误地“少算”会留下陈旧或越权数据，错误地“全算”会制造昂贵重建风暴。
+
+### 10.1 血缘本身也要完整
+
+监控：
+
+- 有父版本但无血缘边的派生资产数；
+- 指向不存在版本的悬空边；
+- 已发布Generation中不可追溯资产占比；
+- 变更事件到影响计划的延迟；
+- 影响计划中长期`unknown`的存储；
+- 同一事件重复处理后是否产生不同计划。
+
+“我们接了OpenLineage”不证明这些不变量成立。协议提供表达方式，系统仍需验证覆盖率和消费路径。
+
+## 11. 新鲜度、漂移和质量是不同告警
+
+| 信号 | 问题 | 典型动作 |
+| --- | --- | --- |
+| Source Observation Lag | 来源变化没有被及时发现 | 检查抓取、Webhook、游标 |
+| Processing Lag | 已发现版本未完成派生 | 检查队列、Worker和失败分类 |
+| Serving Lag | 候选已构建但未发布 | 检查验证、切换和回滚阻塞 |
+| Schema Drift | 字段或类型偏离契约 | 隔离版本、升级Parser/契约 |
+| Distribution Drift | 值分布改变 | 重新评测下游阈值或模型 |
+| Permission Drift | 来源和派生标签不一致 | 立即拒绝、重建并审计 |
+| Lineage Gap | 资产无法追溯 | 阻止发布，补齐血缘 |
+
+漂移不自动意味着数据坏了。它是“分布与基线不同”的证据，需要结合业务事件判断。新鲜度正常也不意味着Schema、权限和质量正常。
+
+### 11.1 可执行质量门禁
+
+```ts
+interface DatasetValidationReport {
+  generationId: string;
+  status: 'pass' | 'fail' | 'invalid';
+  checks: Array<{
+    checkId: string;
+    status: 'pass' | 'fail' | 'invalid';
+    observed: number | string | null;
+    threshold: number | string | null;
+    evidenceArtifact: string;
+  }>;
+}
+```
+
+`invalid`表示检查本身没有可信执行，例如抽样器失败、父Manifest缺失或权限探针未运行。不能把“没有测到失败”当Pass。
+
+## 12. 缓存、索引和导出都要带Generation
+
+读取结果至少返回：
+
+```ts
+interface DataReadReceipt {
+  assetId: string;
+  sourceVersionId: string;
+  derivedVersionId: string;
+  generationId: string;
+  permissionRevision: string;
+  observedFreshnessSeconds: number;
+}
+```
+
+缓存键示意：
+
+```text
+hash(query, principalScopeDigest, generationId, policyRevision)
+```
+
+如果缓存键没有Generation，索引切换后旧答案仍可能命中。如果没有Principal Scope，受限用户与公开用户可能共享结果。若Generation被回滚，缓存也要跟随回到匹配版本，不能混用前后数据。
+
+导出文件同样写Manifest和父版本列表。`export-latest.csv`只适合作为人类便利指针，不能作为可回放身份。
+
+## 13. 确定性TypeScript影响分析演示
+
+下面的完整程序维护一个小型派生图，对更新、删除和权限变化生成不同动作计划，并拒绝含Tombstone祖先的发布候选。它不连接真实数据库或索引。
+
+```ts title="examples/data-asset-lifecycle.runnable.ts"
+import assert from 'node:assert/strict';
+
+type AssetKind =
+  | 'source'
+  | 'normalized'
+  | 'chunks'
+  | 'embeddings'
+  | 'index';
+type ChangeKind = 'updated' | 'withdrawn' | 'permission_changed';
+type Action =
+  | 'invalidate'
+  | 'rebuild'
+  | 'deny_immediately'
+  | 'tombstone'
+  | 'purge_after_publish';
+
+type AssetVersion = {
+  versionId: string;
+  assetId: string;
+  kind: AssetKind;
+  permissionRevision: string;
+  state: 'active' | 'candidate' | 'validated' | 'published' | 'invalid' | 'tombstoned';
+};
+
+type DerivationEdge = {
+  parentVersionId: string;
+  childVersionId: string;
+  dependencyKind: 'content' | 'schema' | 'permission' | 'metadata';
+};
+
+type ChangeEvent = {
+  eventId: string;
+  versionId: string;
+  kind: ChangeKind;
+  nextPermissionRevision?: string;
+};
+
+type ImpactStep = {
+  versionId: string;
+  actions: Action[];
+  reason: string;
+};
+
+function descendants(root: string, edges: DerivationEdge[]): string[] {
+  const children = new Map<string, string[]>();
+  for (const edge of edges) {
+    const existing = children.get(edge.parentVersionId) ?? [];
+    existing.push(edge.childVersionId);
+    children.set(edge.parentVersionId, existing);
+  }
+
+  const visited = new Set<string>();
+  const queue = [root];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    assert(current);
+    for (const child of children.get(current) ?? []) {
+      if (visited.has(child)) continue;
+      visited.add(child);
+      queue.push(child);
+    }
+  }
+  return [...visited].sort();
+}
+
+function planImpact(
+  event: ChangeEvent,
+  assets: AssetVersion[],
+  edges: DerivationEdge[],
+): ImpactStep[] {
+  const byId = new Map(assets.map((asset) => [asset.versionId, asset]));
+  const source = byId.get(event.versionId);
+  if (!source) throw new Error(`unknown asset version: ${event.versionId}`);
+
+  const affected = [event.versionId, ...descendants(event.versionId, edges)];
+  return affected.map((versionId) => {
+    const asset = byId.get(versionId);
+    if (!asset) throw new Error(`lineage references missing asset: ${versionId}`);
+
+    if (event.kind === 'withdrawn') {
+      return {
+        versionId,
+        actions: [
+          'deny_immediately',
+          'tombstone',
+          'purge_after_publish',
+        ],
+        reason: 'SOURCE_WITHDRAWN',
+      };
+    }
+
+    if (event.kind === 'permission_changed') {
+      if (!event.nextPermissionRevision) {
+        throw new Error('permission change requires nextPermissionRevision');
+      }
+      return {
+        versionId,
+        actions: ['deny_immediately', 'invalidate', 'rebuild'],
+        reason: `PERMISSION_CHANGED:${event.nextPermissionRevision}`,
+      };
+    }
+
+    return {
+      versionId,
+      actions: asset.kind === 'source'
+        ? ['invalidate']
+        : ['invalidate', 'rebuild'],
+      reason: 'SOURCE_UPDATED',
+    };
+  });
+}
+
+function canPublish(
+  candidateVersionId: string,
+  assets: AssetVersion[],
+  edges: DerivationEdge[],
+): boolean {
+  const byId = new Map(assets.map((asset) => [asset.versionId, asset]));
+  const candidate = byId.get(candidateVersionId);
+  if (!candidate || candidate.state !== 'validated') return false;
+
+  const parents = new Map<string, string[]>();
+  for (const edge of edges) {
+    const existing = parents.get(edge.childVersionId) ?? [];
+    existing.push(edge.parentVersionId);
+    parents.set(edge.childVersionId, existing);
+  }
+
+  const seen = new Set<string>();
+  const queue = [...(parents.get(candidateVersionId) ?? [])];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    assert(current);
+    if (seen.has(current)) continue;
+    seen.add(current);
+    const asset = byId.get(current);
+    if (!asset || asset.state === 'tombstoned' || asset.state === 'invalid') {
+      return false;
+    }
+    queue.push(...(parents.get(current) ?? []));
+  }
+  return true;
+}
+
+const assets: AssetVersion[] = [
+  {
+    versionId: 'source-policy@v7',
+    assetId: 'source-policy',
+    kind: 'source',
+    permissionRevision: 'perm-public-v1',
+    state: 'active',
+  },
+  {
+    versionId: 'normalized-policy@v7-parser3',
+    assetId: 'normalized-policy',
+    kind: 'normalized',
+    permissionRevision: 'perm-public-v1',
+    state: 'active',
+  },
+  {
+    versionId: 'chunks-policy@v7-chunker5',
+    assetId: 'chunks-policy',
+    kind: 'chunks',
+    permissionRevision: 'perm-public-v1',
+    state: 'active',
+  },
+  {
+    versionId: 'embeddings-policy@v7-embed8',
+    assetId: 'embeddings-policy',
+    kind: 'embeddings',
+    permissionRevision: 'perm-public-v1',
+    state: 'active',
+  },
+  {
+    versionId: 'index-generation@208',
+    assetId: 'retrieval-index',
+    kind: 'index',
+    permissionRevision: 'perm-public-v1',
+    state: 'published',
+  },
+  {
+    versionId: 'index-generation@209',
+    assetId: 'retrieval-index',
+    kind: 'index',
+    permissionRevision: 'perm-finance-v2',
+    state: 'validated',
+  },
+];
+
+const edges: DerivationEdge[] = [
+  {
+    parentVersionId: 'source-policy@v7',
+    childVersionId: 'normalized-policy@v7-parser3',
+    dependencyKind: 'content',
+  },
+  {
+    parentVersionId: 'normalized-policy@v7-parser3',
+    childVersionId: 'chunks-policy@v7-chunker5',
+    dependencyKind: 'content',
+  },
+  {
+    parentVersionId: 'chunks-policy@v7-chunker5',
+    childVersionId: 'embeddings-policy@v7-embed8',
+    dependencyKind: 'content',
+  },
+  {
+    parentVersionId: 'chunks-policy@v7-chunker5',
+    childVersionId: 'index-generation@208',
+    dependencyKind: 'content',
+  },
+  {
+    parentVersionId: 'embeddings-policy@v7-embed8',
+    childVersionId: 'index-generation@208',
+    dependencyKind: 'content',
+  },
+  {
+    parentVersionId: 'chunks-policy@v7-chunker5',
+    childVersionId: 'index-generation@209',
+    dependencyKind: 'permission',
+  },
+];
+
+const updatePlan = planImpact(
+  {
+    eventId: 'event-update-1',
+    versionId: 'source-policy@v7',
+    kind: 'updated',
+  },
+  assets,
+  edges,
+);
+assert(updatePlan.some((step) => step.versionId === 'index-generation@208'));
+assert(
+  updatePlan
+    .find((step) => step.versionId === 'chunks-policy@v7-chunker5')
+    ?.actions.includes('rebuild'),
+);
+
+const permissionPlan = planImpact(
+  {
+    eventId: 'event-permission-1',
+    versionId: 'source-policy@v7',
+    kind: 'permission_changed',
+    nextPermissionRevision: 'perm-finance-v2',
+  },
+  assets,
+  edges,
+);
+assert(
+  permissionPlan.every((step) =>
+    step.actions.includes('deny_immediately'),
+  ),
+);
+
+const deletePlan = planImpact(
+  {
+    eventId: 'event-delete-1',
+    versionId: 'source-policy@v7',
+    kind: 'withdrawn',
+  },
+  assets,
+  edges,
+);
+assert(
+  deletePlan.every(
+    (step) =>
+      step.actions.includes('tombstone') &&
+      step.actions.includes('purge_after_publish'),
+  ),
+);
+
+const unvalidatedAssets = assets.map((asset) =>
+  asset.versionId === 'index-generation@209'
+    ? { ...asset, state: 'candidate' as const }
+    : asset,
+);
+assert.equal(canPublish('index-generation@209', unvalidatedAssets, edges), false);
+assert.equal(canPublish('index-generation@209', assets, edges), true);
+const tombstonedAssets = assets.map((asset) =>
+  asset.versionId === 'source-policy@v7'
+    ? { ...asset, state: 'tombstoned' as const }
+    : asset,
+);
+assert.equal(
+  canPublish('index-generation@209', tombstonedAssets, edges),
+  false,
+);
+
+console.log(
+  JSON.stringify(
+    {
+      status: 'passed',
+      updateAffected: updatePlan.length,
+      permissionDeniedImmediately: permissionPlan.length,
+      deletePurgesPlanned: deletePlan.length,
+      publishRequiresValidation: true,
+      publishBlockedByTombstone: true,
+    },
+    null,
+    2,
+  ),
+);
+```
+
+真实系统还需持久化事件、计划、执行尝试与对账状态，并处理图规模、并发版本和部分存储不可用；但影响集合与发布不变量应先在纯函数中确定。
+
+## 14. 数据资产故障诊断矩阵
+
+| 现象 | 最小证据 | 可能根因 | 正确动作 |
+| --- | --- | --- | --- |
+| 源已更新，查询仍返回旧内容 | Source/Derived Version、Generation、缓存键 | 变更未传播、候选未发布、旧缓存无Generation | 定位卡住阶段，重建并原子切换 |
+| 源已删除，Chunk仍可召回 | Tombstone、影响计划、索引文档ID | 只删源文件、向量/稀疏索引未清 | 先强制拒绝，再重建和对账清理 |
+| 权限收紧后仍泄露 | Permission Revision、Principal Scope、Generation | 缓存键缺权限、旧Chunk标签、先重建后拒绝 | 立即拒绝，清缓存，重建验证 |
+| 新Generation文档数骤降 | 新旧Manifest Diff、失败清单 | 抓取分页缺失、Parser失败被当空文档 | 阻止发布并分类失败 |
+| 数据很新但答案错误 | 质量报告、Schema、内容版本 | 新来源错误、Parser语义漂移 | 隔离版本并回滚，不放宽新鲜度门槛 |
+| 全量重建越来越慢 | 血缘边、变更分类、任务分片 | 每次变化都全算、缺少内容依赖 | 用显式影响规则做增量重建 |
+| 历史引用无法打开 | Citation Version、保留策略、归档状态 | 覆盖写、只存URL、过早GC | 提供版本化归档或明确已撤回状态 |
+| 删除任务显示成功但某存储未知 | 对账清单、每存储终态 | 把命令提交当完成、异步消费者失败 | 保持`unknown`并重试查询/人工处理 |
+
+## 15. 三个故障注入实验
+
+### 实验一：更新了文档，但旧Chunk仍在索引
+
+创建`source@v1 → chunks@v1 → index@1`，再写入`source@v2`，故意让Chunk Worker失败。验收：在线指针仍指向完整的`index@1`并标记Serving Lag超标；不能把混有v1/v2的半成品标为新Generation。恢复后构建`chunks@v2/index@2`，验证通过再原子切换。
+
+### 实验二：删除只清理对象存储
+
+删除源对象但保留稀疏索引、向量索引和答案缓存。验收：Tombstone强制过滤立即让固定查询无结果；影响计划覆盖三个派生存储；清理后按文档ID、Chunk ID和内容Digest探针均不可达，未知存储不能报告完成。
+
+### 实验三：权限收紧与缓存竞争
+
+先以`public`身份缓存答案，再把来源改为`restricted`并延迟索引重建。验收：缓存键含Principal Scope与Permission Revision，旧公开缓存立即失效；无权限用户在重建期间得到拒绝，而不是旧答案。
+
+扩展实验：
+
+- Parser升级但Manifest漏记版本，验证确定性检查发现相同ID对应不同内容；
+- 变更事件重复投递，验证影响计划幂等且不制造多个Published指针；
+- 血缘边指向不存在父版本，验证候选发布为`invalid`；
+- 新索引文档数下降30%，验证Diff门禁阻止切流；
+- 回滚到旧Generation，验证缓存和Citation同时回到匹配版本；
+- Legal Hold存在时发起删除，验证内容隔离与异常保留证据明确可审计。
+
+## 16. 验收条件
+
+完成本课后，作品必须能证明：
+
+- □ 来源业务身份、不可变版本、内容Digest和存储位置分开；
+- □ 数据契约包含Owner、Schema、语义、权限、质量、新鲜度和删除责任；
+- □ 派生资产身份包含父版本、代码、配置、环境和契约版本；
+- □ 更新、撤回和权限变化先写事件，再由消费者计算影响集；
+- □ 候选Generation完整构建和验证后才原子发布；
+- □ 权限收紧先拒绝后重建，权限放宽先验证后开放；
+- □ 删除传播到Chunk、索引、Embedding、缓存、导出和评测引用；
+- □ 每个在线结果带Generation、来源版本和Permission Revision；
+- □ 新鲜度、Schema、质量、权限和血缘完整性分别门禁；
+- □ 对账保留`unknown`状态，不把命令接受误报为清理完成。
+
+静态Markdown中的方框仅表示阅读验收清单，不保存进度；课程完成状态使用页面顶部的进度控件。
+
+## 17. 学完后应该能回答什么
+
+1. 为什么URL、内容Hash和业务Asset ID不能互相替代？
+2. `effectiveAt`、`observedAt`、`processedAt`和`publishedAt`分别回答什么问题？
+3. 血缘如何从展示元数据变成更新与删除的执行依据？
+4. 为什么Parser版本、Chunk配置和运行环境必须进入派生身份？
+5. 为什么在线索引要使用候选Generation和原子指针？
+6. 删除源文件后还要检查哪些派生表面？
+7. 权限收紧为什么必须先拒绝、后重建？
+8. 缓存键为什么需要Generation和Principal Scope？
+9. 数据很新为什么仍可能不正确或不可发布？
+10. 如何证明一个历史答案当时使用了哪个来源和索引版本？
+
+## 18. 来源边界
+
+本课使用W3C PROV的Entity/Activity/Agent关系与OpenLineage的Dataset/Job/Run/Facet思路说明来源表达，使用SLSA Provenance帮助区分输入、构建过程和产物身份，使用RAG论文限定下游检索场景，并参考NIST生成式AI风险框架理解治理边界。课程使用的是简化工程模型，不要求采用RDF、OpenLineage后端或任何特定数据平台；示例中的版本、数量、权限和时间均为确定性教学夹具。

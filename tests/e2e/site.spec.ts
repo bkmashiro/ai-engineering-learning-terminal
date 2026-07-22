@@ -134,9 +134,9 @@ test('foundation lessons render the mechanism and recovery sections', async ({ p
 test('lesson keeps progress locally and exposes canonical prerequisite links', async ({ page }) => {
   await page.goto('/agent/workflow-vs-agent/');
 
-  await expect(page.locator('.module-prerequisites').getByRole('link', { name: /网络、流式与取消/ })).toHaveAttribute(
+  await expect(page.locator('.module-prerequisites').getByRole('link', { name: /模型服务、路由与推理预算/ })).toHaveAttribute(
     'href',
-    '/foundations/software-systems/network-streaming/',
+    '/foundations/llm/model-serving-governance/',
   );
   await page.getByRole('button', { name: '标记本课完成' }).click();
   await page.reload();
@@ -180,6 +180,8 @@ test('term peek remains interactive while the pointer crosses into its panel', a
 });
 
 test('core pages have no automatic WCAG A/AA violations', async ({ page }) => {
+  test.setTimeout(60_000);
+
   for (const path of [
     '/',
     '/roadmap/',
@@ -187,8 +189,10 @@ test('core pages have no automatic WCAG A/AA violations', async ({ page }) => {
     '/foundations/software-systems/state-and-events/',
     '/foundations/software-systems/network-streaming/',
     '/foundations/software-systems/data-reliability/',
+    '/foundations/software-systems/data-asset-lifecycle/',
     '/foundations/ml/',
     '/foundations/llm/',
+    '/foundations/llm/model-serving-governance/',
     '/foundations/llm/retrieval/',
     '/agent/workflow-vs-agent/',
     '/agent/state-tools-memory/',
@@ -228,6 +232,11 @@ test('new core modules expose mechanisms, diagrams and mobile-safe layouts', asy
       component: '.reliability-boundary',
     },
     {
+      path: '/foundations/software-systems/data-asset-lifecycle/',
+      heading: '数据资产不是一个文件，而是一张版本化派生图',
+      component: '.data-asset-lifecycle',
+    },
+    {
       path: '/foundations/ml/',
       heading: '混淆矩阵与手算',
       component: '.experiment-split',
@@ -236,6 +245,11 @@ test('new core modules expose mechanisms, diagrams and mobile-safe layouts', asy
       path: '/foundations/llm/retrieval/',
       heading: 'Citation 与 Grounding',
       component: '.retrieval-pipeline',
+    },
+    {
+      path: '/foundations/llm/model-serving-governance/',
+      heading: '请求级SLO必须拆成排队、Prefill与Decode',
+      component: '.model-serving-control',
     },
     {
       path: '/agent/workflow-vs-agent/',
@@ -281,6 +295,23 @@ test('new core modules expose mechanisms, diagrams and mobile-safe layouts', asy
   }
 });
 
+test('new teaching diagrams stay inside the desktop course column', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'desktop course-column geometry');
+  await page.setViewportSize({ width: 1280, height: 900 });
+
+  for (const [path, selector] of [
+    ['/foundations/llm/model-serving-governance/', '.model-serving-control'],
+    ['/foundations/software-systems/data-asset-lifecycle/', '.data-asset-lifecycle'],
+  ] as const) {
+    await page.goto(path);
+    const widths = await page.locator(selector).evaluate((diagram) => ({
+      client: diagram.clientWidth,
+      scroll: diagram.scrollWidth,
+    }));
+    expect(widths.scroll, path).toBeLessThanOrEqual(widths.client + 1);
+  }
+});
+
 test('direction pages expose system boundaries, evidence and learning order', async ({ page }) => {
   const paths = [
     '/directions/agent-applications/',
@@ -322,8 +353,24 @@ test('new course prerequisites resolve through canonical roadmap links', async (
     'href',
     '/foundations/llm/',
   );
+  await expect(page.locator('.module-prerequisites').getByRole('link', { name: /数据资产生命周期/ })).toHaveAttribute(
+    'href',
+    '/foundations/software-systems/data-asset-lifecycle/',
+  );
+
+  await page.goto('/foundations/software-systems/data-asset-lifecycle/');
   await expect(page.locator('.module-prerequisites').getByRole('link', { name: /事务、缓存与队列/ })).toHaveAttribute(
     'href',
     '/foundations/software-systems/data-reliability/',
+  );
+
+  await page.goto('/foundations/llm/model-serving-governance/');
+  await expect(page.locator('.module-prerequisites').getByRole('link', { name: /Token、Attention 与上下文/ })).toHaveAttribute(
+    'href',
+    '/foundations/llm/',
+  );
+  await expect(page.locator('.module-prerequisites').getByRole('link', { name: /网络、流式与取消/ })).toHaveAttribute(
+    'href',
+    '/foundations/software-systems/network-streaming/',
   );
 });

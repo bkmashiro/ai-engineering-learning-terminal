@@ -1,9 +1,17 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { roadmapNodes, validateRoadmap, type RoadmapNode } from './roadmap';
 
 describe('roadmap graph', () => {
+  const docsRoot = fileURLToPath(new URL('../content/docs/', import.meta.url));
+
+  const contentPathFor = (href: string): string => {
+    const relative = href.replace(/^\//, '').replace(/\/$/, '');
+    const direct = `${docsRoot}${relative}.mdx`;
+    return existsSync(direct) ? direct : `${docsRoot}${relative}/index.mdx`;
+  };
+
   it('accepts the published roadmap', () => {
     expect(validateRoadmap(roadmapNodes)).toEqual([]);
   });
@@ -29,7 +37,6 @@ describe('roadmap graph', () => {
   });
 
   it('backs every available route with a content file', () => {
-    const docsRoot = fileURLToPath(new URL('../content/docs/', import.meta.url));
     const missing = roadmapNodes
       .filter((node) => node.status === 'available')
       .filter((node) => {
@@ -39,5 +46,28 @@ describe('roadmap graph', () => {
       .map((node) => `${node.id}: ${node.href}`);
 
     expect(missing).toEqual([]);
+  });
+
+  it('keeps available lesson metadata aligned with the canonical roadmap', () => {
+    const mismatches: string[] = [];
+
+    for (const node of roadmapNodes.filter((candidate) => candidate.status === 'available')) {
+      const source = readFileSync(contentPathFor(node.href), 'utf8');
+      const frontmatter = source.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
+      const moduleId = frontmatter.match(/^moduleId: (.+)$/m)?.[1];
+      const prerequisiteBlock = frontmatter.match(/^prerequisites:\n((?:  - .+\n?)*)/m)?.[1] ?? '';
+      const prerequisites = [...prerequisiteBlock.matchAll(/^  - (.+)$/gm)].map((match) => match[1]);
+
+      if (moduleId !== node.id) {
+        mismatches.push(`${node.id}: frontmatter moduleId is ${moduleId ?? 'missing'}`);
+      }
+      if (JSON.stringify(prerequisites) !== JSON.stringify(node.prerequisites)) {
+        mismatches.push(
+          `${node.id}: frontmatter prerequisites ${JSON.stringify(prerequisites)} != roadmap ${JSON.stringify(node.prerequisites)}`,
+        );
+      }
+    }
+
+    expect(mismatches).toEqual([]);
   });
 });

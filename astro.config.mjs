@@ -62,6 +62,7 @@ export default defineConfig({
             { label: '状态、事件与复杂度', slug: 'foundations/software-systems/state-and-events' },
             { label: '网络、流式与取消', slug: 'foundations/software-systems/network-streaming' },
             { label: '事务、缓存与队列', slug: 'foundations/software-systems/data-reliability' },
+            { label: '数据资产生命周期', slug: 'foundations/software-systems/data-asset-lifecycle' },
             { label: '机器学习与实验', slug: 'foundations/ml' },
           ],
         },
@@ -69,6 +70,7 @@ export default defineConfig({
           label: 'LLM 应用',
           items: [
             { label: 'Token、Attention与上下文', slug: 'foundations/llm' },
+            { label: '模型服务、路由与推理预算', slug: 'foundations/llm/model-serving-governance' },
             { label: '检索、引用与无答案', slug: 'foundations/llm/retrieval' },
           ],
         },

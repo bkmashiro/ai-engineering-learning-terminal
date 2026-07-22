@@ -1,0 +1,877 @@
+---
+title: 模型服务、路由与推理预算
+description: 把排队、Prefill、Decode、KV容量、连续批处理、版本路由、降级与成本变成可测量、可控制的模型服务边界。
+moduleId: model-serving-governance
+stage: llm-applications
+prerequisites:
+  - llm-foundations
+  - network-streaming
+outcomes:
+  - 把端到端延迟拆成排队、Prefill、Decode和网络输出并选择正确分位数
+  - 根据Deadline、Token预算、KV容量和健康度实施准入、路由、降级与负载保护
+  - 为模型、Tokenizer、推理配置和供应路径建立可回放的版本证据
+estimatedMinutes: 90
+difficulty: core
+careerDirections:
+  - ai-backend-reliability
+  - agent-runtime-evaluation
+  - edge-inference
+sourceIds:
+  - vllm-metrics
+  - vllm-paper
+  - orca-serving-paper
+  - kserve-v2-protocol
+  - google-sre-slos
+sourceLocale: zh-CN
+lastReviewed: 2026-07-22
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import ModulePrerequisites from '../../../../components/content/ModulePrerequisites.astro';
+import ModelServingControlDiagram from '../../../../components/content/ModelServingControlDiagram.astro';
+import Term from '../../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="model-serving-governance" client:load />
+
+<ModulePrerequisites moduleId="model-serving-governance" />
+
+一个聊天服务的平均响应时间仍是 3 秒，但用户开始集中投诉“点了以后很久没有任何字”。GPU 利用率接近满载，服务没有明显报错，自动扩容也没有触发。团队只保存了总耗时和 HTTP 状态码，因此无法回答：请求是在入口排队、等待 KV 空间、执行长 Prompt 的 Prefill，还是在 Decode 阶段被其他请求拖慢？一次重试会减轻故障，还是把已经过载的队列再放大一倍？
+
+这不是模型原理课能够回答的问题。Token、Attention 与 <Term id="kv-cache" /> 解释单次推理为什么消耗计算和内存；模型服务工程要决定大量不同长度、不同优先级和不同Deadline的请求如何共享有限设备，并在过载、版本发布和供应商失败时保持可判断行为。
+
+本课不部署真实GPU，也不比较任何厂商榜单。你将建立一个确定性模型服务适配层：输入请求预算和模型池状态，输出准入、路由或拒绝决定，并留下可回放的原因、版本身份和预测预算。
+
+<ModelServingControlDiagram />
+
+## 1. 模型服务不是一个HTTP转发器
+
+最小服务边界包含五段：
+
+```text
+Client / Agent
+→ Admission：身份、Deadline、Token与并发预算
+→ Routing：模型版本、地区、供应路径和降级策略
+→ Scheduling：排队、批处理、优先级与KV容量
+→ Inference：Prefill、Decode与流式输出
+→ Validation：终态、使用量、取消和版本证据
+```
+
+如果适配层只把请求转发给一个SDK，它无法统一以下行为：
+
+- 调用方给了 2 秒Deadline，但后端队列预计已需 3 秒；
+- `max_tokens` 未设上限，单个请求可能长期占用KV和Decode槽位；
+- 主模型健康但已过载，备用模型健康且质量略低；
+- 首字延迟超标，但总吞吐看起来很高；
+- 流在中途断开，服务不知道后端是否仍继续生成和计费；
+- 同一模型名背后的权重、Tokenizer或推理配置已发生变化；
+- 自动重试把一个请求复制到多个供应路径，却没有取消输掉的副本。
+
+服务层的输出不能只有模型文本。它至少要返回：
+
+```ts
+interface InferenceReceipt {
+  requestId: string;
+  status: 'completed' | 'rejected' | 'cancelled' | 'failed' | 'unknown';
+  modelId: string;
+  modelRevision: string;
+  tokenizerRevision: string;
+  servingConfigRevision: string;
+  routeId: string;
+  routeReason: string;
+  inputTokens: number;
+  outputTokens: number;
+  queueMs: number;
+  prefillMs: number;
+  decodeMs: number;
+  firstTokenMs: number | null;
+  estimatedCostUnits: number;
+  terminalErrorCode: string | null;
+}
+```
+
+Receipt不是调试装饰。它决定一次异常能否回放、两个版本能否比较、成本能否归因，以及重试前是否知道上一次请求的终态。
+
+## 2. 请求级SLO必须拆成排队、Prefill与Decode
+
+“延迟”不是一个数字。对流式生成，至少区分：
+
+- `queueMs`：请求被接受到获得执行机会；
+- `prefillMs`：处理已有输入并建立初始KV状态；
+- `firstDecodeMs`：生成首个Token的Decode开销；
+- <Term id="time-to-first-token" />：用户从发送到看到第一个Token；
+- <Term id="inter-token-latency" />：相邻输出Token间隔的分布；
+- `e2eMs`：从接受请求到终态或流关闭；
+- `cancelAckMs`：取消发出到后端确认停止。
+
+近似分解：
+
+```text
+TTFT = 排队时间 + Prefill时间 + 首次Decode时间 + 首字节网络时间
+总延迟 = 排队时间 + Prefill时间 + Decode时间 + 网络输出时间
+```
+
+例：排队 `0.24s`，Prefill `0.36s`，首次Decode `0.04s`，首字节网络 `0.02s`：
+
+```text
+TTFT = 0.24 + 0.36 + 0.04 + 0.02 = 0.66s
+```
+
+若共输出 80 个Token，后续 79 个Token平均间隔 `0.035s`：
+
+```text
+E2E ≈ 0.66 + 79 × 0.035 = 3.425s
+```
+
+这两个请求可以拥有相同E2E，却给用户完全不同的体验：一个在 0.3 秒开始稳定输出，另一个等待 2.5 秒后快速吐完。因此交互SLO不能只看E2E。
+
+### 2.1 平均数为什么会掩盖过载
+
+假设 100 个请求中 95 个排队 20ms，5 个排队 4s。平均排队约 219ms，看起来可能仍可接受；但P95边界已经进入长尾。服务门禁至少报告P50、P95、P99，并按请求类别拆分：
+
+| 切片 | 为什么分开 |
+| --- | --- |
+| 交互 / 批处理 | 用户首字体验与离线吞吐目标不同 |
+| 输入Token区间 | 长Prompt的Prefill不能与短请求混为一谈 |
+| 输出Token区间 | 长Decode天然占用更多迭代 |
+| 模型与版本 | 切流后回归必须能定位到具体版本 |
+| 租户与优先级 | 一个大租户可能挤占全局队列 |
+| 正常 / 降级路径 | 降级后的“成功”不能掩盖主路径不可用 |
+
+<Aside type="caution" title="分位数不能直接相加">
+  各阶段P99之和通常不等于端到端P99，因为最慢的请求集合可能不同。逐请求记录阶段时间，再直接计算端到端分位数；阶段分位数用于定位，不用于伪造总SLO。
+</Aside>
+
+## 3. 从Token预算推导资源预算
+
+输入长度影响Prefill计算与初始KV占用，输出上限影响Decode时间和KV增长。服务在入队前就应知道：
+
+```ts
+interface InferenceBudget {
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  maxTotalTokens: number;
+  deadlineMs: number;
+  maxEstimatedCostUnits: number;
+  priority: 'interactive' | 'normal' | 'batch';
+}
+```
+
+必须在Tokenize后重新检查，而不是用字符数猜Token数。请求契约还要固定Tokenizer版本，因为版本变化会改变长度、截断点和成本。
+
+### 3.1 KV容量不是“显存够不够模型权重”
+
+用简化公式估算每个Token的KV字节数：
+
+```text
+KV bytes/token ≈ 层数 × 2(K与V) × KV Head数 × Head维度 × 每元素字节数
+```
+
+一个示意配置：32层、8个KV Head、Head维度128、FP16每元素2字节：
+
+```text
+32 × 2 × 8 × 128 × 2 = 131,072 bytes = 128 KiB / token
+```
+
+单请求8,192 Token的KV约为：
+
+```text
+128 KiB × 8,192 = 1 GiB
+```
+
+这只是示意估算，不含分配器元数据、碎片、临时Workspace和实现差异。它说明为什么只看权重能否加载远远不够：并发数、上下文长度分布、KV复用和回收速度共同决定可接纳容量。
+
+### 3.2 预算必须在入口失败
+
+坏路径：请求先排几秒，拿到GPU后才发现上下文超过上限。正确路径在准入阶段返回结构化拒绝：
+
+```json
+{
+  "status": "rejected",
+  "reasonCode": "TOKEN_BUDGET_EXCEEDED",
+  "limits": {
+    "maxInputTokens": 8192,
+    "observedInputTokens": 9340
+  },
+  "retryable": false
+}
+```
+
+客户端可以缩短输入或换支持更长上下文的路由；盲目重试同一请求没有意义。
+
+## 4. 连续批处理是调度，不是免费吞吐
+
+固定批处理等待凑齐一组请求再整体执行，短请求会被最长请求拖住。<Term id="continuous-batching" /> 在生成迭代边界加入新请求、移除已完成请求，使设备持续有工作。
+
+但更高利用率不自动等于更好服务：
+
+- 大批次可提高吞吐，却可能增加首Token等待；
+- 长Prompt集中Prefill会挤压正在Decode的交互流；
+- 长输出请求持续占槽，短请求产生队头阻塞；
+- 高优先级持续到达可能饿死批处理队列；
+- KV不足时，抢占和重算会带来额外成本；
+- 取消若不能及时回收KV，客户端断开后仍消耗容量。
+
+调度器至少需要以下公开状态：
+
+```ts
+interface SchedulerSnapshot {
+  observedAt: string;
+  waitingRequests: number;
+  runningRequests: number;
+  waitingInputTokens: number;
+  reservedKvTokens: number;
+  freeKvTokens: number;
+  recentOutputTokensPerSecond: number;
+  queueP95Ms: number;
+  rejectedByReason: Record<string, number>;
+}
+```
+
+不要让路由器读取一个几分钟不更新的“GPU利用率”缓存后决定继续灌流量。Snapshot必须带观测时间和版本；过期状态只能触发保守准入或健康探测，不能当作当前容量事实。
+
+## 5. 准入控制：在队列外拒绝比在队列内超时更诚实
+
+到达工作量超过可持续处理能力时，队列会持续增长。示意：每秒30个请求，平均输出800 Token，则到达负载为：
+
+```text
+30 × 800 = 24,000 output tokens/s
+```
+
+若当前配置只能稳定提供20,000 output tokens/s：
+
+```text
+负载比 = 24,000 / 20,000 = 1.2
+```
+
+在没有降载的情况下，积压不会自行消失。扩容也有冷启动时间，因此服务需要 <Term id="load-shedding" />：按明确优先级拒绝、缩短或转移部分请求，保护已接纳请求的Deadline。
+
+准入顺序建议：
+
+<Steps>
+1. 验证身份、租户、模型能力与请求Schema。
+2. Tokenize并检查输入、输出和总Token硬上限。
+3. 计算剩余Deadline；不足以覆盖保守预测则拒绝。
+4. 检查租户在途数、速率与成本预算。
+5. 检查候选路由健康度、KV容量和队列年龄。
+6. 接纳后生成稳定`requestId`，预算不可被下游静默扩大。
+</Steps>
+
+结构化拒绝要区分：
+
+| 原因 | 可重试 | 调用方动作 |
+| --- | --- | --- |
+| `TOKEN_BUDGET_EXCEEDED` | 否 | 缩短输入或选择长上下文路由 |
+| `DEADLINE_INSUFFICIENT` | 条件性 | 放宽Deadline或改用更快降级模型 |
+| `TENANT_CONCURRENCY_LIMIT` | 是 | 按服务给出的退避窗口重试 |
+| `CAPACITY_SHED` | 是 | 退避、异步排队或降级 |
+| `CAPABILITY_UNAVAILABLE` | 否 | 改请求或等待具备能力的版本恢复 |
+| `POLICY_DENIED` | 否 | 不应自动换路由绕过策略 |
+
+HTTP状态只能表达协议层类别，业务原因仍需稳定`reasonCode`。
+
+## 6. 路由必须基于能力和预算，而不是随机试错
+
+模型路由输入包括：
+
+- 必需能力：上下文上限、结构化输出、工具协议、语言或模态；
+- 质量等级：任务可接受的最低离线评测门槛；
+- 用户路径：交互、后台、评测或恢复；
+- 地区与数据边界；
+- 剩余Deadline和成本预算；
+- 当前健康、队列、容量与版本发布状态。
+
+路由先做硬过滤，再做可解释排序：
+
+```text
+候选 = 健康
+  ∩ 满足能力
+  ∩ 满足地区/策略
+  ∩ 支持输入与输出Token预算
+  ∩ 预测能在剩余Deadline内完成
+  ∩ 预测成本不超过预算
+```
+
+排序可以考虑预计完成时间、质量等级、成本和稳定性，但每次决定要记录规则版本与理由。不要把未经校准的LLM再放到最底层“自主挑供应商”，否则路由失败无法稳定回放。
+
+### 6.1 模型身份必须不可变
+
+`model="good-model"`不是版本身份。最小身份：
+
+```ts
+interface ModelDeploymentIdentity {
+  logicalModel: string;
+  weightsRevision: string;
+  tokenizerRevision: string;
+  runtimeName: string;
+  runtimeRevision: string;
+  quantization: string;
+  servingConfigRevision: string;
+  promptPolicyRevision: string;
+}
+```
+
+即使权重未变，Tokenizer、量化、采样默认值或结构化输出适配器变化也可能改变行为。版本证据要进入Receipt和离线评测结果。
+
+## 7. Fallback不是捕获异常后换模型
+
+降级可能改变：
+
+- 输出质量和语言能力；
+- 上下文长度；
+- Tool/Schema支持；
+- 安全策略或数据地区；
+- Tokenizer与截断行为；
+- 成本和延迟分布。
+
+所以每条Fallback边必须声明前置条件：
+
+```ts
+interface FallbackEdge {
+  fromRoute: string;
+  toRoute: string;
+  allowedReasons: Array<'overloaded' | 'unhealthy' | 'deadline_risk'>;
+  requiredEvaluationSuite: string;
+  qualityFloor: number;
+  preservesDataBoundary: boolean;
+  preservesRequiredCapabilities: boolean;
+}
+```
+
+以下情况不能自动Fallback：
+
+- 目标路由不满足数据地区或隐私边界；
+- 结构化输出能力缺失，而调用方依赖机器解析；
+- 主路由产生未知终态，备用路由会导致重复副作用；
+- 质量门槛没有离线证据；
+- 安全策略版本落后。
+
+### 7.1 Hedging要取消输掉的副本
+
+对无副作用的读取式推理，可以在长尾条件下延迟启动第二副本，以首个有效结果为准。但必须记录两个请求身份并取消输掉的请求；否则延迟下降以双倍成本和容量为代价。Tool调用或其他外部副作用不应隐藏在无法对账的Hedge中。
+
+## 8. 统一协议不等于统一能力
+
+标准推理协议可以统一模型名、版本、输入和输出字段，但不能证明两个后端具有相同：
+
+- Tokenizer；
+- 采样语义；
+- 停止序列行为；
+- Tool/JSON Schema支持；
+- 日志与取消语义；
+- 使用量统计时点；
+- 错误分类。
+
+适配层应先把各供应路径的原始结果归一为内部状态：
+
+```ts
+type ProviderOutcome =
+  | { status: 'completed'; text: string; usage: Usage; providerRequestId: string }
+  | { status: 'rejected'; reasonCode: string; retryAfterMs?: number }
+  | { status: 'failed'; reasonCode: string; retryable: boolean }
+  | { status: 'cancelled'; acknowledged: boolean }
+  | { status: 'unknown'; providerRequestId?: string };
+```
+
+超时只说明调用方停止等待，不证明后端没有完成。若供应路径支持按`providerRequestId`查询，进入对账；不支持查询时要把终态标为`unknown`，不能伪造失败后安全重试。
+
+## 9. 成本要绑定请求和用户结果
+
+抽象成本模型：
+
+```text
+requestCost = inputTokens × inputUnitCost
+            + outputTokens × outputUnitCost
+            + fixedRequestCost
+            + retryAndHedgeCost
+```
+
+假设一批1,000个请求，每个输入1,000 Token、输出200 Token；输入每百万Token 2个抽象单位，输出每百万Token 8个单位：
+
+```text
+1,000 × (1,000 × 2 + 200 × 8) / 1,000,000 = 3.6个成本单位
+```
+
+这里使用抽象单位，避免把厂商实时价格写死进课程。真实系统应版本化费率表，并把费率版本写进成本Receipt。
+
+单位成本至少按以下分母观察：
+
+- 每个完成请求；
+- 每个通过质量门的请求；
+- 每个有引用且可验证的答案；
+- 每个用户完成的任务；
+- 每个降级路径成功结果。
+
+只算“每Token成本”会奖励输出很短但任务失败的系统。成本必须和质量、可靠性一起看。
+
+## 10. SLO与控制动作必须连接
+
+模型服务常见SLI：
+
+| SLI | 示例切片 | 超标后的动作 |
+| --- | --- | --- |
+| TTFT P95/P99 | 交互请求、输入Token桶 | 限制Prefill并发、调整调度、扩容 |
+| ITL P95 | 输出长度桶 | 减小批次压力、检查Decode容量 |
+| 有效完成率 | 模型版本、路由 | 回滚版本、切断不健康路由 |
+| 拒绝率 | 原因、租户 | 扩容或调整配额；策略拒绝不算容量失败 |
+| 取消确认延迟 | 后端版本 | 修复取消传播与KV回收 |
+| 每有效结果成本 | 任务类型 | 调整模型、Token预算或缓存策略 |
+| 降级占比 | 主路由 | 降级持续升高应视为主路径事故 |
+
+<Term id="service-level-objective" /> 不是Dashboard上的红线，而是发布、扩容、限流和回滚的输入。<Term id="error-budget" /> 消耗过快时暂停新版本切流，把容量用于恢复；不能一边主路径大量降级，一边因为HTTP 200很多而继续发布。
+
+### 10.1 最小Trace事件
+
+```json
+{
+  "event": "inference.route.selected",
+  "requestId": "req-0187",
+  "observedAt": "2026-07-22T12:00:00Z",
+  "policyRevision": "route-policy-v4",
+  "routeId": "local-fast-v2",
+  "reasons": ["capability_match", "deadline_fit", "cost_fit"],
+  "budget": {
+    "deadlineMs": 3000,
+    "inputTokens": 820,
+    "maxOutputTokens": 180
+  },
+  "capacitySnapshotRevision": "capacity-991"
+}
+```
+
+不要记录原始Prompt、Secret或完整用户内容来换取可观测性。Trace记录身份、大小、时间、策略和结果分类；内容调试另走受控、最小化和有保留期的证据路径。
+
+## 11. 发布：模型版本也需要金丝雀和回滚
+
+发布单元不只包含权重：
+
+```text
+Release = weights
+        + tokenizer
+        + runtime
+        + quantization
+        + serving config
+        + route policy
+        + prompt/policy revision
+```
+
+切流前离线Gate检查固定评测集、结构化输出、工具调用、安全用例和性能基线。线上先给小比例、可识别流量，并比较：
+
+- 同请求类型的TTFT、ITL和有效完成率；
+- Token长度分布是否漂移；
+- 输出Schema失败率；
+- 用户取消率；
+- 每有效结果成本；
+- 主动Fallback和人工接管率。
+
+回滚条件要在发布前定义。例如新版本在连续两个窗口中：有效完成率下降超过阈值，或交互TTFT P99超标，同时样本量达到最低要求，则停止切流并恢复旧版本。不要等事故发生后临时挑一个有利指标解释。
+
+<Aside type="note" title="影子流量不是免费证据">
+  Shadow请求仍消耗容量与成本，并可能接触真实输入。必须遵守数据边界、隔离输出、不执行下游副作用，并确保影子负载不会反过来破坏生产SLO。
+</Aside>
+
+## 12. 确定性TypeScript准入与路由演示
+
+下面的完整示例不调用真实模型。它验证Token、租户、Deadline、能力、健康度和成本预算，再按预测完成时间与成本稳定排序。输出是决定与理由，不伪造模型文本。
+
+```ts title="examples/model-serving-admission.runnable.ts"
+import assert from 'node:assert/strict';
+
+type Capability = 'json_schema' | 'tools' | 'long_context';
+type Priority = 'interactive' | 'normal' | 'batch';
+
+type InferenceRequest = {
+  requestId: string;
+  tenantId: string;
+  priority: Priority;
+  inputTokens: number;
+  maxOutputTokens: number;
+  deadlineMs: number;
+  maxCostUnits: number;
+  requiredCapabilities: Capability[];
+};
+
+type Route = {
+  routeId: string;
+  modelRevision: string;
+  healthy: boolean;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  maxTotalTokens: number;
+  capabilities: Capability[];
+  predictedQueueMs: number;
+  predictedPrefillMs: number;
+  predictedInterTokenMs: number;
+  inputCostPerMillion: number;
+  outputCostPerMillion: number;
+  freeKvTokens: number;
+};
+
+type AdmissionContext = {
+  tenantInFlight: number;
+  tenantConcurrencyLimit: number;
+};
+
+type Decision =
+  | {
+      status: 'accepted';
+      requestId: string;
+      routeId: string;
+      modelRevision: string;
+      predictedTtftMs: number;
+      predictedE2eMs: number;
+      predictedCostUnits: number;
+      reasonCodes: string[];
+    }
+  | {
+      status: 'rejected';
+      requestId: string;
+      reasonCode:
+        | 'INVALID_TOKEN_BUDGET'
+        | 'TENANT_CONCURRENCY_LIMIT'
+        | 'NO_CAPABLE_ROUTE'
+        | 'DEADLINE_INSUFFICIENT'
+        | 'COST_BUDGET_EXCEEDED'
+        | 'CAPACITY_SHED';
+      retryable: boolean;
+    };
+
+const FIRST_DECODE_MS = 40;
+const FIRST_BYTE_NETWORK_MS = 20;
+
+function hasCapabilities(route: Route, required: Capability[]): boolean {
+  return required.every((capability) => route.capabilities.includes(capability));
+}
+
+function estimate(route: Route, request: InferenceRequest) {
+  const predictedTtftMs =
+    route.predictedQueueMs +
+    route.predictedPrefillMs +
+    FIRST_DECODE_MS +
+    FIRST_BYTE_NETWORK_MS;
+  const remainingTokens = Math.max(0, request.maxOutputTokens - 1);
+  const predictedE2eMs =
+    predictedTtftMs + remainingTokens * route.predictedInterTokenMs;
+  const predictedCostUnits =
+    (request.inputTokens * route.inputCostPerMillion +
+      request.maxOutputTokens * route.outputCostPerMillion) /
+    1_000_000;
+  return { predictedTtftMs, predictedE2eMs, predictedCostUnits };
+}
+
+function decide(
+  request: InferenceRequest,
+  routes: Route[],
+  context: AdmissionContext,
+): Decision {
+  if (
+    request.inputTokens <= 0 ||
+    request.maxOutputTokens <= 0 ||
+    request.deadlineMs <= 0
+  ) {
+    return {
+      status: 'rejected',
+      requestId: request.requestId,
+      reasonCode: 'INVALID_TOKEN_BUDGET',
+      retryable: false,
+    };
+  }
+
+  if (context.tenantInFlight >= context.tenantConcurrencyLimit) {
+    return {
+      status: 'rejected',
+      requestId: request.requestId,
+      reasonCode: 'TENANT_CONCURRENCY_LIMIT',
+      retryable: true,
+    };
+  }
+
+  const capable = routes.filter(
+    (route) =>
+      route.healthy &&
+      request.inputTokens <= route.maxInputTokens &&
+      request.maxOutputTokens <= route.maxOutputTokens &&
+      request.inputTokens + request.maxOutputTokens <= route.maxTotalTokens &&
+      hasCapabilities(route, request.requiredCapabilities),
+  );
+  if (capable.length === 0) {
+    return {
+      status: 'rejected',
+      requestId: request.requestId,
+      reasonCode: 'NO_CAPABLE_ROUTE',
+      retryable: false,
+    };
+  }
+
+  const withCapacity = capable.filter(
+    (route) =>
+      route.freeKvTokens >= request.inputTokens + request.maxOutputTokens,
+  );
+  if (withCapacity.length === 0) {
+    return {
+      status: 'rejected',
+      requestId: request.requestId,
+      reasonCode: 'CAPACITY_SHED',
+      retryable: true,
+    };
+  }
+
+  const estimates = withCapacity.map((route) => ({
+    route,
+    ...estimate(route, request),
+  }));
+  const withinDeadline = estimates.filter(
+    (item) => item.predictedE2eMs <= request.deadlineMs,
+  );
+  if (withinDeadline.length === 0) {
+    return {
+      status: 'rejected',
+      requestId: request.requestId,
+      reasonCode: 'DEADLINE_INSUFFICIENT',
+      retryable: false,
+    };
+  }
+
+  const withinCost = withinDeadline.filter(
+    (item) => item.predictedCostUnits <= request.maxCostUnits,
+  );
+  if (withinCost.length === 0) {
+    return {
+      status: 'rejected',
+      requestId: request.requestId,
+      reasonCode: 'COST_BUDGET_EXCEEDED',
+      retryable: false,
+    };
+  }
+
+  withinCost.sort(
+    (a, b) =>
+      a.predictedE2eMs - b.predictedE2eMs ||
+      a.predictedCostUnits - b.predictedCostUnits ||
+      a.route.routeId.localeCompare(b.route.routeId),
+  );
+  const selected = withinCost[0];
+  assert(selected);
+
+  return {
+    status: 'accepted',
+    requestId: request.requestId,
+    routeId: selected.route.routeId,
+    modelRevision: selected.route.modelRevision,
+    predictedTtftMs: selected.predictedTtftMs,
+    predictedE2eMs: selected.predictedE2eMs,
+    predictedCostUnits: selected.predictedCostUnits,
+    reasonCodes: [
+      'CAPABILITY_MATCH',
+      'KV_CAPACITY_AVAILABLE',
+      'DEADLINE_FIT',
+      'COST_FIT',
+    ],
+  };
+}
+
+const routes: Route[] = [
+  {
+    routeId: 'fast-v2',
+    modelRevision: 'model-fast-sha256-a1',
+    healthy: true,
+    maxInputTokens: 8_192,
+    maxOutputTokens: 1_024,
+    maxTotalTokens: 8_192,
+    capabilities: ['json_schema', 'tools'],
+    predictedQueueMs: 120,
+    predictedPrefillMs: 260,
+    predictedInterTokenMs: 24,
+    inputCostPerMillion: 2,
+    outputCostPerMillion: 8,
+    freeKvTokens: 24_000,
+  },
+  {
+    routeId: 'long-context-v4',
+    modelRevision: 'model-long-sha256-b7',
+    healthy: true,
+    maxInputTokens: 65_536,
+    maxOutputTokens: 2_048,
+    maxTotalTokens: 65_536,
+    capabilities: ['json_schema', 'tools', 'long_context'],
+    predictedQueueMs: 260,
+    predictedPrefillMs: 540,
+    predictedInterTokenMs: 36,
+    inputCostPerMillion: 4,
+    outputCostPerMillion: 12,
+    freeKvTokens: 80_000,
+  },
+];
+
+const normal: InferenceRequest = {
+  requestId: 'req-normal',
+  tenantId: 'tenant-a',
+  priority: 'interactive',
+  inputTokens: 1_000,
+  maxOutputTokens: 200,
+  deadlineMs: 8_000,
+  maxCostUnits: 0.01,
+  requiredCapabilities: ['json_schema'],
+};
+
+const accepted = decide(normal, routes, {
+  tenantInFlight: 1,
+  tenantConcurrencyLimit: 4,
+});
+assert.equal(accepted.status, 'accepted');
+if (accepted.status === 'accepted') {
+  assert.equal(accepted.routeId, 'fast-v2');
+  assert(accepted.predictedE2eMs <= normal.deadlineMs);
+}
+
+const longContext = decide(
+  {
+    ...normal,
+    requestId: 'req-long',
+    inputTokens: 12_000,
+    deadlineMs: 9_000,
+    requiredCapabilities: ['long_context'],
+    maxCostUnits: 0.1,
+  },
+  routes,
+  { tenantInFlight: 0, tenantConcurrencyLimit: 4 },
+);
+assert.equal(longContext.status, 'accepted');
+if (longContext.status === 'accepted') {
+  assert.equal(longContext.routeId, 'long-context-v4');
+}
+
+const quotaRejected = decide(normal, routes, {
+  tenantInFlight: 4,
+  tenantConcurrencyLimit: 4,
+});
+assert.deepEqual(quotaRejected, {
+  status: 'rejected',
+  requestId: 'req-normal',
+  reasonCode: 'TENANT_CONCURRENCY_LIMIT',
+  retryable: true,
+});
+
+const deadlineRejected = decide(
+  { ...normal, requestId: 'req-deadline', deadlineMs: 300 },
+  routes,
+  { tenantInFlight: 0, tenantConcurrencyLimit: 4 },
+);
+assert.equal(deadlineRejected.status, 'rejected');
+if (deadlineRejected.status === 'rejected') {
+  assert.equal(deadlineRejected.reasonCode, 'DEADLINE_INSUFFICIENT');
+}
+
+const totalWindowRejected = decide(
+  {
+    ...normal,
+    requestId: 'req-total-window',
+    inputTokens: 8_000,
+    maxOutputTokens: 512,
+  },
+  [routes[0]!],
+  { tenantInFlight: 0, tenantConcurrencyLimit: 4 },
+);
+assert.equal(totalWindowRejected.status, 'rejected');
+if (totalWindowRejected.status === 'rejected') {
+  assert.equal(totalWindowRejected.reasonCode, 'NO_CAPABLE_ROUTE');
+}
+
+const noCapacity = routes.map((route) => ({ ...route, freeKvTokens: 0 }));
+const shed = decide(
+  { ...normal, requestId: 'req-shed' },
+  noCapacity,
+  { tenantInFlight: 0, tenantConcurrencyLimit: 4 },
+);
+assert.equal(shed.status, 'rejected');
+if (shed.status === 'rejected') {
+  assert.equal(shed.reasonCode, 'CAPACITY_SHED');
+  assert.equal(shed.retryable, true);
+}
+
+console.log(
+  JSON.stringify(
+    {
+      status: 'passed',
+      acceptedRoute:
+        accepted.status === 'accepted' ? accepted.routeId : null,
+      longContextRoute:
+        longContext.status === 'accepted' ? longContext.routeId : null,
+      rejectionChecks: 3,
+    },
+    null,
+    2,
+  ),
+);
+```
+
+这个示例没有模拟真实GPU调度；它验证的是更靠前且必须稳定的决策边界。真实实现需要用观测到的分布更新预测，但不能因此丢失硬预算与Reason Code。
+
+## 13. 模型服务故障诊断矩阵
+
+| 现象 | 需要的最小证据 | 可能根因 | 不应立即做什么 |
+| --- | --- | --- | --- |
+| TTFT P99升高，ITL稳定 | Queue、Prefill、输入Token桶 | 排队增长、长Prompt集中、Prefill争用 | 只调Decode批次 |
+| TTFT稳定，ITL恶化 | Decode时间、运行请求数、KV压力 | Decode过载、批次过大、KV抢占 | 只加入口副本 |
+| GPU利用率高但吞吐下降 | 每迭代Token、KV使用、抢占/重算 | 内存碎片、长请求占槽、调度失衡 | 继续增加并发上限 |
+| HTTP成功率高但用户取消增加 | 首Token、取消时点、降级占比 | 首字太慢、输出节奏差、降级质量下降 | 用2xx证明系统健康 |
+| 切流后成本突增 | 模型/Tokenizer/配置版本、输入输出Token | Tokenizer变化、输出变长、Hedge或重试 | 只比较单价表 |
+| 备用路由成功但Schema错误 | Capability、适配器版本、原始错误分类 | Fallback不等价、停止规则不同 | 把所有完成都计为成功 |
+| 超时后重复计费 | providerRequestId、取消确认、查询结果 | 后端继续生成、重试复制请求 | 把超时当作未执行 |
+| 某租户正常、其他租户排队 | 租户在途数、优先级、队列年龄 | 公平性不足、配额缺失 | 只扩大全局队列 |
+
+## 14. 三个故障注入实验
+
+### 实验一：平均延迟不变，P99排队爆炸
+
+构造95个`queueMs=20`和5个`queueMs=4000`的请求。分别计算平均值、P95、P99，并按交互/批处理切片。验收：告警由交互请求尾延迟触发，不能因平均值仍在宽松阈值内而通过。
+
+### 实验二：KV容量不足时仍继续接纳
+
+把所有路由`freeKvTokens`降到请求总Token预算以下。验收：请求在队列外以`CAPACITY_SHED`拒绝，`retryable=true`，没有生成伪造的模型结果；恢复容量后同一业务请求可以受控重试。
+
+### 实验三：Fallback丢失结构化输出能力
+
+将主路由标为不健康，备用路由移除`json_schema`能力。验收：返回`NO_CAPABLE_ROUTE`，不能因为备用路由能生成文本就绕过调用方的机器解析契约。
+
+扩展实验：
+
+- 把容量Snapshot时间改为过期，验证路由器进入保守路径；
+- 模拟流中途断开，验证取消向后传播并记录确认状态；
+- 修改Tokenizer版本，让同一文本Token数改变，验证预算和Receipt能定位版本；
+- 启动Hedge但不取消副本，确认成本与在途数门禁失败；
+- 切入新版本时只看平均E2E，验证发布Gate能被尾延迟回归阻断。
+
+## 15. 验收条件
+
+完成本课后，作品必须能证明：
+
+- □ 每个请求在入队前检查Token、Deadline、租户和成本硬预算；
+- □ TTFT、ITL、E2E、排队和取消确认分别记录；
+- □ 指标按模型版本、请求类别和Token长度切片；
+- □ 路由先做能力与策略硬过滤，再做可解释排序；
+- □ 所有模型、Tokenizer、Runtime和策略版本进入Receipt；
+- □ 过载时有限队列与负载丢弃保护已接纳请求；
+- □ Fallback有质量与能力证据，不能绕过数据边界；
+- □ 超时、取消、失败和未知终态不混为一个异常；
+- □ 发布能金丝雀、比较、停止切流并回滚；
+- □ 成本按有效结果归因，而不是只统计Token单价。
+
+静态Markdown中的方框仅表示阅读验收清单，不保存进度；课程完成状态使用页面顶部的进度控件。
+
+## 16. 学完后应该能回答什么
+
+1. 为什么吞吐提高可能让首Token体验变差？
+2. TTFT、ITL与E2E分别定位哪类问题？
+3. 为什么KV容量要在准入阶段进入预算？
+4. 连续批处理解决什么，又会引入哪些公平性和尾延迟问题？
+5. 什么时候应该负载丢弃，而不是继续扩大队列？
+6. 为什么统一HTTP或推理协议不能证明后端能力等价？
+7. Fallback为什么需要离线质量证据与显式能力矩阵？
+8. 超时后为什么不能直接断言“模型没有执行”？
+9. 一次模型发布需要版本化哪些非权重资产？
+10. 如何证明一次路由决定在当时的容量、策略和预算下是合理的？
+
+## 17. 来源边界
+
+本课使用vLLM公开指标文档理解服务阶段可观测维度，使用PagedAttention与Orca论文理解KV内存和迭代调度问题，使用KServe开放推理协议说明模型/版本与请求边界，使用Google SRE材料说明SLO与控制动作。课程中的模型池、延迟、容量和成本数字都是教学夹具，不代表任何厂商、模型、GPU或部署的当前性能与价格。
