@@ -1696,13 +1696,25 @@ interface CliOptions {
   outPath?: string;
   markdownPath?: string;
   selfTest: boolean;
+  help: boolean;
 }
 
-function parseCli(argv: string[]): CliOptions {
-  const defaultManifest = path.join(process.cwd(), 'cache-lab-manifest.json');
+const HELP_TEXT = `Usage:
+  pnpm exec tsx examples/cache-reuse-consistency/cache-reuse-simulator.ts [options]
+
+Options:
+  --manifest <path>   Input manifest (default: checked-in cache-workload.json)
+  --out <path>        Write structured JSON report
+  --markdown <path>   Write Markdown summary
+  --self-test         Exit non-zero when an acceptance assertion fails
+  --help              Show this message`;
+
+export function parseCli(argv: string[]): CliOptions {
+  const defaultManifest = fileURLToPath(new URL('./cache-workload.json', import.meta.url));
   const options: CliOptions = {
     manifestPath: defaultManifest,
     selfTest: false,
+    help: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -1715,17 +1727,7 @@ function parseCli(argv: string[]): CliOptions {
     } else if (arg === '--self-test') {
       options.selfTest = true;
     } else if (arg === '--help' || arg === '-h') {
-      console.log(`Usage:
-  node deterministic-cache-lab.js [options]
-
-Options:
-  --manifest <path>   Input manifest (default: ./cache-lab-manifest.json)
-  --out <path>        Write structured JSON report
-  --markdown <path>   Write Markdown summary
-  --self-test         Exit non-zero when an acceptance assertion fails
-  --help              Show this message`);
-      process.exitCode = 0;
-      return options;
+      options.help = true;
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -1739,9 +1741,13 @@ function requireValue(argv: string[], index: number, flag: string): string {
   return value;
 }
 
-function main(): void {
+export function runCli(argv: string[]): number {
   try {
-    const options = parseCli(process.argv.slice(2));
+    const options = parseCli(argv);
+    if (options.help) {
+      console.log(HELP_TEXT);
+      return 0;
+    }
     const manifestPath = path.resolve(options.manifestPath);
     const manifest = readManifest(manifestPath);
     const report = buildReport(manifest);
@@ -1761,11 +1767,12 @@ function main(): void {
     }
 
     if (options.selfTest && report.assertions.some((assertion) => !assertion.passed)) {
-      process.exitCode = 1;
+      return 1;
     }
+    return 0;
   } catch (error) {
     console.error(error instanceof Error ? error.stack ?? error.message : String(error));
-    process.exitCode = 1;
+    return 1;
   }
 }
 
@@ -1773,5 +1780,5 @@ const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : undefined;
 const modulePath = fileURLToPath(import.meta.url);
 
 if (invokedPath === modulePath) {
-  main();
+  process.exitCode = runCli(process.argv.slice(2));
 }

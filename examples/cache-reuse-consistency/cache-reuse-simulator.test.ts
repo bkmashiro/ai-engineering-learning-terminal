@@ -1,9 +1,12 @@
-import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   buildReport,
+  parseCli,
   readManifest,
+  runCli,
   type LabReport,
   type SimulationResult,
 } from './cache-reuse-simulator';
@@ -39,6 +42,39 @@ describe('deterministic cache reuse simulator', () => {
     expect(report.assertions.map((assertion) => assertion.id)).toContain(
       'fill-owner-crash-recovers-with-fence',
     );
+  });
+
+  it('keeps Origin attempt accounting closed, including fenced late fills', () => {
+    const report = buildReport(readManifest(manifestUrl.pathname));
+
+    for (const result of report.results) {
+      expect(result.metrics.originSuccesses + result.metrics.originFailures).toBe(
+        result.metrics.originCalls,
+      );
+    }
+  });
+
+  it('uses the checked-in workload when no manifest flag is provided', () => {
+    const options = parseCli([]);
+
+    expect(options.manifestPath).toBe(fileURLToPath(manifestUrl));
+    expect(existsSync(options.manifestPath)).toBe(true);
+  });
+
+  it('prints help and exits successfully without reading a requested manifest', () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      expect(runCli(['--manifest', '/definitely/missing/cache-manifest.json', '--help'])).toBe(0);
+      const output = log.mock.calls.flat().join('\n');
+      expect(output).toContain('Usage:');
+      expect(output).not.toContain('Assertions:');
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+      error.mockRestore();
+    }
   });
 
   it('shows that coalescing removes fill amplification without serving unsafe hits', () => {
