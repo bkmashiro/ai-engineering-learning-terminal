@@ -315,3 +315,8 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+}

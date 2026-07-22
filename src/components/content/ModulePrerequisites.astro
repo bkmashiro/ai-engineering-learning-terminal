@@ -18,9 +18,9 @@ const prerequisites = module.prerequisites.map((id) => {
 {prerequisites.length > 0 && (
   <aside class="module-prerequisites" aria-labelledby={`prerequisites-${moduleId}`}>
     <div class="module-prerequisites__intro">
-      <span>BEFORE YOU START</span>
+      <span>前置知识</span>
       <strong id={`prerequisites-${moduleId}`}>开始前需要掌握</strong>
-      <small>不熟悉也可以先点开补基础。</small>
+      <small>不熟悉也可以先打开对应课程补基础。</small>
     </div>
     <div class="module-prerequisites__list">
       {prerequisites.map((item) => (
@@ -28,7 +28,7 @@ const prerequisites = module.prerequisites.map((id) => {
           <span>{stageLabels[item.stage]}</span>
           <strong>{item.title}</strong>
           <small>{item.summary}</small>
-          <em>{item.status === 'available' ? '可学习 →' : '路线说明 →'}</em>
+          <em>{item.status === 'available' ? '打开课程 →' : '查看路线 →'}</em>
         </a>
       ))}
     </div>

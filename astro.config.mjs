@@ -43,6 +43,7 @@ export default defineConfig({
       description: '从软件底座到 Agent 工程与就业方向的公开学习路线。',
       favicon: '/favicon.svg',
       customCss: ['./src/styles/global.css'],
+      components: { Head: './src/components/Head.astro' },
       locales: {
         root: { label: '简体中文', lang: 'zh-CN' },
       },
@@ -87,6 +88,7 @@ export default defineConfig({
         },
         {
           label: '方向',
+          collapsed: true,
           items: [
             { label: '方向总览', slug: 'directions' },
             { label: 'Agent 应用与产品工程', slug: 'directions/agent-applications' },
@@ -107,7 +109,7 @@ export default defineConfig({
           ],
         },
       ],
-      tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 3 },
+      tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 2 },
       lastUpdated: true,
       pagination: true,
       head: [

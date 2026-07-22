@@ -68,9 +68,7 @@ export function RoadmapGraph() {
                     <>
                       <div class="roadmap__node-heading">
                         <strong>{title}</strong>
-                        <span class={node.status === 'available' ? 'is-available' : ''}>
-                          {node.status === 'available' ? '可学习' : '计划中'}
-                        </span>
+                        {node.status === 'planned' ? <span>计划中</span> : null}
                       </div>
                       <p>{node.summary}</p>
                       <small>产物：{node.artifact}</small>

@@ -1,0 +1,191 @@
+<figure class="agent-control-loop" aria-labelledby="agent-control-loop-title agent-control-loop-caption">
+  <div class="agent-control-loop__header">
+    <div>
+      <p class="agent-control-loop__eyebrow">CONTROL OWNERSHIP</p>
+      <h3 id="agent-control-loop-title">模型提议一步，程序控制整条循环</h3>
+    </div>
+    <span>Proposal ≠ Execution</span>
+  </div>
+
+  <div class="agent-control-loop__shell">
+    <section class="agent-control-loop__program is-start">
+      <span>PROGRAM</span>
+      <strong>目标与初始状态</strong>
+      <small>声明成功条件、允许动作和总预算</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section class="agent-control-loop__program">
+      <span>PROGRAM</span>
+      <strong>构造 Observation</strong>
+      <small>只暴露当前决策所需的公开状态</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section class="agent-control-loop__model">
+      <span>MODEL</span>
+      <strong>Action Proposal</strong>
+      <small>完成、调用工具或请求澄清</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section class="agent-control-loop__program is-gate">
+      <span>PROGRAM</span>
+      <strong>策略与参数校验</strong>
+      <small>拒绝越权、超预算或不合法动作</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section class="agent-control-loop__program">
+      <span>PROGRAM</span>
+      <strong>执行并验证</strong>
+      <small>得到分类结果，检查真实后置条件</small>
+    </section>
+  </div>
+
+  <div class="agent-control-loop__outcomes" aria-label="循环结果">
+    <section class="is-complete">
+      <span>COMPLETE</span>
+      <strong>成功条件成立</strong>
+      <small>提交输出和可验证证据</small>
+    </section>
+    <section class="is-loop">
+      <span>CONTINUE</span>
+      <strong>状态发生有效变化</strong>
+      <small>扣减预算后返回下一轮 Observation</small>
+    </section>
+    <section class="is-stop">
+      <span>STOP</span>
+      <strong>拒绝、取消或人工接管</strong>
+      <small>保留停止原因，不让模型覆盖程序边界</small>
+    </section>
+  </div>
+
+  <figcaption id="agent-control-loop-caption">
+    Agent 的“不确定性”只存在于候选动作选择。程序仍拥有循环入口、可执行动作集合、预算、验证器、状态提交和所有终止路径。
+  </figcaption>
+</figure>
+
+<style>
+  .agent-control-loop {
+    display: grid;
+    gap: 0.85rem;
+    margin-block: 1.5rem;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.875rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 3%, var(--sl-color-bg));
+  }
+
+  .agent-control-loop__header {
+    display: flex;
+    align-items: end;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .agent-control-loop__header h3,
+  .agent-control-loop__header p,
+  .agent-control-loop section strong,
+  .agent-control-loop section small {
+    margin: 0;
+  }
+
+  .agent-control-loop__header h3 {
+    font-size: 1rem;
+  }
+
+  .agent-control-loop__eyebrow,
+  .agent-control-loop__header > span,
+  .agent-control-loop section > span {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.8125rem;
+    font-weight: 750;
+    letter-spacing: 0.025em;
+  }
+
+  .agent-control-loop__shell {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
+    align-items: stretch;
+    gap: 0.4rem;
+  }
+
+  .agent-control-loop section {
+    display: grid;
+    align-content: start;
+    gap: 0.3rem;
+    min-width: 0;
+    padding: 0.75rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.6rem;
+    background: var(--sl-color-bg);
+  }
+
+  .agent-control-loop section strong {
+    font-size: 0.875rem;
+  }
+
+  .agent-control-loop section small,
+  .agent-control-loop figcaption {
+    color: var(--sl-color-gray-2);
+    font-size: 0.8125rem;
+    line-height: 1.5;
+  }
+
+  .agent-control-loop__shell > b {
+    align-self: center;
+    color: var(--sl-color-accent-high);
+  }
+
+  .agent-control-loop__model {
+    border-style: dashed !important;
+    background: color-mix(in srgb, var(--sl-color-accent) 6%, var(--sl-color-bg)) !important;
+  }
+
+  .agent-control-loop__program.is-gate {
+    border-width: 2px;
+    border-color: var(--sl-color-accent);
+  }
+
+  .agent-control-loop__outcomes {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.55rem;
+    padding-top: 0.75rem;
+    border-top: 1px dashed var(--sl-color-gray-5);
+  }
+
+  .agent-control-loop__outcomes .is-complete {
+    border-color: color-mix(in srgb, #1f9d62 50%, var(--sl-color-gray-5));
+  }
+
+  .agent-control-loop__outcomes .is-loop {
+    border-color: color-mix(in srgb, var(--sl-color-accent) 55%, var(--sl-color-gray-5));
+  }
+
+  .agent-control-loop__outcomes .is-stop {
+    border-color: color-mix(in srgb, #c75b47 55%, var(--sl-color-gray-5));
+  }
+
+  .agent-control-loop figcaption {
+    padding-top: 0.75rem;
+    border-top: 1px dashed var(--sl-color-gray-5);
+  }
+
+  @media (max-width: 64rem) {
+    .agent-control-loop__shell {
+      grid-template-columns: 1fr;
+    }
+
+    .agent-control-loop__shell > b {
+      justify-self: center;
+      transform: rotate(90deg);
+    }
+  }
+
+  @media (max-width: 38rem) {
+    .agent-control-loop__header,
+    .agent-control-loop__outcomes {
+      display: grid;
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

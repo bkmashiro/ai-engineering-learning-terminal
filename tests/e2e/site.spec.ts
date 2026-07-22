@@ -37,17 +37,71 @@ test('sidebar separates learning directions from site references', async ({ page
   }
   const sidebar = page.locator('#starlight__sidebar');
   await expect(sidebar.getByText('方向', { exact: true })).toBeVisible();
+  const directionGroup = sidebar.locator('summary').filter({ hasText: /^方向$/ }).locator('..');
+  await expect(directionGroup).not.toHaveAttribute('open', '');
   await expect(sidebar.getByText('参考与本站', { exact: true })).toBeVisible();
   await expect(sidebar.getByRole('link', { name: '术语表', exact: true })).toBeVisible();
   await expect(sidebar.getByRole('link', { name: '来源', exact: true })).toBeVisible();
   await expect(sidebar.getByRole('link', { name: '关于本站', exact: true })).toBeVisible();
+
+  await page.goto('/directions/agent-applications/');
+  const activeDirectionGroup = page
+    .locator('#starlight__sidebar summary')
+    .filter({ hasText: /^方向$/ })
+    .locator('..');
+  await expect(activeDirectionGroup).toHaveAttribute('open', '');
+});
+
+test('sidebar navigation swaps pages without reloading the document', async ({ page }, testInfo) => {
+  await page.goto('/agent/workflow-vs-agent/');
+  const sentinel = await page.evaluate(() => {
+    const value = crypto.randomUUID();
+    (window as Window & { __navigationSentinel?: string }).__navigationSentinel = value;
+    return value;
+  });
+
+  if (testInfo.project.name === 'mobile-chromium') {
+    await page.getByRole('button', { name: '菜单', exact: true }).click();
+  }
+  await page.locator('#starlight__sidebar').getByRole('link', { name: '状态、工具与记忆', exact: true }).click();
+
+  await expect(page).toHaveURL(/\/agent\/state-tools-memory\/$/);
+  await expect(page.getByRole('heading', { level: 1, name: '状态、工具与记忆' })).toBeVisible();
+  const sentinelAfterNavigation = await page.evaluate(
+    () => (window as Window & { __navigationSentinel?: string }).__navigationSentinel,
+  );
+  expect(sentinelAfterNavigation).toBe(sentinel);
+  await page.getByRole('button', { name: '标记本课完成' }).click();
+  await expect(page.getByRole('status')).toHaveText('本课已完成');
+});
+
+test('table of contents groups the expanded agent lesson into six learning phases', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'the right-side table of contents is desktop-only');
+  await page.goto('/agent/workflow-vs-agent/');
+  const toc = page.getByRole('navigation', { name: '本页内容' });
+  await expect(toc.getByRole('link', { name: '一、先选择最小编排' })).toBeVisible();
+  await expect(toc.getByRole('link', { name: '六、完成本课' })).toBeVisible();
+  await expect(toc.getByRole('link', { name: '2. 编排模式：不是只有“固定”或“自主”两档' })).toHaveCount(0);
+  await expect(toc.getByRole('link', { name: '2.1 Prompt Chaining' })).toHaveCount(0);
+  await expect(toc.getByRole('link')).toHaveCount(7);
+});
+
+test('lesson prerequisites use reader-facing Chinese actions', async ({ page }) => {
+  await page.goto('/agent/workflow-vs-agent/');
+  const prerequisites = page.getByRole('complementary', { name: '开始前需要掌握' });
+  await expect(prerequisites.getByText('前置知识', { exact: true })).toBeVisible();
+  await expect(prerequisites.getByText('BEFORE YOU START', { exact: true })).toHaveCount(0);
+  await expect(prerequisites.getByRole('link').first()).toContainText('打开课程 →');
 });
 
 test('roadmap filters without losing the selected direction prerequisites', async ({ page }) => {
   await page.goto('/roadmap/');
 
   await page.getByLabel('查看路径').selectOption('agent-runtime-evaluation');
-  await expect(page.locator('.roadmap__node').filter({ hasText: 'Workflow 与 Agent' })).toBeVisible();
+  const workflowNode = page.locator('.roadmap__node').filter({ hasText: 'Workflow 与 Agent' });
+  await expect(workflowNode).toBeVisible();
+  await expect(workflowNode).toContainText('编排模式、控制循环、预算与终止条件');
+  await expect(page.getByText('可学习', { exact: true })).toHaveCount(0);
   await expect(page.locator('.roadmap__node').filter({ hasText: 'Agent Runtime、Harness 与评测' })).toBeVisible();
 });
 
@@ -182,6 +236,11 @@ test('new core modules expose mechanisms, diagrams and mobile-safe layouts', asy
       path: '/foundations/llm/retrieval/',
       heading: 'Citation 与 Grounding',
       component: '.retrieval-pipeline',
+    },
+    {
+      path: '/agent/workflow-vs-agent/',
+      heading: '控制权必须留在程序',
+      component: '.agent-control-loop',
     },
     {
       path: '/agent/state-tools-memory/',

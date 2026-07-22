@@ -97,11 +97,6 @@
   white-space: nowrap;
 }
 
-.roadmap__node-heading span.is-available {
-  color: var(--sl-color-accent-high);
-  background: var(--sl-color-accent-low);
-}
-
 .roadmap__node p {
   margin: 0.35rem 0 0.55rem;
   color: var(--sl-color-gray-2);

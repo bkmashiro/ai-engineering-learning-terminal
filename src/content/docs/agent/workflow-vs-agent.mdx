@@ -1,16 +1,17 @@
 ---
 title: Workflow 与 Agent
-description: 判断何时使用固定工作流，何时需要受控 Agent，并通过故障注入理解执行循环。
+description: 从编排模式、控制权、预算和终止条件出发，判断何时使用固定工作流，何时需要受控 Agent。
 moduleId: workflow-vs-agent
 stage: agent-core
 prerequisites:
   - network-streaming
   - llm-foundations
 outcomes:
-  - 区分 Workflow 与 Agent
-  - 设计有限步、可取消的 Agent Loop
-  - 在工具故障或状态重复时正确停止
-estimatedMinutes: 35
+  - 根据路径不确定性、验证能力和副作用选择编排模式
+  - 区分模型候选动作与程序可执行命令
+  - 设计有限步、可取消、可验证的 Agent Loop
+  - 用 Trace、预算和故障注入证明循环能够正确停止
+estimatedMinutes: 90
 difficulty: core
 careerDirections:
   - agent-applications
@@ -20,10 +21,11 @@ sourceIds:
   - building-effective-agents
   - owasp-agent-security
 sourceLocale: zh-CN
-lastReviewed: 2026-07-21
+lastReviewed: 2026-07-22
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
+import AgentControlLoopDiagram from '../../../components/content/AgentControlLoopDiagram.astro';
 import ModulePrerequisites from '../../../components/content/ModulePrerequisites.astro';
 import Term from '../../../components/content/Term.astro';
 import WorkflowComparison from '../../../components/content/WorkflowComparison.astro';
@@ -36,86 +38,714 @@ import { ModuleProgress } from '../../../components/learning/ModuleProgress';
 <ModulePrerequisites moduleId="workflow-vs-agent" />
 
 <Aside type="tip" title="先记住这一句">
-**工作流（Workflow）由代码决定路径；智能体（Agent）由模型选择下一项动作，但程序必须守住权限、预算和终止条件。**
+**工作流（Workflow）由代码决定路径；智能体（Agent）由模型选择下一项动作，但程序仍然决定允许什么、执行什么、何时停止，以及什么才算完成。**
 </Aside>
 
-## 1. 为什么先问“需不需要 Agent”
+## 一、先选择最小编排
 
-<Term id="agent" />会引入更多不确定性：模型可能选错工具、参数不合法、工具超时、结果无法验证，或者状态一直重复。若一个任务的步骤本来就清楚，固定<Term id="workflow" />通常更容易测试、审计和恢复。
+### 1. 具体工程问题：客服退款到底需不需要 Agent
+
+假设系统收到一句话：“昨天重复扣款了，帮我退款。”它可能需要：
+
+1. 找到用户和订单；
+2. 检查是否真的重复扣款；
+3. 判断支付渠道和退款规则；
+4. 生成退款计划；
+5. 在获得确认后调用支付接口；
+6. 验证退款单是否创建成功；
+7. 把结果通知用户。
+
+表面看，这是一串步骤，似乎适合固定<Term id="workflow" />。但真实输入可能缺少订单号、一个用户可能有多笔订单、不同渠道规则不同，检索结果也可能冲突。路径中存在需要根据现场状态选择下一步的部分。
+
+错误的结论是：“既然有不确定性，就让 Agent 自己处理全部流程。”退款具有外部副作用，错误动作难以撤回；如果模型可以直接调用支付接口，它可能选错订单、重复退款、把超时误判为失败后再次提交，或者在证据不足时仍宣称完成。
+
+更可靠的拆分是：
+
+- **固定入口：** 身份、订单范围、退款规则和请求状态由程序读取；
+- **模型可选区域：** 在多个候选订单或证据中提出下一项调查动作；
+- **固定出口：** 金额、订单、权限、确认和幂等身份由程序验证；
+- **高风险提交：** 进入独立确认步骤，不能由模型自行批准；
+- **完成判定：** 查询支付系统的退款单，而不是相信模型说“已完成”。
+
+这不是“Workflow 或 Agent 二选一”。生产系统通常是 **Workflow 包围一个受控 Agent 区域**。
 
 <WorkflowComparison />
 
-| 问题 | 更偏 Workflow | 更偏受控 Agent |
-| --- | --- | --- |
-| 步骤是否已知？ | 大部分已知 | 需要根据现场状态选择 |
-| 是否允许探索？ | 很少 | 在明确预算内允许 |
-| 错误能否验证？ | 规则明确 | 需要工具结果与外部检查 |
-| 副作用风险？ | 高风险时优先固定 | 必须加权限、确认和审计 |
-| 终止条件？ | 程序直接定义 | 程序定义预算，模型不能自行取消边界 |
+### 2. 编排模式：不是只有“固定”或“自主”两档
+
+从单次模型调用到受控 Agent，中间至少有六种常见模式。差别不在于用了多少个 Prompt，而在于**下一步由谁选择、结果由谁合并、循环由谁停止**。
+
+| 模式 | 模型决策点 | 程序必须拥有的控制 | 适用问题 | 主要失败路径 |
+| --- | ---: | --- | --- | --- |
+| 单次调用 | 0–1 | 输入、输出Schema和失败处理 | 分类、抽取、改写 | 输出不合法、事实错误 |
+| Prompt Chaining | 每个固定阶段一次 | 顺序、阶段输入和停止 | 先抽取再生成、先计划再格式化 | 上游错误向后传播 |
+| Routing | 选择一个分支 | 路由标签、默认分支和回退 | 按意图选择工具或专家 | 路由漂移、未知类别 |
+| Parallel Fan-out/Fan-in | 多个独立子任务 | 并发上限、合并规则和部分失败策略 | 多来源检索、独立检查 | 慢节点拖尾、结果冲突 |
+| Evaluator–Optimizer | 生成与评价交替 | 通过条件、轮数和改进阈值 | 文案修订、代码修复 | 评价器偏差、无限互改 |
+| Orchestrator–Workers | 动态拆分子任务 | Worker边界、依赖图和汇总验证 | 边界可分的复杂调查 | 重复工作、依赖遗漏 |
+| 受控 Agent Loop | 每轮选择下一动作 | 动作集合、预算、验证、状态和终止 | 路径无法预先枚举 | 循环、越权、成本失控 |
+
+#### 2.1 Prompt Chaining
+
+程序提前知道阶段：例如“抽取字段 → 检索证据 → 生成带引用答案”。模型只在每个阶段完成受限转换。若第二阶段失败，程序知道停在哪里，也能单独重放。
+
+不要为了“更Agent”而让模型重新决定是否需要抽取或检索；如果步骤总是相同，动态选择只增加故障面。
+
+#### 2.2 Routing
+
+Router 输出有限标签，例如 `billing`、`technical`、`account`、`unknown`。程序把标签映射到固定分支。`unknown` 是必要状态，不应该把所有低置信输入硬塞进最相近分支。
+
+Router 的正确率不能只看整体 Accuracy。高风险分支还要单独检查误路由率：把普通咨询路由到只读FAQ通常可恢复，把退款请求路由到可写支付工具则需要更严格的后续门槛。
+
+#### 2.3 Parallel Fan-out/Fan-in
+
+并行适合互相独立的工作：同时读取三份公开材料，或让三个确定性检查器分别验证格式、引用和安全边界。Fan-in 必须定义：
+
+- 是否要求所有分支成功；
+- 部分失败能否返回降级结果；
+- 冲突结果怎样仲裁；
+- 慢分支何时取消；
+- 汇总是否保留每个分支的来源身份。
+
+“开十个Agent一起想”不是并行策略。没有独立边界和合并规则，只会把一个不确定任务复制十次。
+
+#### 2.4 Evaluator–Optimizer
+
+生成器产出候选，评价器给出结构化缺口，生成器据此修订。循环的通过条件必须由程序读取，例如 `allRequiredCitationsPresent === true`，而不是评价器写一句“现在很好”。还要设置最大轮数和最小改进量；连续两轮得分不变应停止，而不是继续消耗预算。
+
+#### 2.5 Orchestrator–Workers
+
+Orchestrator 适合在运行时拆出边界清楚的子任务，例如分别比较三个API的认证、限流和错误语义。Worker不应再无限创建Worker；依赖和汇总仍由程序检查。
+
+多Agent是一种拓扑，不是能力证明。若一个模型加三个工具已经能完成任务，增加角色不会自动提高正确率。
+
+### 3. 用四个问题选择架构
+
+先不要问“哪个框架最流行”，而要问下面四个问题。
+
+#### 3.1 路径能否提前枚举
+
+- 能枚举全部步骤和分支：优先固定Workflow；
+- 能枚举大部分路径，但某一步需要语义选择：在固定流程中加入Router或一个模型决策点；
+- 下一步依赖不断变化的外部观察：才考虑受控Agent Loop。
+
+#### 3.2 正确结果能否被程序验证
+
+如果完成条件可以由Schema、数据库查询、测试或外部状态验证，模型选择动作后仍能由程序收口。若结果主要依赖主观判断，要增加人工评价或多层评测，而不是让同一个模型既生成又宣布自己成功。
+
+#### 3.3 副作用是否可逆
+
+| 副作用 | 默认策略 |
+| --- | --- |
+| 无副作用读取 | 可在预算内自动执行 |
+| 可重放计算 | 可自动重试，但保留输入和版本 |
+| 幂等写入 | 使用稳定幂等键并验证后置条件 |
+| 可补偿写入 | 记录原状态和补偿动作，失败时对账 |
+| 不可逆或高影响操作 | 固定流程、明确确认、最小权限和人工接管 |
+
+#### 3.4 失败是否可观察
+
+工具返回200不代表业务目标成立；Timeout也不代表外部写入没有发生。越难观察真实后置条件，越不能把控制权交给开放循环。
 
 <ArchitectureDecisionMap client:load />
 
-## 2. 一个最小但可靠的 Agent Loop
+<Aside type="caution" title="不要用一个总分替代边界判断">
+路径不确定性高，不代表副作用也可以自动化；验证能力强，也不代表权限可以放宽。四个问题需要分别回答，再决定哪些区域固定、哪些区域允许模型选择。
+</Aside>
 
-<Steps>
-1. <strong>观察（Observe）：</strong>读取任务、公开状态和工具描述。
-2. <strong>选择（Decide）：</strong>模型只返回一个候选动作及结构化参数。
-3. <strong>执行（Act）：</strong>程序检查Schema、权限、幂等键和超时后执行。
-4. <strong>验证（Validate）：</strong>程序验证结果，选择接受、重试、降级或停止。
-5. <strong>更新（Update）：</strong>写入Trace和有限状态，检查目标、预算与循环保护。
-</Steps>
+## 二、把Agent变成受控状态机
 
-```ts title="runner.ts"
-for (let step = 0; step < maxSteps; step += 1) {
-  const proposal = await chooseAction(publicState, allowedTools);
-  const checked = validateProposal(proposal);
-  const result = await executeWithTimeout(checked);
-  const verdict = validateResult(result);
+### 4. 控制权必须留在程序
 
-  trace.append({ step, proposal: checked, result, verdict });
-  if (verdict.kind === 'complete') return verdict.output;
-  if (verdict.kind === 'stop') throw new ControlledStop(verdict.reason);
-  publicState = updateState(publicState, verdict);
+<Term id="agent" />的定义不是“模型可以做任何事”，而是“模型在程序边界内选择下一步”。模型输出是候选，不是已经授权的命令。
+
+<AgentControlLoopDiagram />
+
+程序至少拥有以下控制权：
+
+1. **入口：** 哪个用户目标可以启动哪类Run；
+2. **Observation：** 当前轮向模型暴露哪些公开状态；
+3. **动作集合：** 本轮有哪些允许动作；
+4. **策略门：** 参数、权限、预算和当前状态是否允许；
+5. **执行器：** 谁真正持有凭据并调用外部系统；
+6. **验证器：** 工具结果是否满足契约和真实后置条件；
+7. **状态提交：** 哪些事实可以成为下一轮的权威输入；
+8. **终止：** 成功、失败、取消、预算耗尽和人工接管如何进入终态。
+
+模型可以提出：
+
+```json
+{
+  "kind": "tool",
+  "tool": "lookup_order",
+  "arguments": { "orderHint": "昨天的重复扣款" }
 }
-throw new ControlledStop('step-budget-exhausted');
 ```
 
-<div class="boundary-note">
-<strong>关键边界：</strong>模型可以提出动作，但不能绕过 `allowedTools`、<Term id="schema" />、权限确认、<Term id="timeout" />、<Term id="idempotency" />和最大步数。
-</div>
+程序不能直接执行这段JSON。它还要确认当前Run是否允许查订单、用户范围是否正确、参数能否解析、调用是否在Deadline内，以及返回结果能否绑定到同一个用户。
 
-## 3. 动手：给循环注入故障
+### 5. Agent Loop 是状态机，不是 while(true)
 
-下面的组件不会调用真实模型或 API。它使用固定状态机模拟四种路径，因此每次操作都可复现。
+一个最小循环包含五个阶段：
+
+<Steps>
+1. <strong>观察（Observe）：</strong>从权威状态构造本轮最小Observation。
+2. <strong>选择（Decide）：</strong>模型只返回一个候选动作、完成声明或澄清请求。
+3. <strong>执行（Act）：</strong>程序检查策略后执行一个动作，并产生分类结果。
+4. <strong>验证（Validate）：</strong>检查结果、后置条件和完成声明是否真实。
+5. <strong>更新（Update）：</strong>原子写入公开Trace与新状态，扣减预算，再决定继续或停止。
+</Steps>
+
+状态转换可以写成：
+
+```text
+running + valid_proposal + allowed_action      → executing
+running + invalid_proposal                     → stopped_invalid
+executing + verified_result                    → running
+executing + unknown_effect                     → human_handoff
+running + verified_completion                  → completed
+running + repeated_state_or_budget_exhausted   → stopped_budget
+running + cancellation_requested               → cancelling
+```
+
+关键不是状态名字，而是非法转换必须失败。例如Run进入`cancelling`后不能再启动新工具；模型声明`complete`但后置条件不成立时，不能进入`completed`。
+
+### 6. 一次可手算的执行Trace
+
+目标：基于三份公开文档回答“某API是否支持幂等写入”，答案必须带引用；没有证据时返回无答案。
+
+初始预算：最多四次模型决策、三次工具调用、总Deadline 38秒。
+
+| 轮次 | Observation摘要 | 模型Proposal | 程序动作 | 验证后状态 |
+| ---: | --- | --- | --- | --- |
+| 0 | 尚无文档 | `search(query)` | 参数合法，调用检索 | 获得三个候选来源 |
+| 1 | 三个候选，两个可能相关 | `fetch(source-a)` | 来源在允许列表，读取 | A只描述重试，没有幂等语义 |
+| 2 | A证据不足，B仍未读取 | `fetch(source-b)` | 读取B并保留版本 | B明确说明幂等键和重复响应 |
+| 3 | 已有可引用证据 | `complete(answer, citation)` | 验证引用位置和结论 | `completed` |
+
+公开Trace不需要保存模型的私有思维过程。它只需记录可审计事实：
+
+```text
+proposal.received       search(query_hash=...)
+policy.allowed          tool=search remaining_calls=3
+result.verified         source_ids=[A,B,C]
+proposal.received       fetch(source=A)
+result.verified         claim_support=false
+proposal.received       fetch(source=B)
+result.verified         claim_support=true location=section-4
+completion.verified     citations=1 unsupported_claims=0
+run.completed           steps=4 tool_calls=3
+```
+
+如果第3轮没有引用就声明完成，验证器应拒绝完成；剩余预算允许时可以返回下一轮，否则进入`stopped_budget`或<Term id="human-handoff" />。
+
+## 三、用预算、副作用边界和终止条件收口
+
+### 7. 预算要同时约束时间、调用和成本
+
+只设置`maxSteps`不够。一次“Step”可能包含多个模型调用或工具调用，也可能被一个慢工具占满全部Deadline。
+
+至少维护：
+
+- `stepBudget`：最多多少次决策循环；
+- `modelCallBudget`：包括重试在内的模型调用次数；
+- `toolCallBudget`：全部工具调用次数，必要时再按工具细分；
+- `tokenBudget`：输入、输出和压缩摘要的总量；
+- `costBudget`：模型、检索和外部API的成本上限；
+- `deadline`：整条Run的绝对截止时刻；
+- `concurrencyBudget`：并行Worker或工具的同时运行数。
+
+#### 7.1 手算最坏延迟
+
+假设最多四次模型决策，每次Timeout为8秒；前三轮之间最多各等待2秒退避，不考虑工具并行：
+
+**最坏延迟预算 = 4 × 8 秒 + 3 × 2 秒 = 38 秒**
+
+如果产品要求30秒内给出结果，这个配置从设计上就不可能满足目标。不能等上线后再靠平均延迟掩盖。
+
+若工具还可能各占5秒，必须从同一个38秒Deadline中扣减，不能给模型和工具分别配置38秒。每一层收到的是“剩余时间”，不是重新开始的完整Timeout。
+
+#### 7.2 手算调用成本
+
+假设每次模型决策最多读取2,000 Token并生成300 Token，四轮上限是：
+
+```text
+输入上限 = 4 × 2,000 = 8,000 Token
+输出上限 = 4 × 300 = 1,200 Token
+```
+
+实际系统还要计算工具结果压缩、缓存命中和不同模型单价。预算耗尽必须进入明确终态，不能偷偷换模型继续跑。
+
+### 8. 终止条件必须可执行
+
+可靠循环至少有六类终止条件。
+
+#### 8.1 完成条件成立
+
+模型说“完成”只是一个Proposal。程序要检查：必填产物是否存在、引用是否可解析、数据库状态是否到达目标、测试是否通过。只有可观察后置条件成立才能`completed`。
+
+#### 8.2 不可恢复失败
+
+例如输入违反业务规则、权限被拒绝或必要资源不存在。继续换措辞重试不会改变事实，应立即停止并返回分类错误。
+
+#### 8.3 预算耗尽
+
+步骤、调用、Token、成本或Deadline任一耗尽都停止。停止记录要说明耗尽的是哪一类预算，以及已经产生了哪些可用产物。
+
+#### 8.4 无进展或循环
+
+对规范化Proposal和关键状态生成Fingerprint。若状态没有变化却重复同一动作，继续调用模型没有新信息。
+
+```text
+fingerprint = hash(state_version, tool_name, normalized_arguments)
+```
+
+同一Fingerprint连续出现两次可以触发停止；也可以维护最近N轮窗口，检测A→B→A→B振荡。不要把时间戳、随机ID这类每轮变化字段放进Fingerprint，否则循环永远检测不到。
+
+#### 8.5 用户取消
+
+取消是状态与信号，不是前端按钮动画。收到取消后不再启动新动作，当前调用收到AbortSignal；若外部副作用状态未知，先进入对账或人工接管，不能直接标记“已取消且什么都没发生”。
+
+#### 8.6 人工接管
+
+高风险、证据冲突、未知副作用或低置信路由都可以进入人工接管。Handoff至少带上当前目标、已验证事实、待确认动作、剩余预算和Trace指针，不能只显示“Agent失败”。
+
+### 9. 把读、计划和写分开
+
+副作用越高，越不应放进开放循环。一个稳妥拓扑是：
+
+1. **Read：** Agent在只读工具中收集证据；
+2. **Plan：** 生成结构化执行计划，列出资源、参数和预期变化；
+3. **Validate：** 程序检查策略、当前版本和用户范围；
+4. **Confirm：** 用户确认准确的动作与参数；
+5. **Commit：** 固定Workflow执行写入；
+6. **Verify：** 查询真实后置条件并记录证据。
+
+退款例子中，Agent可以选择读取哪个订单，也可以解释证据；最终`refund(orderId, amount)`由固定Workflow提交。确认Token必须绑定订单、金额、动作和有效期，不能用一句泛化的“确认继续”授权任意写入。
+
+如果写入接口支持<Term id="idempotency" />，恢复时复用同一个业务意图身份。若Timeout后结果未知，先查询或对账；盲目换新ID重试可能产生第二次副作用。
+
+### 10. 重试、取消与并行不是循环的私事
+
+本课前置模块已经讲过<Term id="timeout" />、<Term id="cancellation" />与<Term id="retry" />。放进Agent后，边界仍然相同，只是调用层级更多。
+
+#### 10.1 重试要占用同一预算
+
+模型调用的网络重试也算模型调用；工具重试也算工具调用。否则“最多五步”可能在底层变成几十次请求。每次重试要检查：
+
+- 错误是否明确可重试；
+- 剩余Deadline是否足够；
+- 副作用是否幂等或可查询；
+- 退避是否会让整个Run超过用户等待上限。
+
+#### 10.2 并行要有取消和汇总语义
+
+Fan-out三个分支后，如果两个已经提供足够证据，第三个慢分支是否取消要由程序决定。若业务要求全量检查，就不能为了快而提前结束。汇总器必须区分：
+
+```text
+complete: 3 / 3 succeeded
+partial: 2 / 3 succeeded, degraded output allowed
+invalid: required branch failed, no verdict
+```
+
+#### 10.3 上游取消必须向下传播
+
+Run取消后，模型流、检索请求、Worker和工具都应收到同一个取消链。仅更新数据库状态而不停止下游，会出现“页面显示已取消，后台仍继续写入”的分裂状态。
+
+## 四、留下证据并实现
+
+### 11. Trace与评测要围绕公开决策
+
+<Term id="trace" />应回答“系统做了什么、为什么允许、结果怎样验证”，而不是记录不可验证的私有推理。
+
+每轮最小事件：
+
+```text
+observation.built     state_version, allowed_tools, remaining_budget
+proposal.received     proposal_type, tool_name, arguments_hash
+proposal.rejected     stable_reason_code
+tool.started          tool_call_id, timeout, idempotency_key_hash
+result.classified     success | rejected | failed | unknown
+result.verified       postcondition, evidence_ref
+state.transitioned    from, to, new_version
+run.stopped           completion | failure | cancellation | budget | handoff
+```
+
+评测也要分层：
+
+| 层 | 断言示例 |
+| --- | --- |
+| 路由 | 退款请求没有进入普通FAQ分支 |
+| Proposal | 模型只选择允许工具，参数能解析 |
+| Policy | 无确认的写入被程序拒绝 |
+| 工具 | 超时、错误和未知副作用被正确分类 |
+| Outcome | 完成声明绑定真实后置条件 |
+| 效率 | 成功任务未超过调用、Token和延迟预算 |
+| 恢复 | 重放相同Trace能解释停止原因 |
+
+单看最终答案会漏掉危险的“碰巧成功”：系统可能调用过越权工具，或重复写入后只展示最后一次结果。过程断言与结果断言都需要。
+
+### 12. 一个可编译的最小Runner
+
+下面的实现只演示本章边界：模型提出一步，程序维护预算、动作白名单、重复检测、Timeout和完成验证。下一章会继续展开工具契约、Capability、权威状态与记忆写入。
+
+```ts title="examples/workflow-runner.ts"
+type ToolName = 'lookup' | 'saveDraft';
+
+type ToolProposal = {
+  kind: 'tool';
+  tool: string;
+  arguments: Record<string, unknown>;
+};
+
+type ValidatedToolProposal = Omit<ToolProposal, 'tool'> & { tool: ToolName };
+
+type Proposal =
+  | ToolProposal
+  | { kind: 'complete'; answer: string }
+  | { kind: 'clarify'; question: string };
+
+type ToolResult =
+  | { status: 'success'; observation: string }
+  | { status: 'failed'; code: string; retryable: boolean }
+  | { status: 'unknown'; code: string };
+
+type StopReason =
+  | 'completed'
+  | 'cancelled'
+  | 'clarification-required'
+  | 'invalid-proposal'
+  | 'repeated-proposal'
+  | 'step-budget-exhausted'
+  | 'tool-call-budget-exhausted'
+  | 'deadline-exhausted'
+  | 'tool-failed'
+  | 'unknown-effect';
+
+interface PublicState {
+  runId: string;
+  goal: string;
+  observations: string[];
+  step: number;
+  toolCalls: number;
+}
+
+interface TraceEvent {
+  type: string;
+  step: number;
+  detail: Record<string, unknown>;
+}
+
+interface Dependencies {
+  propose(state: Readonly<PublicState>, allowedTools: readonly ToolName[]): Promise<Proposal>;
+  invoke(proposal: ValidatedToolProposal, signal: AbortSignal): Promise<ToolResult>;
+  verifyCompletion(state: Readonly<PublicState>, answer: string): Promise<boolean>;
+  now(): number;
+}
+
+interface RunOptions {
+  maxSteps: number;
+  maxToolCalls: number;
+  toolTimeoutMs: number;
+  deadlineMs: number;
+  signal: AbortSignal;
+}
+
+interface RunOutcome {
+  reason: StopReason;
+  answer?: string;
+  state: PublicState;
+  trace: TraceEvent[];
+}
+
+const allowedTools = ['lookup', 'saveDraft'] as const;
+
+function normalizeArguments(value: Record<string, unknown>): string {
+  return JSON.stringify(
+    Object.entries(value).sort(([left], [right]) => left.localeCompare(right)),
+  );
+}
+
+function proposalFingerprint(proposal: ValidatedToolProposal): string {
+  return `${proposal.tool}:${normalizeArguments(proposal.arguments)}`;
+}
+
+function isAllowedTool(value: string): value is ToolName {
+  return allowedTools.some((tool) => tool === value);
+}
+
+class ToolTimeoutError extends Error {}
+
+async function withTimeout<T>(
+  timeoutMs: number,
+  parentSignal: AbortSignal,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const abortFromParent = () => controller.abort(parentSignal.reason);
+  if (parentSignal.aborted) controller.abort(parentSignal.reason);
+  else parentSignal.addEventListener('abort', abortFromParent, { once: true });
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort('timeout');
+      reject(new ToolTimeoutError('tool-timeout'));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([operation(controller.signal), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    parentSignal.removeEventListener('abort', abortFromParent);
+  }
+}
+
+export async function runControlledAgent(
+  goal: string,
+  dependencies: Dependencies,
+  options: RunOptions,
+): Promise<RunOutcome> {
+  const state: PublicState = {
+    runId: 'run-demo',
+    goal,
+    observations: [],
+    step: 0,
+    toolCalls: 0,
+  };
+  const trace: TraceEvent[] = [];
+  const seen = new Set<string>();
+  const deadlineAt = dependencies.now() + options.deadlineMs;
+
+  const stop = (reason: StopReason, answer?: string): RunOutcome => ({
+    reason,
+    answer,
+    state: { ...state, observations: [...state.observations] },
+    trace: [...trace],
+  });
+
+  while (state.step < options.maxSteps) {
+    if (options.signal.aborted) return stop('cancelled');
+    if (dependencies.now() >= deadlineAt) return stop('deadline-exhausted');
+
+    const proposal = await dependencies.propose(state, allowedTools);
+    trace.push({ type: 'proposal.received', step: state.step, detail: { kind: proposal.kind } });
+
+    if (proposal.kind === 'clarify') {
+      trace.push({ type: 'run.stopped', step: state.step, detail: { reason: 'clarification-required' } });
+      return stop('clarification-required');
+    }
+
+    if (proposal.kind === 'complete') {
+      const verified = await dependencies.verifyCompletion(state, proposal.answer);
+      trace.push({ type: 'completion.verified', step: state.step, detail: { verified } });
+      if (verified) return stop('completed', proposal.answer);
+      state.step += 1;
+      continue;
+    }
+
+    if (!isAllowedTool(proposal.tool)) return stop('invalid-proposal');
+    if (state.toolCalls >= options.maxToolCalls) return stop('tool-call-budget-exhausted');
+
+    const validatedProposal: ValidatedToolProposal = { ...proposal, tool: proposal.tool };
+
+    const fingerprint = proposalFingerprint(validatedProposal);
+    if (seen.has(fingerprint)) return stop('repeated-proposal');
+    seen.add(fingerprint);
+
+    state.toolCalls += 1;
+    let result: ToolResult;
+    try {
+      result = await withTimeout(options.toolTimeoutMs, options.signal, (signal) =>
+        dependencies.invoke(validatedProposal, signal),
+      );
+    } catch (error) {
+      const timedOut = error instanceof ToolTimeoutError;
+      trace.push({
+        type: 'tool.failed',
+        step: state.step,
+        detail: { tool: validatedProposal.tool, timedOut, cancelled: options.signal.aborted },
+      });
+      if (options.signal.aborted) return stop('cancelled');
+      if (timedOut && validatedProposal.tool === 'saveDraft') return stop('unknown-effect');
+      return stop('tool-failed');
+    }
+    trace.push({
+      type: 'result.classified',
+      step: state.step,
+      detail: { tool: validatedProposal.tool, status: result.status },
+    });
+
+    if (result.status === 'unknown') return stop('unknown-effect');
+    if (result.status === 'failed' && !result.retryable) return stop('tool-failed');
+    if (result.status === 'failed') {
+      state.step += 1;
+      continue;
+    }
+
+    state.observations.push(result.observation);
+    state.step += 1;
+    trace.push({
+      type: 'state.transitioned',
+      step: state.step,
+      detail: { observationCount: state.observations.length },
+    });
+  }
+
+  return stop('step-budget-exhausted');
+}
+```
+
+这个接口把`Proposal`视为已经通过基础Schema解析的候选；真实模型Adapter必须先把原始输出当作`unknown`解析，拒绝缺字段、错类型和多余危险字段。Runner随后再用`isAllowedTool`把任意工具名收窄到当前Run允许的动作集合。
+
+这个例子故意没有把所有生产问题都塞进一个文件。它仍需在下一章补上：工具输入输出Schema、权限Capability、稳定幂等身份、持久Run State、并发版本、长期记忆和副作用对账。
+
+## 五、故障注入与架构验收
+
+### 13. 故障诊断矩阵
+
+| 现象 | 首先检查 | 常见根因 | 正确处理 |
+| --- | --- | --- | --- |
+| 同类输入偶尔走错流程 | Router标签与混淆矩阵 | 未知类别被强制归类、标签定义漂移 | 增加`unknown`，按高风险类别单独测误路由 |
+| 并行任务一直等不完 | 每个分支状态和汇总条件 | 要求全成功但某分支无Deadline | 定义部分失败语义，取消非必要慢分支 |
+| 评价循环反复改写 | 每轮分数和差异 | 无最大轮数、无最小改进阈值 | 预算耗尽或连续无改进时停止 |
+| 工具一直重复调用 | Proposal Fingerprint和状态版本 | 工具结果未进入状态，或随机字段破坏去重 | 修复状态提交，规范化Fingerprint后停止 |
+| 模型称完成但产物缺失 | completion验证事件 | 把自然语言声明当后置条件 | 由程序查询产物、引用或业务状态 |
+| 用户取消后仍发生写入 | 下游Abort和工具状态 | 只改UI或Run状态，没有传播取消 | 停止新动作，取消当前调用并验证副作用 |
+| Timeout后产生重复写入 | 幂等身份和对账查询 | 把未知结果当明确失败并换ID重试 | 先查询真实状态，恢复时复用意图身份 |
+| 成功率尚可但成本暴涨 | 每Run调用数、Token和并发 | 底层重试不计预算、Worker递归创建 | 所有调用共用总预算和并发上限 |
+| Trace看不出为何停止 | `run.stopped`原因码 | 只记录自由文本或最终答案 | 记录稳定原因、预算快照和证据指针 |
+
+### 14. 故障注入实验
+
+所有实验都可以使用固定Proposal序列和假工具完成，不需要真实模型。
+
+#### 实验一：路由漂移
+
+准备20个带标签请求，其中5个是退款，5个是普通账单解释。让Router把一个低置信退款请求输出为`billing_faq`。
+
+**断言：** 高风险分支误路由被单独报告；低置信结果进入`unknown`或人工分类，不能直接调用写工具。
+
+#### 实验二：并行分支部分失败
+
+Fan-out三个文档读取器：A在100毫秒返回，B返回可重试错误，C永不返回。
+
+**断言：** C在分支Deadline时被取消；如果策略允许两份证据，结果标记`partial`并列出缺失来源；如果必须全量，整体进入`invalid`而不是伪装成功。
+
+#### 实验三：模型伪造完成
+
+固定Proposal第一轮就返回`complete`，但Artifact存储中不存在目标文件。
+
+**断言：** `verifyCompletion`拒绝完成；Trace出现`completion.verified=false`；剩余预算允许时进入下一轮，预算不足时明确停止。
+
+#### 实验四：Timeout后的未知副作用
+
+假`saveDraft`先写入记录，再让响应Timeout。
+
+**断言：** 结果分类为`unknown`；Runner不换幂等身份重试；先用只读查询确认记录是否存在，再进入完成、补偿或人工接管。
+
+#### 实验五：重复Proposal循环
+
+Planner连续两轮返回同一工具、同一规范化参数，而权威状态版本没有变化。
+
+**断言：** 第二次执行前触发`repeated-proposal`；工具实际只调用一次；停止事件包含Fingerprint和剩余预算。
 
 <AgentLoopStepper client:load />
 
-### 观察重点
+#### 使用交互实验时观察什么
 
 - 工具超时时，当前动作必须停止，而不是假装成功；
-- Schema 不合法时，结果不能进入下一状态；
+- Schema不合法时，结果不能进入下一状态；
 - 状态重复时，要触发循环保护；
-- <Term id="trace" />记录的是公开决策、工具调用和验证结果，不是模型的私有推理过程。
+- Trace记录公开决策、工具调用和验证结果，不记录模型私有思维过程；
+- 重新开始会恢复初始状态，不继承上个场景的故障。
 
-## 4. 自己实现一次
+### 15. 架构评审清单
 
-实现一个不调用真实服务的 TypeScript Runner：
+在引入Agent框架前，逐项回答：
 
-1. 工具只有 `lookup` 与 `saveDraft`；
-2. 每个动作先过 Schema 校验；
-3. `saveDraft` 必须接受幂等键；
-4. 最大执行五步；
-5. 连续两次状态摘要相同就停止；
-6. 输出 trace JSON 和分类错误。
+#### 路径与控制
 
-<strong>验收：</strong>正常路径、超时、非法结果和循环四个测试都通过，并且没有未捕获 Promise rejection。
+- 哪些步骤永远相同，为什么不写成固定Workflow？
+- 模型究竟在哪些节点选择下一步？
+- 每个动态节点的允许动作集合是什么？
+- 是否存在默认安全分支和`unknown`状态？
+
+#### 验证与副作用
+
+- 每个工具结果怎样验证？
+- 完成条件能否由程序检查？
+- 哪些动作只读、幂等、可补偿或不可逆？
+- 高风险写入是否离开开放循环并要求精确确认？
+
+#### 预算与停止
+
+- Step、模型调用、工具调用、Token、成本和Deadline是否分别计数？
+- 底层重试是否也扣减总预算？
+- 重复状态、无进展和评价器振荡怎样检测？
+- 取消后谁负责确认外部副作用真实状态？
+
+#### 证据与恢复
+
+- Trace能否解释每个Proposal为何允许或拒绝？
+- Worker部分失败如何汇总？
+- Timeout后的未知结果如何对账？
+- 人工接管能否获得当前状态、已验证证据和待处理动作？
+
+如果这些问题没有答案，增加Agent框架只会把未知边界藏进更多抽象层。
+
+### 16. 自己实现一次
+
+实现一个不调用真实服务的TypeScript Runner：
+
+1. 支持`lookup`与`saveDraft`两个工具；
+2. Planner由固定Proposal数组驱动；
+3. 每个动作先过允许工具与参数校验；
+4. `saveDraft`使用稳定业务意图身份；
+5. 最大五步、三次工具调用和一个绝对Deadline；
+6. 连续两次Proposal Fingerprint相同就停止；
+7. `complete`必须通过独立后置条件验证；
+8. 输出Trace JSON和分类停止原因。
+
+至少写六个测试：
+
+- 正常路径完成；
+- 非法Proposal在执行前被拒绝；
+- 工具Timeout且确认没有副作用；
+- 工具Timeout但副作用未知，进入对账；
+- 重复Proposal只调用一次工具；
+- 用户取消后不再启动新动作。
+
+<strong>验收：</strong>六个测试全部通过；Trace能解释每个停止原因；没有未捕获Promise rejection；同一业务意图恢复时不会产生第二次写入。
 
 <KnowledgeCheck client:load />
 
-## 5. 下一步
+## 六、完成本课
 
-下一模块会把工具契约、状态、短期记忆和持久记忆拆开，避免把“把所有历史塞进上下文”误认为记忆系统。
+### 17. 学完后应该能回答什么
+
+1. 为什么固定Workflow并不比Agent“低级”？
+2. Routing、并行、Evaluator–Optimizer和Agent Loop分别把什么交给模型？
+3. 如何把一个高副作用任务拆成只读Agent区和固定提交区？
+4. 为什么模型声明完成不等于系统完成？
+5. 为什么`maxSteps`不能替代模型调用、工具调用、成本和Deadline预算？
+6. 如何检测同动作循环与A→B→A→B振荡？
+7. Timeout后为什么可能需要对账而不是重试？
+8. 多Agent什么时候只是复制不确定性？
+9. Trace应记录哪些公开事实，哪些内容不需要记录？
+10. 哪些信号应该触发人工接管？
+
+### 18. 与下一章的边界
+
+本章解决的是：**什么时候允许模型选择下一步，以及怎样让编排循环可停止、可验证。**
+
+下一章[状态、工具与记忆](/agent/state-tools-memory/)继续解决：
+
+- 工具输入输出、权限、副作用和错误如何形成可执行契约；
+- Action Proposal怎样变成Executable Command；
+- 权威Run State、Working Memory、Long-term Memory和Trace怎样分离；
+- 记忆写入、Capability、并发版本和副作用Ledger怎样实现。
 
 - 回到[完整学习路线](/roadmap/)
-- 查看[就业方向映射](/directions/)
-- 检查[公开来源](/sources/)
+- 查看[方向总览](/directions/)
+- 检查[来源与版本](/sources/)
