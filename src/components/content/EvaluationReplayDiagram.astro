@@ -1,0 +1,115 @@
+---
+---
+
+<figure class="evaluation-replay" aria-labelledby="evaluation-replay-title evaluation-replay-caption">
+  <div class="evaluation-replay__title">
+    <p id="evaluation-replay-title">评测结果必须能回到一次具体执行</p>
+    <span>Case → Run → Evidence → Verdict</span>
+  </div>
+
+  <div class="evaluation-replay__flow">
+    <section>
+      <span>CASE</span>
+      <strong>初始状态 + 输入 + 威胁动作</strong>
+      <small>固定夹具和允许的能力</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section>
+      <span>ISOLATED RUN</span>
+      <strong>受限 Runner</strong>
+      <small>预算、权限、模拟工具、故障注入</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section>
+      <span>EVIDENCE</span>
+      <strong>Trace + Result + Artifact</strong>
+      <small>包含拒绝和人工确认记录</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section class="evaluation-replay__verdict">
+      <span>ASSERTIONS</span>
+      <strong>Pass / Fail / Invalid</strong>
+      <small>失败原因可机器分类</small>
+    </section>
+  </div>
+
+  <div class="evaluation-replay__loops">
+    <section>
+      <span>REPLAY</span>
+      <strong>同一 Evidence 重新计算 Verdict</strong>
+      <small>适合验证评测器改动，不冒充真实外部服务重演。</small>
+    </section>
+    <section>
+      <span>REGRESSION</span>
+      <strong>修复后的用例进入固定套件</strong>
+      <small>同时保留正常路径，避免安全修复破坏可用性。</small>
+    </section>
+    <section>
+      <span>TRIAGE</span>
+      <strong>系统失败与评测无效分开</strong>
+      <small>夹具损坏、超时和断言错误不能算模型失败。</small>
+    </section>
+  </div>
+
+  <figcaption id="evaluation-replay-caption">
+    一个百分比不能说明系统在哪里越界。可执行评测需要固定输入、受控环境、结构化断言和可回放证据，才能把失败转成工程任务。
+  </figcaption>
+</figure>
+
+<style>
+  .evaluation-replay {
+    display: grid;
+    gap: 0.85rem;
+    margin-block: 1.5rem;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.875rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 3%, var(--sl-color-bg));
+  }
+
+  .evaluation-replay__title { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+  .evaluation-replay__title p { margin: 0; font-size: 1rem; font-weight: 750; }
+  .evaluation-replay__title span,
+  .evaluation-replay section > span {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.875rem;
+    font-weight: 750;
+  }
+
+  .evaluation-replay__flow {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, auto));
+    align-items: stretch;
+    gap: 0.45rem;
+  }
+
+  .evaluation-replay section {
+    display: grid;
+    align-content: start;
+    gap: 0.27rem;
+    min-width: 0;
+    padding: 0.75rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.6rem;
+    background: var(--sl-color-bg);
+  }
+
+  .evaluation-replay__flow b { align-self: center; color: var(--sl-color-accent-high); font-size: 1.2rem; }
+  .evaluation-replay__verdict { border: 2px solid var(--sl-color-accent) !important; }
+  .evaluation-replay__loops { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.55rem; }
+  .evaluation-replay strong { font-size: 0.875rem; }
+  .evaluation-replay small,
+  .evaluation-replay figcaption { color: var(--sl-color-gray-2); font-size: 0.875rem; line-height: 1.5; }
+  .evaluation-replay figcaption { padding-top: 0.875rem; border-top: 1px dashed var(--sl-color-gray-5); }
+
+  @media (max-width: 60rem) {
+    .evaluation-replay__flow { grid-template-columns: 1fr; }
+    .evaluation-replay__flow b { justify-self: center; transform: rotate(90deg); }
+    .evaluation-replay__loops { grid-template-columns: 1fr; }
+  }
+
+  @media (max-width: 36rem) {
+    .evaluation-replay__title { display: grid; }
+  }
+</style>

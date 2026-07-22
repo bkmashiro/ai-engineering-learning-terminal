@@ -1,0 +1,123 @@
+---
+---
+
+<figure class="experiment-split" aria-labelledby="experiment-split-title experiment-split-caption">
+  <div class="experiment-split__title">
+    <p id="experiment-split-title">数据切分先于任何会“学习”的步骤</p>
+    <span>Fit 只看训练折</span>
+  </div>
+
+  <div class="experiment-split__flow">
+    <section>
+      <span>RAW DATA</span>
+      <strong>样本 + 标签 + 分组 + 时间</strong>
+      <small>先定义预测时真正可见的字段</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section class="experiment-split__gate">
+      <span>SPLIT POLICY</span>
+      <strong>按实体、时间或来源切分</strong>
+      <small>阻止同一实体或未来信息跨集合泄漏</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <div class="experiment-split__sets">
+      <section>
+        <span>TRAIN</span>
+        <strong>拟合预处理与模型</strong>
+        <small>允许反复训练</small>
+      </section>
+      <section>
+        <span>VALIDATION</span>
+        <strong>选择阈值与配置</strong>
+        <small>不能反向参与拟合</small>
+      </section>
+      <section>
+        <span>TEST</span>
+        <strong>一次最终核验</strong>
+        <small>结果不再用于调参</small>
+      </section>
+    </div>
+  </div>
+
+  <div class="experiment-split__evidence">
+    <section>
+      <span>METRICS</span>
+      <strong>混淆矩阵 + Precision / Recall</strong>
+      <small>同时报告分母与样本数。</small>
+    </section>
+    <section>
+      <span>SLICES</span>
+      <strong>按来源、长度、时间分桶</strong>
+      <small>平均值不能隐藏局部失败。</small>
+    </section>
+    <section>
+      <span>ERROR SET</span>
+      <strong>保存误判样本身份</strong>
+      <small>区分标签问题、覆盖缺口与模型边界。</small>
+    </section>
+  </div>
+
+  <figcaption id="experiment-split-caption">
+    标准化、缺失值填充、特征选择和阈值选择都会从数据中学习参数。它们若在全量数据上执行，测试信息会进入训练路径。
+  </figcaption>
+</figure>
+
+<style>
+  .experiment-split {
+    display: grid;
+    gap: 0.85rem;
+    margin-block: 1.5rem;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.875rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 3%, var(--sl-color-bg));
+  }
+
+  .experiment-split__title { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+  .experiment-split__title p { margin: 0; font-size: 1rem; font-weight: 750; }
+  .experiment-split__title span,
+  .experiment-split section > span {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.875rem;
+    font-weight: 750;
+  }
+
+  .experiment-split__flow {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.1fr) auto minmax(0, 1.4fr);
+    align-items: stretch;
+    gap: 0.5rem;
+  }
+
+  .experiment-split section {
+    display: grid;
+    align-content: start;
+    gap: 0.27rem;
+    min-width: 0;
+    padding: 0.75rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.6rem;
+    background: var(--sl-color-bg);
+  }
+
+  .experiment-split__flow b { align-self: center; color: var(--sl-color-accent-high); font-size: 1.2rem; }
+  .experiment-split__gate { border-style: dashed !important; }
+  .experiment-split__sets { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.4rem; }
+  .experiment-split__evidence { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.55rem; }
+  .experiment-split strong { font-size: 0.875rem; }
+  .experiment-split small,
+  .experiment-split figcaption { color: var(--sl-color-gray-2); font-size: 0.875rem; line-height: 1.5; }
+  .experiment-split figcaption { padding-top: 0.875rem; border-top: 1px dashed var(--sl-color-gray-5); }
+
+  @media (max-width: 60rem) {
+    .experiment-split__flow { grid-template-columns: 1fr; }
+    .experiment-split__flow b { justify-self: center; transform: rotate(90deg); }
+  }
+
+  @media (max-width: 44rem) {
+    .experiment-split__sets,
+    .experiment-split__evidence { grid-template-columns: 1fr; }
+    .experiment-split__title { display: grid; }
+  }
+</style>

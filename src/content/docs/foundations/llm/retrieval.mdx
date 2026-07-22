@@ -1,0 +1,975 @@
+---
+title: 检索、引用与无答案
+description: 把文档身份、分块、召回、重排、上下文打包、引用绑定和无答案评测连接成可诊断的RAG流水线。
+moduleId: retrieval-grounding
+stage: llm-applications
+prerequisites:
+  - llm-foundations
+  - data-reliability
+outcomes:
+  - 设计带语料版本、权限过滤和可追踪引用的检索流水线
+  - 手算Recall@k与MRR并定位召回、排序、生成和引用失败
+  - 构建具有无答案策略与固定评测集的确定性检索演示
+estimatedMinutes: 90
+difficulty: core
+careerDirections:
+  - llm-search-retrieval
+  - agent-applications
+sourceIds:
+  - rag-paper
+  - beir-paper
+  - elastic-similarity
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import ModulePrerequisites from '../../../../components/content/ModulePrerequisites.astro';
+import RetrievalPipelineDiagram from '../../../../components/content/RetrievalPipelineDiagram.astro';
+import Term from '../../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="retrieval-grounding" client:load />
+
+<ModulePrerequisites moduleId="retrieval-grounding" />
+
+一个问答系统返回：“任务失败后会自动无限重试。”回答语句流畅，还附了一个看起来相关的文档链接。打开链接后发现原文写的是“最多重试三次，随后进入隔离队列”。系统并非完全没有检索到相关文档；它可能检索到了错误分块、把低排名证据截掉、引用只绑定到文档首页、生成阶段改写了数量词，或者问题本来就超出语料范围。
+
+<Term id="retrieval-augmented-generation" /> 把外部材料放进生成上下文，但“有 RAG”不等于“答案有根据”。可诊断系统要保留从语料身份到最终 Claim 的链条：文档版本、<Term id="chunking" />、候选召回、<Term id="reranking" />、权限过滤、上下文预算、<Term id="citation" /> 和 <Term id="no-answer" /> 决策。每一层都有独立失败方式和指标。
+
+本课构建一个不调用真实模型的确定性检索演示。它对固定中文教学语料做词项召回与手工重排，从证据句中提取受限答案；答案必须绑定 Chunk 与字符区间。若证据不足，返回结构化“无答案”，不能用语言流畅度填补空白。
+
+<RetrievalPipelineDiagram />
+
+## 1. 先定义系统要回答什么
+
+语料是一个公开教学规范集合，问题类型限定为：
+
+- 某个机制的明确规则；
+- 某个状态或错误码的边界；
+- 文档中出现的数量、条件或恢复动作；
+- 语料未覆盖时返回无答案。
+
+不支持：开放建议、需要外部最新事实的问题、跨语料推断出的个人或组织信息。问题契约：
+
+```ts
+interface SearchQuestion {
+  queryId: string;
+  text: string;
+  allowedCorpusVersion: string;
+  principalScopes: string[];
+}
+```
+
+回答契约：
+
+```ts
+interface GroundedAnswer {
+  status: 'answered' | 'no_answer';
+  answer: string | null;
+  claims: Array<{
+    text: string;
+    citations: Array<{
+      documentId: string;
+      documentVersion: string;
+      chunkId: string;
+      startOffset: number;
+      endOffset: number;
+      quoteSha256: string;
+    }>;
+  }>;
+  retrieval: {
+    corpusVersion: string;
+    candidateChunkIds: string[];
+    selectedChunkIds: string[];
+  };
+  reasonCode: string | null;
+}
+```
+
+`answered` 要求每个可核查 Claim 至少有一条支持性引用；`no_answer` 要求 `answer=null`、`claims=[]`，并给出原因。不能一边返回猜测答案，一边把状态标成无答案。
+
+## 2. 离线索引与在线查询是两条流水线
+
+### 2.1 离线索引
+
+```text
+Document Source
+→ fetch/parse
+→ normalize
+→ permission label
+→ chunk
+→ sparse terms / embeddings
+→ index generation
+→ validation
+→ atomic publish corpusVersion
+```
+
+离线流水线必须记录：
+
+- `documentId`：跨版本稳定身份；
+- `documentVersion`：具体内容版本；
+- 原始内容 Hash；
+- 解析器版本；
+- Chunker 版本和参数；
+- 每个 Chunk 的来源字符区间；
+- 权限标签；
+- 索引生成号与完整性检查。
+
+不能在索引一半更新时让查询混用新旧文档。做法是构建新 generation，验证文档数、Chunk 数、权限字段与抽样查询，再原子切换 `corpusVersion` 指针。旧 generation 保留到在途请求结束或回滚窗口结束。
+
+### 2.2 在线查询
+
+```text
+Query normalization
+→ principal/permission filter
+→ sparse and/or dense retrieval
+→ candidate merge
+→ rerank
+→ evidence threshold
+→ context packing
+→ answer construction
+→ claim-citation validation
+→ answered / no_answer
+```
+
+每一步都输出可比较 Evidence。只记录最终 Prompt 无法判断相关文档是否从未被召回，还是被后续预算截断。
+
+## 3. 文档身份与引用稳定性
+
+URL 不是足够的引用身份。网页内容可以改变，标题也可能重复。最小文档记录：
+
+```ts
+interface IndexedDocument {
+  documentId: string;
+  documentVersion: string;
+  canonicalUrl: string;
+  contentSha256: string;
+  locale: 'zh-CN' | 'en';
+  scopes: string[];
+  parserVersion: string;
+}
+```
+
+Chunk 记录：
+
+```ts
+interface Chunk {
+  chunkId: string;
+  documentId: string;
+  documentVersion: string;
+  ordinal: number;
+  headingPath: string[];
+  text: string;
+  sourceStart: number;
+  sourceEnd: number;
+  textSha256: string;
+  scopes: string[];
+}
+```
+
+如果文档更新，旧 Citation 仍要能指向当时版本或明确显示“来源版本已归档”。只保存当前 URL 会让历史答案的证据漂移。
+
+## 4. Chunking：上下文边界会改变可检索事实
+
+<Term id="chunking" /> 不是简单“每 500 字切一次”。它要保持能独立支持 Claim 的语义单元，同时控制召回粒度和上下文成本。
+
+### 4.1 固定长度切分的故障
+
+原文：
+
+```text
+任务失败后最多自动重试三次。第三次仍失败时，消息进入隔离队列，等待修复后受控重放。
+```
+
+若在“第三次仍”前切开：
+
+```text
+chunk-A: 任务失败后最多自动重试三次。第三次仍
+chunk-B: 失败时，消息进入隔离队列，等待修复后受控重放。
+```
+
+查询“重试耗尽后怎么办”可能只召回 B，答案失去“第三次”的条件；查询“最多几次”只召回 A，答案失去后续动作。
+
+### 4.2 结构感知切分
+
+优先按标题、段落、列表和代码块切分；超长段落再按句子窗口切。每个 Chunk 可重复少量标题路径，但不要把整篇文档标题树塞进每个块导致词项噪声。
+
+### 4.3 Overlap 的取舍
+
+Overlap 能缓解边界切断，但会：
+
+- 增加索引体积；
+- 让相邻重复 Chunk 同时占据 Top-k；
+- 重复证据挤掉其他候选；
+- 使评测中多个 Chunk 都算相关，标签变复杂。
+
+应通过评测集比较，而不是默认更大更好。保存 Chunker 版本，任何参数变化都产生新 corpusVersion。
+
+## 5. Sparse、Dense 与 Hybrid 召回
+
+### 5.1 Sparse Retrieval
+
+词项检索适合精确标识、错误码、数量词和术语。BM25 类评分会考虑词频、文档频率和长度归一化。具体公式和默认参数应以所用搜索引擎官方文档为准；本课不复制某个实现参数并宣称通用最优。
+
+故障：同义表达词项不重合。例如查询“消息反复投递怎么隔离”，文档写“毒消息进入死信队列”。
+
+### 5.2 Dense Retrieval
+
+<Term id="embedding" /> 将 Query 和 Chunk 映射到向量，按相似度召回。它能覆盖同义表达，但也可能把主题相近、规则相反的段落排得很近，或遗漏稀有编号。
+
+余弦相似度：
+
+```text
+cos(q, d) = (q · d) / (||q||₂ × ||d||₂)
+```
+
+假设：
+
+```text
+q = [1, 1]
+d1 = [1, 0]
+d2 = [2, 2]
+```
+
+```text
+cos(q, d₁) = 1 / (√2 × 1) ≈ 0.7071
+```
+
+```text
+cos(q, d₂) = 4 / (√2 × √8) = 1
+```
+
+这只说明向量方向更接近，不证明 d2 的句子支持答案。相似度不是 Grounding 断言。
+
+### 5.3 Hybrid Retrieval
+
+并行取得 sparse 与 dense 候选，再用归一化分数或 Reciprocal Rank Fusion 合并。不同检索器分数不可直接相加，必须定义可复现的归一化或排名融合。
+
+RRF 示例：
+
+```text
+RRF(d) = Σ[r ∈ R] 1 / (k + rankᵣ(d))
+```
+
+`k` 是稳定常数，具体值要通过验证集选择。RRF 使用排名而非原始分数，减少尺度不一致，但丢失绝对置信信息。
+
+## 6. Reranking：候选相关不等于证据足够
+
+<Term id="reranking" /> 对较小候选集做更细比较。可使用交叉编码器、规则特征或模型判断；本课使用确定性特征：
+
+```text
+exact_term_overlap
+required_number_match
+heading_match
+scope_match
+negation_conflict
+```
+
+重排器输出必须保留原始召回来源和各特征贡献。若候选在召回阶段未出现，重排无法救回；所以要分开评估 Recall 与排序质量。
+
+### 6.1 权限过滤必须在可泄漏信息之前
+
+权限标签应在检索阶段过滤，而不是先取回私有 Chunk、放进 Prompt 后要求模型忽略。即使最终回答不引用，Trace、缓存或模型上下文也已经接触未授权内容。
+
+```text
+candidate.scopes ⊆ principal.scopes 或 candidate为public
+```
+
+实际规则可能是 ACL、租户、项目或属性策略，但原则相同：程序边界做强制过滤。
+
+## 7. Context Packing：Top-k 不是直接全部塞入
+
+上下文预算属于已完成的 LLM 基础模块；这里关注证据打包。候选需要：
+
+1. 去除同源重复；
+2. 保留问题所需的条件句与标题；
+3. 按引用 ID 加边界标记；
+4. 限制每个文档占用；
+5. 预留系统指令、回答和工具结果预算；
+6. 记录哪些候选因预算被丢弃。
+
+一个可执行选择问题：
+
+```text
+maximize Σ relevance(chunk)
+subject to Σ tokenCost(chunk) ≤ evidenceBudget
+           selected chunks pass permission filter
+           duplicate overlap ≤ threshold
+```
+
+贪心按“相关分/Token”选择可能工作，但不保证全局最优。小系统可以用明确规则；复杂系统再评估 knapsack 或学习式选择。关键是把选择过程留在 Trace 中。
+
+## 8. Citation 与 Grounding
+
+<Term id="grounding" /> 要求答案中的可核查 Claim 受所给证据支持。<Term id="citation" /> 是可追踪指针，但“有引用”仍可能不 Grounded：
+
+- 引用文档相关，但句子没有支持数量；
+- 引用描述旧版本；
+- 引用只支持 Claim 的一半；
+- 引用与答案相反；
+- 字符区间偏移，显示了相邻段落；
+- 一个引用被错误复用于多个 Claim。
+
+### 8.1 Claim-first 验证
+
+答案先拆成原子 Claim：
+
+```text
+Claim 1: 系统最多自动重试三次。
+Claim 2: 第三次失败后消息进入隔离队列。
+Claim 3: 修复后需要受控重放。
+```
+
+分别绑定引用。若某 Claim 没有支持，选择：删除、缩小、返回无答案或明确标为推导；不能靠另一个相关引用掩盖。
+
+### 8.2 Quote Hash 与 Offset
+
+引用记录 `startOffset/endOffset` 和引用文本 Hash。展示时从归档文档版本重新切片并核对 Hash。如果 Hash 不匹配，引用应显示失效状态，不悄悄指向新文本。
+
+### 8.3 推导与原文事实分开
+
+两个 Chunk 分别写：
+
+```text
+A: 每个Worker最多并发处理4个任务。
+B: 当前部署有3个Worker。
+```
+
+“理论并发上限为12”是算术推导，不是原文直接声明。回答可以给出，但要标明推导规则，并引用 A、B。若“当前部署”是动态事实，还要记录观察时间和版本；公开教学案例不包含真实部署数据。
+
+## 9. No-answer：拒绝比编造更可评估
+
+<Term id="no-answer" /> 是明确终态，不是兜底句。常见原因码：
+
+```text
+NO_RELEVANT_CANDIDATE
+EVIDENCE_BELOW_THRESHOLD
+CONFLICTING_EVIDENCE
+PERMISSION_FILTERED
+QUESTION_OUT_OF_SCOPE
+CITATION_VALIDATION_FAILED
+```
+
+系统要区分：
+
+- 语料没有答案；
+- 语料有答案但检索漏掉；
+- 检索到但排名/预算丢掉；
+- 证据互相冲突；
+- 有证据但当前主体无权访问；
+- 回答生成后引用验证失败。
+
+面向用户时，不应暴露“存在私有文档但你无权访问”的敏感元数据。外部响应可统一为“在可访问资料中未找到足够证据”，内部 Trace 保存政策允许的分类。
+
+### 9.1 阈值不是单个相似度数字
+
+无答案决策可以组合：
+
+```text
+top_score >= minimum
+score_margin >= minimum_margin
+required_terms_covered
+citation_span_contains_answer_value
+no_conflict_detected
+```
+
+阈值在含答案与无答案的 Validation Set 上选择。只评有答案问题会推动系统总是回答，无法测量拒答能力。
+
+## 10. 检索指标与手算
+
+### 10.1 Recall@k
+
+<Term id="recall-at-k" /> 对单个 Query：
+
+```text
+Recall@k = |Relevant ∩ Retrieved@k| / |Relevant|
+```
+
+若 Query 有 2 个相关 Chunk，Top-3 取回其中 1 个：
+
+```text
+Recall@3 = 1 / 2 = 0.5
+```
+
+若评测只标了一个“标准 Chunk”，但另一个等价 Chunk 也能支持答案，指标会低估系统。相关性标注要以 Claim 支持为准，记录可接受集合。
+
+### 10.2 MRR
+
+<Term id="mean-reciprocal-rank" /> 关注第一个相关结果排名。对 Query `q`：
+
+```text
+RR(q) = 1 / rank_first，若找到相关结果
+RR(q) = 0，若未找到相关结果
+```
+
+三个 Query 的首个相关排名分别为 1、2、无结果：
+
+```text
+MRR = (1 + 1/2 + 0) / 3 = 0.5
+```
+
+MRR 不关心第二个相关结果，也不直接衡量引用或答案正确。需要与 Recall@k、Claim Support、No-answer 指标组合。
+
+### 10.3 Answer 与拒答矩阵
+
+把“是否应回答”当二分类：
+
+| 实际 | 系统回答 | 系统拒答 |
+| --- | --- | --- |
+| 有足够证据 | 正确回答/错误回答需再细分 | 过度拒答 |
+| 无足够证据 | 不支持回答 | 正确拒答 |
+
+至少报告：有答案问题召回率、无答案正确拒答率、错误回答率、引用有效率。不能用一个总 Accuracy 隐藏“所有问题都拒答”或“所有问题都回答”。
+
+## 11. 评测集 Schema
+
+```json
+{
+  "caseId": "retrieval-001",
+  "query": "任务自动重试耗尽后怎么办？",
+  "corpusVersion": "teaching-corpus-v1",
+  "principalScopes": ["public"],
+  "answerability": "answerable",
+  "requiredClaims": [
+    {
+      "claimId": "c1",
+      "acceptedChunkIds": ["retry-policy-v1#2"],
+      "requiredTerms": ["三次", "隔离队列"]
+    }
+  ],
+  "forbiddenClaims": ["无限重试"],
+  "expectedNoAnswerReason": null
+}
+```
+
+无答案 Case：
+
+```json
+{
+  "caseId": "retrieval-002",
+  "query": "这个系统明年的价格是多少？",
+  "corpusVersion": "teaching-corpus-v1",
+  "principalScopes": ["public"],
+  "answerability": "unanswerable",
+  "requiredClaims": [],
+  "forbiddenClaims": [],
+  "expectedNoAnswerReason": "QUESTION_OUT_OF_SCOPE"
+}
+```
+
+评测集也要版本化，避免改题后与旧结果直接比较。
+
+## 12. 确定性 TypeScript 检索演示
+
+下面是完整单文件实现。它不使用 Embedding 或模型，而是用规范化词项、固定同义词和可解释重排说明数据流。回答只能从一个证据句中抽取，不伪造模型输出。
+
+```ts title="examples/deterministic-retrieval.ts"
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+
+type Scope = 'public' | 'restricted-demo';
+
+type DocumentRecord = {
+  documentId: string;
+  documentVersion: string;
+  title: string;
+  text: string;
+  scopes: Scope[];
+};
+
+type Chunk = {
+  chunkId: string;
+  documentId: string;
+  documentVersion: string;
+  ordinal: number;
+  heading: string;
+  text: string;
+  sourceStart: number;
+  sourceEnd: number;
+  textSha256: string;
+  scopes: Scope[];
+  terms: string[];
+};
+
+type Candidate = {
+  chunk: Chunk;
+  sparseScore: number;
+  exactRequiredMatches: number;
+  conflictPenalty: number;
+  finalScore: number;
+};
+
+type Query = {
+  queryId: string;
+  text: string;
+  corpusVersion: string;
+  principalScopes: Scope[];
+};
+
+type GroundedAnswer =
+  | {
+      status: 'answered';
+      answer: string;
+      claims: Array<{
+        text: string;
+        citations: Array<{
+          documentId: string;
+          documentVersion: string;
+          chunkId: string;
+          startOffset: number;
+          endOffset: number;
+          quoteSha256: string;
+        }>;
+      }>;
+      retrieval: {
+        corpusVersion: string;
+        candidateChunkIds: string[];
+        selectedChunkIds: string[];
+      };
+      reasonCode: null;
+    }
+  | {
+      status: 'no_answer';
+      answer: null;
+      claims: [];
+      retrieval: {
+        corpusVersion: string;
+        candidateChunkIds: string[];
+        selectedChunkIds: string[];
+      };
+      reasonCode:
+        | 'NO_RELEVANT_CANDIDATE'
+        | 'EVIDENCE_BELOW_THRESHOLD'
+        | 'CONFLICTING_EVIDENCE'
+        | 'QUESTION_OUT_OF_SCOPE'
+        | 'CITATION_VALIDATION_FAILED';
+    };
+
+const CORPUS_VERSION = 'teaching-corpus-v1';
+
+const DOCUMENTS: DocumentRecord[] = [
+  {
+    documentId: 'retry-policy',
+    documentVersion: 'v1',
+    title: '任务重试与隔离',
+    text: [
+      '任务处理器只对明确可重试错误执行自动重试。',
+      '同一任务最多自动重试三次。第三次仍失败时，消息进入隔离队列，等待修复后受控重放。',
+      '超时只表示结果未知，必须先查询副作用状态。',
+    ].join('\n'),
+    scopes: ['public'],
+  },
+  {
+    documentId: 'cache-policy',
+    documentVersion: 'v1',
+    title: '缓存边界',
+    text: [
+      '缓存只保存任务读模型，不是写入权威来源。',
+      '缓存缺失或淘汰时，读取应回到权威数据库。',
+    ].join('\n'),
+    scopes: ['public'],
+  },
+  {
+    documentId: 'restricted-runbook',
+    documentVersion: 'v1',
+    title: '受限恢复说明',
+    text: '受限示例中的内部恢复开关仅供隔离测试使用。',
+    scopes: ['restricted-demo'],
+  },
+];
+
+const SYNONYMS: Record<string, string[]> = {
+  重试: ['重试', '再次执行', '重新处理'],
+  隔离: ['隔离', '死信', '停止自动处理'],
+  缓存: ['缓存', 'cache'],
+  淘汰: ['淘汰', 'eviction', '缺失'],
+};
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function normalizeText(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize('NFKC')
+    .replace(/[，。！？；：、“”‘’（）()\[\]{}]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function terms(value: string): string[] {
+  const normalized = normalizeText(value);
+  const units = new Set<string>();
+  for (const token of normalized.split(' ')) {
+    if (token) units.add(token);
+  }
+  for (let index = 0; index < normalized.length - 1; index += 1) {
+    const pair = normalized.slice(index, index + 2);
+    if (!pair.includes(' ')) units.add(pair);
+  }
+  return [...units].sort();
+}
+
+function chunkDocuments(documents: DocumentRecord[]): Chunk[] {
+  const chunks: Chunk[] = [];
+  for (const document of documents) {
+    let cursor = 0;
+    document.text.split('\n').forEach((paragraph, ordinal) => {
+      const sourceStart = document.text.indexOf(paragraph, cursor);
+      const sourceEnd = sourceStart + paragraph.length;
+      cursor = sourceEnd;
+      chunks.push({
+        chunkId: `${document.documentId}-${document.documentVersion}#${ordinal + 1}`,
+        documentId: document.documentId,
+        documentVersion: document.documentVersion,
+        ordinal,
+        heading: document.title,
+        text: paragraph,
+        sourceStart,
+        sourceEnd,
+        textSha256: sha256(paragraph),
+        scopes: document.scopes,
+        terms: terms(`${document.title} ${paragraph}`),
+      });
+    });
+  }
+  return chunks;
+}
+
+function isAuthorized(chunk: Chunk, principalScopes: Scope[]): boolean {
+  return chunk.scopes.every((scope) => principalScopes.includes(scope));
+}
+
+function expandedQueryTerms(query: string): string[] {
+  const output = new Set(terms(query));
+  for (const [concept, variants] of Object.entries(SYNONYMS)) {
+    if (query.includes(concept) || variants.some((variant) => query.includes(variant))) {
+      for (const variant of variants) for (const term of terms(variant)) output.add(term);
+    }
+  }
+  return [...output];
+}
+
+function retrieve(query: Query, chunks: Chunk[], limit: number): Candidate[] {
+  const queryTerms = expandedQueryTerms(query.text);
+  return chunks
+    .filter((chunk) => isAuthorized(chunk, query.principalScopes))
+    .map((chunk): Candidate => {
+      const overlap = queryTerms.filter((term) => chunk.terms.includes(term));
+      const sparseScore = overlap.reduce((score, term) => score + Math.max(1, term.length), 0);
+      const exactRequiredMatches = ['三次', '隔离队列', '权威数据库']
+        .filter((term) => query.text.includes(term) && chunk.text.includes(term)).length;
+      const conflictPenalty = query.text.includes('无限') && chunk.text.includes('最多') ? 4 : 0;
+      return {
+        chunk,
+        sparseScore,
+        exactRequiredMatches,
+        conflictPenalty,
+        finalScore: sparseScore + exactRequiredMatches * 5 - conflictPenalty,
+      };
+    })
+    .filter((candidate) => candidate.sparseScore > 0)
+    .sort((left, right) =>
+      right.finalScore - left.finalScore ||
+      left.chunk.chunkId.localeCompare(right.chunk.chunkId),
+    )
+    .slice(0, limit);
+}
+
+function extractSupportedSentence(query: string, chunk: Chunk): string | null {
+  const retryQuestion = /重试|失败.*怎么办|隔离/.test(query);
+  if (retryQuestion && chunk.text.includes('最多自动重试三次') && chunk.text.includes('隔离队列')) {
+    return '同一任务最多自动重试三次；第三次仍失败时，消息进入隔离队列，等待修复后受控重放。';
+  }
+  const cacheQuestion = /缓存.*(淘汰|缺失|没有)|淘汰.*怎么办/.test(query);
+  if (cacheQuestion && chunk.text.includes('权威数据库')) {
+    return '缓存缺失或淘汰时，读取应回到权威数据库。';
+  }
+  return null;
+}
+
+function locateCitation(answer: string, chunk: Chunk): GroundedAnswer['claims'][number]['citations'][number] | null {
+  // 为避免改写导致整句不相等，取能证明关键值的最小连续原文。
+  const needles = answer.includes('三次')
+    ? ['最多自动重试三次', '第三次仍失败时，消息进入隔离队列，等待修复后受控重放']
+    : ['缓存缺失或淘汰时，读取应回到权威数据库'];
+  const matched = needles.filter((needle) => chunk.text.includes(needle));
+  if (matched.length === 0) return null;
+  const start = Math.min(...matched.map((needle) => chunk.text.indexOf(needle)));
+  const end = Math.max(...matched.map((needle) => chunk.text.indexOf(needle) + needle.length));
+  const quote = chunk.text.slice(start, end);
+  return {
+    documentId: chunk.documentId,
+    documentVersion: chunk.documentVersion,
+    chunkId: chunk.chunkId,
+    startOffset: start,
+    endOffset: end,
+    quoteSha256: sha256(quote),
+  };
+}
+
+function answerQuestion(query: Query, chunks: Chunk[]): GroundedAnswer {
+  if (query.corpusVersion !== CORPUS_VERSION) {
+    return {
+      status: 'no_answer', answer: null, claims: [],
+      retrieval: { corpusVersion: CORPUS_VERSION, candidateChunkIds: [], selectedChunkIds: [] },
+      reasonCode: 'QUESTION_OUT_OF_SCOPE',
+    };
+  }
+  if (/价格|天气|明年|个人/.test(query.text)) {
+    return {
+      status: 'no_answer', answer: null, claims: [],
+      retrieval: { corpusVersion: CORPUS_VERSION, candidateChunkIds: [], selectedChunkIds: [] },
+      reasonCode: 'QUESTION_OUT_OF_SCOPE',
+    };
+  }
+
+  const candidates = retrieve(query, chunks, 5);
+  const retrieval = {
+    corpusVersion: CORPUS_VERSION,
+    candidateChunkIds: candidates.map((candidate) => candidate.chunk.chunkId),
+    selectedChunkIds: [] as string[],
+  };
+  if (candidates.length === 0) {
+    return { status: 'no_answer', answer: null, claims: [], retrieval, reasonCode: 'NO_RELEVANT_CANDIDATE' };
+  }
+  if (candidates[0].finalScore < 4) {
+    return { status: 'no_answer', answer: null, claims: [], retrieval, reasonCode: 'EVIDENCE_BELOW_THRESHOLD' };
+  }
+
+  for (const candidate of candidates) {
+    const answer = extractSupportedSentence(query.text, candidate.chunk);
+    if (!answer) continue;
+    const citation = locateCitation(answer, candidate.chunk);
+    if (!citation) {
+      return { status: 'no_answer', answer: null, claims: [], retrieval, reasonCode: 'CITATION_VALIDATION_FAILED' };
+    }
+    const quote = candidate.chunk.text.slice(citation.startOffset, citation.endOffset);
+    if (sha256(quote) !== citation.quoteSha256) {
+      return { status: 'no_answer', answer: null, claims: [], retrieval, reasonCode: 'CITATION_VALIDATION_FAILED' };
+    }
+    retrieval.selectedChunkIds = [candidate.chunk.chunkId];
+    return {
+      status: 'answered',
+      answer,
+      claims: [{ text: answer, citations: [citation] }],
+      retrieval,
+      reasonCode: null,
+    };
+  }
+  return { status: 'no_answer', answer: null, claims: [], retrieval, reasonCode: 'EVIDENCE_BELOW_THRESHOLD' };
+}
+
+function recallAtK(relevant: Set<string>, retrieved: string[], k: number): number {
+  if (relevant.size === 0) throw new Error('RECALL_UNDEFINED_WITHOUT_RELEVANT_ITEMS');
+  const hits = retrieved.slice(0, k).filter((id) => relevant.has(id)).length;
+  return hits / relevant.size;
+}
+
+function reciprocalRank(relevant: Set<string>, retrieved: string[]): number {
+  const index = retrieved.findIndex((id) => relevant.has(id));
+  return index === -1 ? 0 : 1 / (index + 1);
+}
+
+const chunks = chunkDocuments(DOCUMENTS);
+const retryAnswer = answerQuestion({
+  queryId: 'q1',
+  text: '任务自动重试耗尽后怎么办？',
+  corpusVersion: CORPUS_VERSION,
+  principalScopes: ['public'],
+}, chunks);
+assert.equal(retryAnswer.status, 'answered');
+if (retryAnswer.status === 'answered') {
+  assert.match(retryAnswer.answer, /三次/);
+  assert.match(retryAnswer.answer, /隔离队列/);
+  assert.equal(retryAnswer.claims[0].citations.length, 1);
+}
+
+const noAnswer = answerQuestion({
+  queryId: 'q2',
+  text: '这个系统明年的价格是多少？',
+  corpusVersion: CORPUS_VERSION,
+  principalScopes: ['public'],
+}, chunks);
+assert.deepEqual(noAnswer, {
+  status: 'no_answer',
+  answer: null,
+  claims: [],
+  retrieval: { corpusVersion: CORPUS_VERSION, candidateChunkIds: [], selectedChunkIds: [] },
+  reasonCode: 'QUESTION_OUT_OF_SCOPE',
+});
+
+const ranked = ['retry-policy-v1#1', 'retry-policy-v1#2', 'cache-policy-v1#1'];
+assert.equal(recallAtK(new Set(['retry-policy-v1#2']), ranked, 2), 1);
+assert.equal(reciprocalRank(new Set(['retry-policy-v1#2']), ranked), 0.5);
+```
+
+实现刻意没有假装“规则抽取器就是 LLM”。它提供可执行基线：只在证据句满足明确模式时回答。后续接入模型后，仍可复用 Candidate、Citation 和 Evaluation Schema，比较模型是否增加覆盖，同时是否引入不支持 Claim。
+
+## 13. 正常路径逐步执行
+
+问题：“任务自动重试耗尽后怎么办？”
+
+1. Query 规范化并扩展“重试、隔离”同义词；
+2. 权限过滤删除主体不可访问 Chunk；
+3. Sparse 召回返回 `retry-policy-v1#2` 等候选；
+4. 重排检查“重试”“失败”“隔离”的覆盖；
+5. Evidence Threshold 通过；
+6. 选择包含完整条件的 Chunk；
+7. 抽取受限回答；
+8. 定位原文字符区间并计算 Quote Hash；
+9. 验证回答包含的“三次”“隔离队列”都在引用区间；
+10. 输出 `answered`，Trace 保存候选和选择原因。
+
+若在第 3 步没有相关 Chunk，是召回失败；若第 3 步有而第 6 步没选，是排序/预算失败；若第 8 步失败，是引用失败；分类不能都归为“模型幻觉”。
+
+## 14. 至少六类失败路径
+
+### 14.1 语料缺失
+
+问题所需事实从未进入当前 corpusVersion。正确终态是无答案，并记录索引覆盖缺口。不能调大 Top-k 解决不存在的材料。
+
+### 14.2 Chunk 边界破坏条件
+
+数量词与后续动作分在两块，单块无法支持完整 Claim。通过结构切分、有限 Overlap 或多 Chunk Claim 验证修复。
+
+### 14.3 召回遗漏
+
+相关 Chunk 存在但不在候选集合。检查 Query 分词、同义词、索引字段、Embedding 版本与权限过滤。先提高 Recall，再谈重排。
+
+### 14.4 Rerank 错误
+
+相关 Chunk 在候选中，但被主题相近的错误规则压下。保存候选前后排名和特征，建立 Pairwise 评测。
+
+### 14.5 Context Budget 截断
+
+正确 Chunk 排名不低，但由于前面重复长块占满预算被丢弃。检查去重、每文档配额和 Token 预算 Trace。
+
+### 14.6 Citation Mismatch
+
+回答引用了相关文档，但字符区间不包含关键数量。Claim 验证失败，系统应拒答或缩小 Claim。
+
+### 14.7 Stale Index
+
+文档已从“三次”改为“两次”，查询仍命中旧 generation。回答必须显示 corpusVersion；发布流程验证并原子切换。历史结果不应悄悄换引用版本。
+
+### 14.8 Permission Leak
+
+先召回私有 Chunk、后过滤，私有标题可能进入 Trace 或排名特征。修复为检索前/检索时强制 ACL，并审计缓存键包含主体作用域。
+
+## 15. 故障矩阵
+
+| 观察 | 可能层 | 确认证据 | 修复方向 |
+| --- | --- | --- | --- |
+| Top-k 没有标准 Chunk | 语料/索引/召回/权限 | corpusVersion、索引清单、过滤前后候选 | 补语料、修Chunk、调召回或修ACL |
+| 候选有标准 Chunk但没选 | 重排/预算 | before/after rank、score features、丢弃原因 | 重排训练、去重、预算策略 |
+| 选中Chunk但答案错误 | 生成/抽取 | Prompt、Claim、证据 Span | 受限生成、Claim验证、拒答 |
+| 引用打开后不含答案 | Citation | version、offset、quote Hash | 绑定归档版本和稳定 Span |
+| 无答案问题仍回答 | No-answer policy | 阈值、冲突检测、评测 Case | 加无答案集、提高证据门槛 |
+| 有答案问题总拒答 | 召回/阈值 | Recall@k、top score分布 | 改召回或按验证集调门槛 |
+| 私有材料影响公开结果 | 权限/缓存 | 主体Scope、候选Trace、cache key | 过滤前置、缓存分域、清理泄漏证据 |
+| 更新后结果漂移 | 索引版本 | document/chunker/model version | generation发布、A/B与回滚 |
+
+## 16. 故障注入实验
+
+### 实验一：切断关键句
+
+1. 修改 Chunker，在“第三次仍”处切分；
+2. 重新构建新 corpusVersion；
+3. 运行固定 Query；
+4. 比较 Recall@k、Selected Chunk 和 Claim Validation；
+5. 增加结构感知切分或有限 Overlap；
+6. 检查是否引入重复候选挤占；
+7. 保存两版索引差异。
+
+验收：能说明改动影响召回、排序还是证据完整性，而不是只看最终回答。
+
+### 实验二：注入高相似错误规则
+
+1. 增加一个 Chunk：“某些临时观察操作可以重复执行，不设重试上限”；
+2. 让它包含多个与 Query 重合词；
+3. 观察 Sparse 排名；
+4. 重排器检查“任务处理器”“最多”“隔离队列”等必要条件；
+5. 若仍选错，评测 Case 失败；
+6. 将错误候选加入 Pairwise 回归集；
+7. 不用硬编码文档 ID 直接抬高标准答案。
+
+验收：修复基于可泛化特征或明确规则，不是答案泄漏。
+
+### 实验三：Citation Offset 损坏
+
+1. 正常生成回答和 Citation；
+2. 把 `startOffset` 加 1；
+3. 重新切片并验证 Quote Hash；
+4. 断言返回 `CITATION_VALIDATION_FAILED`；
+5. 确认系统没有仍以 `answered` 返回；
+6. 测试文档版本更新后旧 Offset 的行为；
+7. 显示“来源版本不可验证”而不是指向邻近文本。
+
+验收：引用不是装饰链接，而是可机器核对的证据。
+
+### 实验四：权限过滤次序
+
+1. 构造公开 Query 与仅 restricted Scope 的高分 Chunk；
+2. 在错误实现中先全局召回再过滤；
+3. 检查 Trace、缓存和分数特征是否已包含受限标题；
+4. 改为索引查询时加入 Scope Filter；
+5. 缓存键加入 Scope 集合 Hash；
+6. 公开主体结果中不出现受限 Chunk ID；
+7. 受限主体可按授权正常检索。
+
+验收：未授权内容不进入上下文、公开 Trace 或跨主体缓存。
+
+## 17. 决策表：先改哪一层
+
+| 失败证据 | 不要先做 | 优先动作 |
+| --- | --- | --- |
+| Relevant Chunk 不在 Top-100 | 换更强生成模型 | 修语料、分块、索引或召回 |
+| Relevant 在 Top-100，不在 Top-5 | 增大上下文到全部候选 | 改重排和候选特征 |
+| Relevant 在已选上下文，Claim 错 | 继续调 Embedding | 改生成约束与 Claim 验证 |
+| Claim 正确，Citation 不支持 | 增加更多文档首页链接 | 修 Span 绑定与版本身份 |
+| 无答案错误回答多 | 只优化有答案 Accuracy | 建无答案集、冲突和门槛 |
+| 正确拒答过多 | 强制所有问题回答 | 分析 Recall 与阈值分布 |
+| 私有材料泄漏 | 依赖 Prompt “不要泄露” | 权限过滤前置、隔离缓存和Trace |
+| 更新后结果不可解释 | 手动回滚部分文档 | 索引 generation、版本和回放 |
+
+## 18. 产物验收条件
+
+- □ 每个文档有稳定 ID、版本、内容 Hash、权限和解析器版本；
+- □ 每个 Chunk 有来源区间、Hash、Chunker 版本和 corpusVersion；
+- □ 新索引先构建和验证，再原子发布；
+- □ 权限过滤发生在未授权内容进入上下文和共享缓存之前；
+- □ 召回与重排分别保存候选、分数和排名；
+- □ Context Packing 记录预算、去重和被丢弃候选；
+- □ 每个可核查 Claim 有支持其完整含义的 Citation；
+- □ Citation 的文档版本、Offset 与 Quote Hash 可验证；
+- □ 无答案是结构化终态，有内部原因码和安全的外部表达；
+- □ 评测集同时包含有答案、无答案、冲突和权限 Case；
+- □ 报告 Recall@k、MRR、正确拒答和不支持回答，不只报一个总分；
+- □ 至少完成三个故障注入实验；
+- □ 确定性基线不伪装成真实模型输出；
+- □ 所有实验保存 corpusVersion、Query、候选、选择、Claim 和 Citation Evidence。
+
+## 19. 学完后应该能回答什么
+
+1. RAG 中离线索引与在线查询各有哪些独立故障点？
+2. URL 为什么不足以作为历史 Citation 身份？
+3. Chunk Size 与 Overlap 如何同时影响 Recall、重复和上下文预算？
+4. Sparse 与 Dense Retrieval 各自擅长和容易失败的场景是什么？
+5. 为什么重排不能修复召回阶段完全漏掉的文档？
+6. 权限过滤为什么必须在检索/上下文边界前执行？
+7. Citation 与 Grounding 有什么区别？
+8. 如何验证一个引用真的支持答案中的数量和条件？
+9. 两个相关 Chunk、Top-3 命中一个时 Recall@3 是多少？
+10. 三个 Query 的首个相关排名为 1、2、无结果时 MRR 是多少？
+11. 无答案错误应怎样区分语料缺失、召回失败、阈值过高和引用失败？
+12. 为什么评测必须保留原始候选和 Claim，而不能只看最终回答字符串？
+
+## 20. 来源边界
+
+- RAG 原始论文用于理解把非参数检索材料与生成模型结合的研究方向；课程不外推论文实验数字，也不把任何具体架构描述为所有场景的最佳方案。
+- BEIR 论文用于理解异构检索任务与跨数据集评测的重要性；本课固定小语料不能代表通用检索性能。
+- Elastic Similarity 官方文档用于核对 BM25 等评分设置的实现边界；具体参数必须在自己的语料和评测集上验证。
+- 本课确定性检索器是教学基线，不调用真实 Embedding 或生成模型，也不伪造模型输出。所有文档、权限和问题均为抽象公开案例。

@@ -1,0 +1,852 @@
+---
+title: 机器学习与实验
+description: 从预测时可见信息推导数据切分、Pipeline、指标、阈值和误差分析，避免把泄漏与偶然性误报成模型能力。
+moduleId: ml-experiments
+stage: ml-foundations
+prerequisites:
+  - evidence-first
+outcomes:
+  - 识别实体、时间、预处理和标签代理造成的数据泄漏
+  - 从混淆矩阵手算Precision、Recall、F1并解释阈值边界
+  - 生成带固定切分、原始预测和误差切片的可复现实验报告
+estimatedMinutes: 90
+difficulty: core
+careerDirections:
+  - llm-search-retrieval
+  - edge-inference
+sourceIds:
+  - sklearn-common-pitfalls
+  - sklearn-cross-validation
+  - sklearn-model-evaluation
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import ExperimentSplitDiagram from '../../../../components/content/ExperimentSplitDiagram.astro';
+import ModulePrerequisites from '../../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="ml-experiments" client:load />
+
+<ModulePrerequisites moduleId="ml-experiments" />
+
+一个分类器在随机切分上得到很高分，部署后却频繁漏掉真正需要处理的样本。回看实验才发现：同一实体的多条近重复记录同时进入训练集和测试集；全量数据先做了标准化和缺失值填充；一个特征在业务流程结束后才写入，预测时根本不可见；阈值在测试集上反复调到最好。指标计算没有错，实验问题定义错了。
+
+<Term id="data-leakage" /> 不是某一种 API 误用，而是评测目标中的未知信息进入了训练、特征构造、选择或阈值决策。防泄漏的起点不是“记住要用 Pipeline”，而是先写出预测时刻：系统在什么时间、对哪个实体、可以看到哪些字段、要预测哪个未来或未知结果。
+
+本课构建一个小型二分类实验：根据任务提交时可见的结构特征，预测任务是否需要人工复核。数据是固定的抽象合成记录，不代表真实业务分布；产物包括切分 Manifest、Pipeline、每条样本的原始分数、阈值、混淆矩阵、误差切片和失败报告。
+
+<ExperimentSplitDiagram />
+
+## 1. 工程问题：你究竟在什么时刻做预测
+
+先定义预测契约：
+
+```text
+单位：一次任务提交
+预测时刻：任务刚进入queued，任何Worker尚未执行
+输入：提交时可见的字节数、字段数、来源类型、历史实体计数、客户端声明优先级
+标签：任务最终是否被人工复核判为需要修改
+用途：对高风险任务安排额外预检查，不自动拒绝任务
+```
+
+这段契约立即排除一些看似强特征：
+
+- `final_error_code`：任务结束后才知道；
+- `reviewer_comment_length`：标签产生过程的一部分；
+- `completed_at - submitted_at`：预测时尚未发生；
+- `artifact_validation_failed`：目标事件的直接后果；
+- 使用未来 30 天汇总得到的实体历史统计。
+
+预测契约也是上线验收边界。离线脚本和在线服务必须从同一字段定义构造特征；否则离线高分无法说明线上实现。
+
+<Aside type="tip" title="防泄漏的第一问">
+对每个特征问：在需要做出预测的那个时刻，这个值是否已经存在、是否能以同样语义读取、是否不会因为标签结果而改变？
+</Aside>
+
+## 2. 四类常见泄漏
+
+### 2.1 标签代理泄漏
+
+特征直接或间接编码标签。例如人工复核后写入 `review_status`，标签正是“是否需要修改”。模型只是在读取答案。
+
+识别方法：画字段产生时间线，查找标签决定后才写入的列；做单特征基线，若一个字段几乎完美区分标签，要先审计来源，而不是庆祝。
+
+### 2.2 实体泄漏
+
+同一 `entity_id` 有多条相似记录。随机按行切分后，训练集看到实体模板，测试集只是在考记忆。实际部署若主要面对新实体，评测应按实体分组。
+
+```text
+entity-A: records 1,2,3 → 必须整体进入同一集合
+entity-B: records 4,5   → 必须整体进入同一集合
+```
+
+### 2.3 时间泄漏
+
+用未来数据训练或构造特征，再评估过去。即使每个单字段在预测时可见，全量统计也可能包含未来：
+
+```text
+feature = entity过去90天的失败率
+```
+
+对 3 月样本计算时，不能使用 4 月数据。时间切分还要保留特征计算的截断时间（cutoff）。
+
+### 2.4 预处理泄漏
+
+标准化、缺失值填充、词表、特征选择和降维都会从数据学习参数。如果在切分前对全量数据 `fit`，测试分布进入训练路径。
+
+错误：
+
+```python
+X_scaled = scaler.fit_transform(X_all)
+X_train, X_test = split(X_scaled)
+```
+
+正确：把可学习步骤放进 Pipeline，让每个训练折只在训练数据上 `fit`。
+
+## 3. 数据身份与切分 Manifest
+
+延续 evidence-first，本课实验输入不能只写“使用 data.csv”。Manifest 至少记录：
+
+```json
+{
+  "datasetId": "synthetic-review-v1",
+  "datasetSha256": "...",
+  "schemaVersion": 1,
+  "label": "needs_review",
+  "predictionTime": "submission",
+  "splitPolicy": {
+    "kind": "group",
+    "groupColumn": "entity_id",
+    "seed": 7121,
+    "trainGroups": ["e01", "e02", "e03", "e04", "e05", "e06"],
+    "validationGroups": ["e07", "e08"],
+    "testGroups": ["e09", "e10"]
+  },
+  "featureColumns": [
+    "payload_kib",
+    "field_count",
+    "source_kind",
+    "declared_priority",
+    "prior_entity_tasks"
+  ],
+  "forbiddenColumns": [
+    "final_error_code",
+    "reviewer_comment_length",
+    "completed_at"
+  ]
+}
+```
+
+固定组列表比只保存 Seed 更强。库版本或样本排序改变时，同一个 Seed 也可能产生不同切分；显式保存样本/组归属，重放时才能核对。
+
+### 3.1 Train、Validation、Test 的职责
+
+<Term id="train-validation-test-split" /> 不是三份同义数据：
+
+| 集合 | 可以做什么 | 不可以做什么 |
+| --- | --- | --- |
+| Train | 拟合预处理器、模型参数 | 报告为最终泛化结果 |
+| Validation | 选择模型、超参数、阈值、停止点 | 反复选择后仍称“未见数据” |
+| Test | 在决策冻结后做一次最终核验 | 用结果继续调参并保留同一“最终”名义 |
+
+如果数据很少，可以在训练开发阶段使用交叉验证，但最终测试边界仍要独立。每次看 Test 并据此改模型，Test 就逐渐变成 Validation；需要新的独立数据才能恢复无偏的最终核验角色。
+
+## 4. 切分策略从部署分布推导
+
+### 4.1 随机行切分
+
+适用：样本近似独立同分布，没有实体重复、时间漂移或来源簇。现实日志很少完全满足，必须用数据审计证明，而不是默认。
+
+### 4.2 Group Split
+
+适用：同一用户、设备、文档模板或项目产生多条记录，部署目标包含未见实体。所有同组样本进入同一折。
+
+验证断言：
+
+```python
+assert set(train_groups).isdisjoint(validation_groups)
+assert set(train_groups).isdisjoint(test_groups)
+assert set(validation_groups).isdisjoint(test_groups)
+```
+
+### 4.3 Time Split
+
+适用：训练使用过去、部署预测未来，存在版本或行为漂移。切分必须连同特征计算时间边界：
+
+```text
+train: submitted_at < 2026-05-01
+validation: 2026-05-01 ≤ submitted_at < 2026-06-01
+test: 2026-06-01 ≤ submitted_at < 2026-07-01
+```
+
+某些任务还需要时间 Gap，避免临近窗口共享尚未结算的信息。
+
+### 4.4 Stratification 不能修复实体或时间泄漏
+
+分层采样让各折标签比例接近，但如果它打散了同一实体，泄漏仍存在。优先满足独立性边界，再考虑标签比例。小数据下某个测试折可能只有极少正例，这会让 Recall 方差很大；正确处理是报告样本数与不确定性，而不是偷偷把相似样本移过去凑比例。
+
+## 5. Pipeline：所有会学习参数的步骤只 Fit Train
+
+本课特征包含数值和类别：
+
+```text
+数值：payload_kib, field_count, prior_entity_tasks
+类别：source_kind, declared_priority
+```
+
+Pipeline：
+
+```text
+ColumnTransformer
+├─ numeric: median imputer → standard scaler
+└─ categorical: most-frequent imputer → one-hot(handle_unknown=ignore)
+→ LogisticRegression
+```
+
+为什么类别编码使用 `handle_unknown=ignore`？因为测试或线上可能出现训练中未见类别。忽略会把未知类别编码为全零，至少保持可执行；是否应该拒绝、映射 `other` 或更新模型，取决于数据契约。必须记录未知类别率，否则模型可能在大面积未知输入上静默退化。
+
+## 6. 混淆矩阵与手算
+
+<Term id="confusion-matrix" /> 将二分类结果分成：
+
+| 实际 \ 预测 | 正类：需要复核 | 负类：无需复核 |
+| --- | ---: | ---: |
+| 正类 | TP | FN |
+| 负类 | FP | TN |
+
+假设测试集 10 条，得到：
+
+```text
+TP = 3
+FP = 1
+FN = 2
+TN = 4
+```
+
+总数验证：
+
+```text
+3+1+2+4=10
+```
+
+准确率：
+
+```text
+Accuracy = (TP + TN) / (TP + FP + FN + TN) = (3 + 4) / 10 = 0.7
+```
+
+<Term id="precision-recall" />：
+
+```text
+Precision = TP / (TP + FP) = 3 / 4 = 0.75
+```
+
+```text
+Recall = TP / (TP + FN) = 3 / 5 = 0.6
+```
+
+```text
+F1 = 2 × Precision × Recall / (Precision + Recall)
+   = 2 × 0.75 × 0.6 / (0.75 + 0.6)
+   = 0.9 / 1.35 = 2 / 3 ≈ 0.6667
+```
+
+Specificity：
+
+```text
+Specificity = TN / (TN + FP) = 4 / 5 = 0.8
+```
+
+这些数没有一个能脱离用途解释。若正类是“需要额外人工复核”，FN 表示漏掉风险任务，FP 表示增加不必要工作。阈值应根据两类成本、容量与安全边界选择，而不是默认 0.5。
+
+### 6.1 分母为零
+
+如果模型从不预测正类，则 `TP+FP=0`，Precision 无定义；库可能按配置返回 0 并警告。报告必须保存正例数、预测正例数和零分母策略，不能只写一个数。小样本中“Recall=1.0”可能只是一个正例恰好命中。
+
+## 7. 阈值是产品决策，不是模型常数
+
+模型输出分数 `p`，分类规则：
+
+```text
+ŷ = 1 when p ≥ t; otherwise ŷ = 0
+```
+
+阈值降低通常增加预测正例，可能提高 Recall、降低 Precision。假设验证集分数：
+
+| 样本 | 实际 | 分数 |
+| --- | ---: | ---: |
+| a | 1 | 0.82 |
+| b | 0 | 0.74 |
+| c | 1 | 0.63 |
+| d | 0 | 0.52 |
+| e | 1 | 0.41 |
+| f | 0 | 0.20 |
+
+阈值 `t=0.60`：预测 a、b、c 为正，TP=2、FP=1、FN=1、TN=2，Precision=2/3，Recall=2/3。
+
+阈值 `t=0.40`：预测 a、b、c、d、e 为正，TP=3、FP=2、FN=0、TN=1，Precision=3/5，Recall=1。
+
+若人工复核每天只能处理有限数量，还需要容量约束：
+
+```text
+predicted_positive_count(t) <= review_capacity
+```
+
+阈值只能在 Validation 上选择。Test 用冻结阈值评估；不能看 Test 漏报太多后调阈值，再把新结果当首次测试。
+
+## 8. Calibration：分数能不能解释成概率
+
+<Term id="calibration" /> 关注“预测 0.8 的样本是否约有 80% 为正”，而不只是排序正确。一个模型可以 AUC 较好但概率严重偏高。需要做成本决策、排队优先级或风险沟通时，Calibration 很重要。
+
+简单分桶检查：把预测分数按区间分组，比较平均预测与实际正例率：
+
+```text
+bucket 0.0–0.2: count=40, mean_score=0.12, positive_rate=0.10
+bucket 0.8–1.0: count=20, mean_score=0.87, positive_rate=0.55
+```
+
+第二桶表明过度自信，但样本数也可能太少。校准器本身也要只在训练/验证数据上拟合，不能偷看 Test。
+
+## 9. 指标边界与基线
+
+### 9.1 类别不平衡
+
+若正例率 1%，永远预测负类可得 99% Accuracy，却 Recall=0。必须报告类别分布、混淆矩阵和与用途相关的指标。
+
+### 9.2 Macro、Micro 与 Weighted
+
+多分类或多标签时聚合方式改变结论：Macro 对每类等权，Micro 汇总所有样本贡献，Weighted 按类支持度加权。没有“永远最好”的平均方式；选择要对应是否重视少数类。
+
+### 9.3 Baseline
+
+至少比较：
+
+- 多数类基线；
+- 业务规则基线；
+- 简单线性模型；
+- 当前候选模型。
+
+复杂模型若只比弱基线提升一点，可能不值得增加延迟、成本和解释难度。这里不提供虚构提升百分比，必须由实验输出计算。
+
+### 9.4 置信区间与重复切分
+
+单次小测试集得分具有抽样波动。可以用 Bootstrap 或重复交叉验证估计分布，但方法假设要匹配实体/时间结构；不能对相关样本当作独立行随意 Bootstrap。课程产物至少报告样本数和切分身份，复杂不确定性估计留给实际数据设计。
+
+## 10. 完整 Python 实验
+
+下面是可运行的单文件教学实验。它使用固定合成数据，不下载数据、不调用 API。PEP 723脚本元数据固定NumPy与scikit-learn版本；`uv run examples/review_experiment.py artifacts/ml-experiment`会创建隔离环境并执行。报告仍记录实际Python与依赖版本，正文不声称某个“当前版本”。
+
+```python title="examples/review_experiment.py"
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "numpy==2.3.1",
+#   "scikit-learn==1.7.1",
+# ]
+# ///
+
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import platform
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import sklearn
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+SEED = 7121
+FEATURES = [
+    "payload_kib",
+    "field_count",
+    "source_kind",
+    "declared_priority",
+    "prior_entity_tasks",
+]
+NUMERIC = ["payload_kib", "field_count", "prior_entity_tasks"]
+CATEGORICAL = ["source_kind", "declared_priority"]
+NUMERIC_INDEX = [FEATURES.index(name) for name in NUMERIC]
+CATEGORICAL_INDEX = [FEATURES.index(name) for name in CATEGORICAL]
+LABEL = "needs_review"
+FORBIDDEN = ["final_error_code", "reviewer_comment_length", "completed_at"]
+
+# 固定抽象样本。每个entity有两条记录，不能跨集合。
+ROWS: list[dict[str, Any]] = [
+    {"sample_id":"s01","entity_id":"e01","payload_kib":12,"field_count":4,"source_kind":"form","declared_priority":"normal","prior_entity_tasks":0,"needs_review":0},
+    {"sample_id":"s02","entity_id":"e01","payload_kib":15,"field_count":5,"source_kind":"form","declared_priority":"normal","prior_entity_tasks":1,"needs_review":0},
+    {"sample_id":"s03","entity_id":"e02","payload_kib":80,"field_count":18,"source_kind":"import","declared_priority":"high","prior_entity_tasks":0,"needs_review":1},
+    {"sample_id":"s04","entity_id":"e02","payload_kib":72,"field_count":16,"source_kind":"import","declared_priority":"high","prior_entity_tasks":1,"needs_review":1},
+    {"sample_id":"s05","entity_id":"e03","payload_kib":22,"field_count":7,"source_kind":"api","declared_priority":"normal","prior_entity_tasks":3,"needs_review":0},
+    {"sample_id":"s06","entity_id":"e03","payload_kib":25,"field_count":8,"source_kind":"api","declared_priority":"normal","prior_entity_tasks":4,"needs_review":0},
+    {"sample_id":"s07","entity_id":"e04","payload_kib":55,"field_count":14,"source_kind":"import","declared_priority":"normal","prior_entity_tasks":0,"needs_review":1},
+    {"sample_id":"s08","entity_id":"e04","payload_kib":50,"field_count":13,"source_kind":"import","declared_priority":"normal","prior_entity_tasks":1,"needs_review":1},
+    {"sample_id":"s09","entity_id":"e05","payload_kib":35,"field_count":10,"source_kind":"form","declared_priority":"high","prior_entity_tasks":5,"needs_review":0},
+    {"sample_id":"s10","entity_id":"e05","payload_kib":40,"field_count":11,"source_kind":"form","declared_priority":"high","prior_entity_tasks":6,"needs_review":1},
+    {"sample_id":"s11","entity_id":"e06","payload_kib":18,"field_count":6,"source_kind":"api","declared_priority":"low","prior_entity_tasks":2,"needs_review":0},
+    {"sample_id":"s12","entity_id":"e06","payload_kib":20,"field_count":6,"source_kind":"api","declared_priority":"low","prior_entity_tasks":3,"needs_review":0},
+    {"sample_id":"s13","entity_id":"e07","payload_kib":62,"field_count":15,"source_kind":"import","declared_priority":"high","prior_entity_tasks":2,"needs_review":1},
+    {"sample_id":"s14","entity_id":"e07","payload_kib":30,"field_count":9,"source_kind":"import","declared_priority":"normal","prior_entity_tasks":3,"needs_review":0},
+    {"sample_id":"s15","entity_id":"e08","payload_kib":45,"field_count":12,"source_kind":"api","declared_priority":"high","prior_entity_tasks":8,"needs_review":1},
+    {"sample_id":"s16","entity_id":"e08","payload_kib":28,"field_count":8,"source_kind":"api","declared_priority":"normal","prior_entity_tasks":9,"needs_review":0},
+    {"sample_id":"s17","entity_id":"e09","payload_kib":70,"field_count":17,"source_kind":"import","declared_priority":"normal","prior_entity_tasks":0,"needs_review":1},
+    {"sample_id":"s18","entity_id":"e09","payload_kib":16,"field_count":5,"source_kind":"form","declared_priority":"normal","prior_entity_tasks":1,"needs_review":0},
+    {"sample_id":"s19","entity_id":"e10","payload_kib":48,"field_count":13,"source_kind":"partner","declared_priority":"high","prior_entity_tasks":2,"needs_review":1},
+    {"sample_id":"s20","entity_id":"e10","payload_kib":24,"field_count":7,"source_kind":"partner","declared_priority":"low","prior_entity_tasks":3,"needs_review":0},
+]
+
+SPLIT_GROUPS = {
+    "train": {"e01", "e02", "e03", "e04", "e05", "e06"},
+    "validation": {"e07", "e08"},
+    "test": {"e09", "e10"},
+}
+
+@dataclass(frozen=True)
+class Metrics:
+    count: int
+    positives: int
+    predicted_positives: int
+    tn: int
+    fp: int
+    fn: int
+    tp: int
+    precision: float
+    recall: float
+    f1: float
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def assert_data_contract(rows: list[dict[str, Any]]) -> None:
+    sample_ids = [row["sample_id"] for row in rows]
+    if len(sample_ids) != len(set(sample_ids)):
+        raise ValueError("DUPLICATE_SAMPLE_ID")
+    for forbidden in FORBIDDEN:
+        if any(forbidden in row for row in rows):
+            raise ValueError(f"FORBIDDEN_FEATURE_PRESENT:{forbidden}")
+    allowed = {"sample_id", "entity_id", LABEL, *FEATURES}
+    unknown = sorted(set().union(*(row.keys() for row in rows)) - allowed)
+    if unknown:
+        raise ValueError(f"UNKNOWN_COLUMNS:{','.join(unknown)}")
+
+
+def split_rows(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    all_groups = set().union(*SPLIT_GROUPS.values())
+    observed_groups = {row["entity_id"] for row in rows}
+    if observed_groups != all_groups:
+        raise ValueError("SPLIT_GROUPS_DO_NOT_COVER_DATASET")
+    if not SPLIT_GROUPS["train"].isdisjoint(SPLIT_GROUPS["validation"]):
+        raise ValueError("TRAIN_VALIDATION_GROUP_LEAKAGE")
+    if not SPLIT_GROUPS["train"].isdisjoint(SPLIT_GROUPS["test"]):
+        raise ValueError("TRAIN_TEST_GROUP_LEAKAGE")
+    if not SPLIT_GROUPS["validation"].isdisjoint(SPLIT_GROUPS["test"]):
+        raise ValueError("VALIDATION_TEST_GROUP_LEAKAGE")
+    return {
+        name: [row for row in rows if row["entity_id"] in groups]
+        for name, groups in SPLIT_GROUPS.items()
+    }
+
+
+def xy(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(
+        [[row[name] for name in FEATURES] for row in rows],
+        dtype=object,
+    )
+    if x.ndim != 2 or x.shape[1] != len(FEATURES):
+        raise ValueError("FEATURE_MATRIX_SHAPE_INVALID")
+    y = np.asarray([int(row[LABEL]) for row in rows], dtype=int)
+    return x, y
+
+
+def build_pipeline() -> Pipeline:
+    numeric_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+    categorical_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
+    preprocessor = ColumnTransformer([
+        ("numeric", numeric_pipeline, NUMERIC_INDEX),
+        ("categorical", categorical_pipeline, CATEGORICAL_INDEX),
+    ])
+    return Pipeline([
+        ("preprocess", preprocessor),
+        ("model", LogisticRegression(random_state=SEED, max_iter=1000)),
+    ])
+
+
+def metric_record(y_true: np.ndarray, scores: np.ndarray, threshold: float) -> Metrics:
+    predictions = (scores >= threshold).astype(int)
+    matrix = confusion_matrix(y_true, predictions, labels=[0, 1])
+    tn, fp, fn, tp = (int(value) for value in matrix.ravel())
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true,
+        predictions,
+        average="binary",
+        zero_division=0,
+    )
+    if tn + fp + fn + tp != len(y_true):
+        raise AssertionError("CONFUSION_MATRIX_COUNT_MISMATCH")
+    return Metrics(
+        count=len(y_true),
+        positives=int(y_true.sum()),
+        predicted_positives=int(predictions.sum()),
+        tn=tn,
+        fp=fp,
+        fn=fn,
+        tp=tp,
+        precision=float(precision),
+        recall=float(recall),
+        f1=float(f1),
+    )
+
+
+def choose_threshold(
+    y_validation: np.ndarray,
+    scores: np.ndarray,
+    minimum_recall: float,
+    review_capacity: int,
+) -> tuple[float, list[dict[str, Any]]]:
+    # 候选来自固定网格，排序规则明确，避免同分时隐式选择。
+    candidates: list[dict[str, Any]] = []
+    for threshold in [round(value, 2) for value in np.linspace(0.05, 0.95, 19)]:
+        metrics = metric_record(y_validation, scores, threshold)
+        feasible = metrics.recall >= minimum_recall and metrics.predicted_positives <= review_capacity
+        candidates.append({"threshold": threshold, "feasible": feasible, **asdict(metrics)})
+    feasible_rows = [row for row in candidates if row["feasible"]]
+    if not feasible_rows:
+        raise ValueError("NO_THRESHOLD_MEETS_VALIDATION_CONSTRAINTS")
+    # 先最大Precision，再最大F1，再选择更高阈值，规则写入Evidence。
+    selected = sorted(
+        feasible_rows,
+        key=lambda row: (-row["precision"], -row["f1"], -row["threshold"]),
+    )[0]
+    return float(selected["threshold"]), candidates
+
+
+def prediction_rows(
+    rows: list[dict[str, Any]],
+    scores: np.ndarray,
+    threshold: float,
+) -> list[dict[str, Any]]:
+    output = []
+    for row, score in zip(rows, scores, strict=True):
+        predicted = int(score >= threshold)
+        actual = int(row[LABEL])
+        if predicted == 1 and actual == 1:
+            outcome = "TP"
+        elif predicted == 1 and actual == 0:
+            outcome = "FP"
+        elif predicted == 0 and actual == 1:
+            outcome = "FN"
+        else:
+            outcome = "TN"
+        output.append({
+            "sample_id": row["sample_id"],
+            "entity_id": row["entity_id"],
+            "actual": actual,
+            "score": round(float(score), 8),
+            "threshold": threshold,
+            "predicted": predicted,
+            "outcome": outcome,
+            "source_kind": row["source_kind"],
+            "payload_bucket": "large" if row["payload_kib"] >= 50 else "small",
+        })
+    return output
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        raise ValueError("REFUSE_EMPTY_PREDICTION_ARTIFACT")
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def main(output_dir: Path) -> None:
+    assert_data_contract(ROWS)
+    splits = split_rows(ROWS)
+    train_x, train_y = xy(splits["train"])
+    validation_x, validation_y = xy(splits["validation"])
+    test_x, test_y = xy(splits["test"])
+
+    if len(set(train_y.tolist())) < 2:
+        raise ValueError("TRAINING_SET_HAS_SINGLE_CLASS")
+    pipeline = build_pipeline()
+    pipeline.fit(train_x, train_y)
+
+    validation_scores = pipeline.predict_proba(validation_x)[:, 1]
+    threshold, threshold_table = choose_threshold(
+        validation_y,
+        validation_scores,
+        minimum_recall=0.5,
+        review_capacity=3,
+    )
+
+    # 从此处开始阈值和Pipeline冻结；Test只核验一次。
+    test_scores = pipeline.predict_proba(test_x)[:, 1]
+    test_metrics = metric_record(test_y, test_scores, threshold)
+    predictions = prediction_rows(splits["test"], test_scores, threshold)
+    errors = [row for row in predictions if row["outcome"] in {"FP", "FN"}]
+
+    dataset_identity = sha256_text(canonical_json(ROWS))
+    report = {
+        "schema_version": 1,
+        "status": "completed",
+        "dataset": {
+            "id": "synthetic-review-v1",
+            "sha256": dataset_identity,
+            "rows": len(ROWS),
+        },
+        "prediction_contract": {
+            "time": "submission",
+            "label": LABEL,
+            "features": FEATURES,
+            "forbidden": FORBIDDEN,
+        },
+        "split": {
+            name: {
+                "groups": sorted(SPLIT_GROUPS[name]),
+                "sample_ids": [row["sample_id"] for row in rows],
+                "count": len(rows),
+            }
+            for name, rows in splits.items()
+        },
+        "selection": {
+            "selected_on": "validation",
+            "threshold": threshold,
+            "minimum_recall": 0.5,
+            "review_capacity": 3,
+            "tie_break": ["precision_desc", "f1_desc", "threshold_desc"],
+            "candidates": threshold_table,
+        },
+        "test_metrics": asdict(test_metrics),
+        "error_count": len(errors),
+        "runtime": {
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            "numpy": np.__version__,
+            "scikit_learn": sklearn.__version__,
+            "seed": SEED,
+        },
+        "limitations": [
+            "固定合成数据不代表真实部署分布",
+            "测试集合很小，指标只用于验证实验管线",
+            "未评估时间漂移、概率校准或线上容量",
+        ],
+    }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_csv(output_dir / "predictions.csv", predictions)
+    write_csv(output_dir / "errors.csv", errors or [{
+        "sample_id":"NONE","entity_id":"NONE","actual":"","score":"","threshold":threshold,
+        "predicted":"","outcome":"NO_ERRORS","source_kind":"","payload_bucket":"",
+    }])
+    (output_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    # 产物完整性断言，防止“脚本退出0但没有测试样本”。
+    if test_metrics.count != len(splits["test"]):
+        raise AssertionError("TEST_PREDICTION_COUNT_MISMATCH")
+    if {row["sample_id"] for row in predictions} != {row["sample_id"] for row in splits["test"]}:
+        raise AssertionError("TEST_SAMPLE_IDENTITY_MISMATCH")
+
+
+if __name__ == "__main__":
+    destination = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("artifacts/ml-experiment")
+    main(destination)
+```
+
+这段代码有意把每条 Test 分数写入 Artifact，而不是只保存最终 F1。没有原始预测，就无法重新计算阈值、检查误差样本或验证指标脚本。
+
+## 11. 误差分析：把分数变成下一步实验
+
+误差清单至少包含：样本身份、实际标签、分数、阈值、FP/FN 类型和预先声明的切片字段。不要在看到结果后无限发明切片并只汇报最差或最好的一组；这会增加多重比较和叙事选择偏差。
+
+建议先定义切片：
+
+```text
+source_kind
+payload_bucket
+priority
+unknown_category_seen
+entity_history_bucket
+```
+
+对每个切片报告：
+
+```text
+count, positives, predicted_positives, TP, FP, FN, TN
+```
+
+小于最小样本数的切片只列原始计数，不给稳定结论。误差原因分类也要区分事实与假设：
+
+| 观察 | 可确认事实 | 下一步假设 |
+| --- | --- | --- |
+| `partner` 来源 2 条都误判 | 两条样本均未在训练类别中出现 | 未知类别编码可能损失信息 |
+| 大 payload 的 FN 集中 | 某切片 FN 比其他切片多 | 模型关系非线性或标签规则不同 |
+| 同实体得分接近 | 两条记录特征相似 | 当前特征不足以区分具体风险 |
+
+“模型不理解 partner”不是可直接观察事实。应先检查 OneHot 的未知类别计数、训练覆盖和标签质量。
+
+## 12. 数据质量与标签边界
+
+模型评测把标签当参考答案，但标签也可能错：
+
+- 人工复核者标准不一致；
+- 标签生成滞后；
+- 规则升级后旧标签含义改变；
+- 只对高分样本进行复核，导致选择偏差；
+- 缺失标签被错误当作负类。
+
+产物应记录标签来源、版本和“未标注”处理方式。误差分析中发现可疑标签时，不要直接把它改成模型预测；要进入独立复核流程，并保留修改记录，否则模型会把自己的判断写回真值。
+
+## 13. 三类失败路径之外，再检查实验系统本身
+
+### 13.1 测试集为空或只有一个类别
+
+脚本应失败或明确标记指标不可估。不要返回全 0 指标并 Exit Code 0，让流水线误以为实验有效。
+
+### 13.2 Pipeline 在全量数据 Fit
+
+可以在测试里注入一个仅 Test 出现的极端数值，检查训练 Scaler 的均值是否变化。如果变化，说明 Test 进入 Fit。
+
+### 13.3 特征服务语义漂移
+
+离线 `payload_kib` 用 UTF-8 字节数，线上却用字符数。Schema 名称相同仍不等义。需要共享特征函数或契约测试，用固定输入比较离线/在线输出。
+
+### 13.4 阈值选择失败
+
+若没有阈值同时满足最低 Recall 和容量限制，函数应返回 `NO_THRESHOLD_MEETS_VALIDATION_CONSTRAINTS`。不能悄悄放宽约束后继续报告“最优阈值”。这可能说明模型不够好、容量不足或目标不可同时满足。
+
+### 13.5 Artifact 缺失
+
+训练脚本即使打印指标，也必须验证 `report.json`、`predictions.csv` 和 `errors.csv` 存在、可读且样本身份完整。沿用 evidence-first 的 Bundle 结构。
+
+## 14. 故障诊断表
+
+| 失败 | 表面指标 | 检测方法 | 正确动作 |
+| --- | --- | --- | --- |
+| 同实体跨 Train/Test | Test 分数异常高 | Group 交集断言、近重复检查 | 按实体重切分并作废旧结论 |
+| 全量标准化 | 小幅或明显虚高 | 检查 Pipeline Fit 边界、注入极值 | 仅在 Train Fit，重跑所有选择 |
+| 未来字段进入特征 | 近乎完美预测 | 字段时间线、单特征基线 | 删除字段，重新定义预测契约 |
+| Test 上调阈值 | 最终分数不可复现地“变好” | 决策日志与阈值来源 | 新建 Test 或把结论降级为开发结果 |
+| 类别极不平衡 | Accuracy 很高、Recall 为零 | 混淆矩阵、正例数 | 采用用途指标与基线 |
+| 未知类别激增 | 整体分数下降 | 未知类别率、来源切片 | 数据契约告警、重训或拒绝策略 |
+| 标签规则变化 | 时间后段误差集中 | 标签版本与时间切片 | 分版本评估，重新标注或迁移 |
+| Test 样本太少 | 指标跳动大 | 报告分母、重复切分 | 扩充独立数据，不夸大单次数字 |
+| 实验退出0但无预测 | 空 CSV、指标默认值 | 样本一一对应断言 | 任务失败，禁止发布报告 |
+
+## 15. 故障注入实验
+
+### 实验一：制造实体泄漏
+
+1. 把 Group Split 替换为随机按行切分；
+2. 记录 Train/Test 中的 `entity_id` 交集；
+3. 训练同一 Pipeline；
+4. 比较原始预测，不只比较汇总分数；
+5. 恢复 Group Split；
+6. 将“实体交集必须为空”加入固定测试；
+7. 不把随机切分结果描述成部署能力。
+
+验收：测试能在训练前阻止实体交集，而不是等到分数异常才猜。
+
+### 实验二：制造预处理泄漏
+
+1. 在 Test 数值列注入一个很大的值；
+2. 错误版本先对全量数据 `StandardScaler.fit`；
+3. 保存 Scaler 的 `mean_`；
+4. 正确版本只在 Train Fit；
+5. 比较两个均值，确认错误版本受 Test 影响；
+6. 检查 Pipeline 中每个有 `fit` 的步骤；
+7. 将训练统计写入 Evidence。
+
+验收：Test 值变化不能改变训练预处理参数。
+
+### 实验三：阈值约束无解
+
+1. 把 `minimum_recall` 设为 1.0；
+2. 把 `review_capacity` 设为 0；
+3. 运行阈值选择；
+4. 断言稳定失败 `NO_THRESHOLD_MEETS_VALIDATION_CONSTRAINTS`；
+5. 报告列出两个约束与候选表；
+6. 不自动选择一个违反约束的阈值；
+7. 分别测试增加容量或改善模型覆盖后的结果。
+
+验收：无解是可报告工程结论，不是需要隐藏的异常。
+
+### 实验四：标签代理字段
+
+1. 在数据中加入 `reviewer_comment_length`；
+2. 尝试把它加入 FEATURES；
+3. 数据契约应在训练前拒绝；
+4. 单独做审计实验观察其与标签关系；
+5. 记录字段产生时间晚于预测时刻；
+6. 删除该字段后重跑；
+7. 作废所有使用泄漏字段的指标。
+
+验收：字段白名单和禁止列表能阻止已知泄漏重新进入。
+
+## 16. 实验验收条件
+
+- □ 预测单位、时刻、标签和用途写入 Manifest；
+- □ 特征白名单与禁止字段列表由 Schema 检查；
+- □ 数据集内容 Hash、Schema 版本和样本 ID 可核对；
+- □ Train、Validation、Test 的实体或时间边界没有交集；
+- □ 所有可学习预处理步骤只在 Train Fit；
+- □ 模型与阈值选择只使用 Train/Validation；
+- □ Test 在决策冻结后只作最终核验；
+- □ 报告包含混淆矩阵四格、分母和零分母策略；
+- □ 至少手算一次 Precision、Recall 与 F1；
+- □ 保存每条 Test 样本的分数、阈值、预测和结果类型；
+- □ 误差分析使用预先声明切片，并报告样本数；
+- □ 与多数类和简单规则/线性基线比较；
+- □ 未知类别、空 Test、单类别和阈值无解有明确失败路径；
+- □ 至少执行三个故障注入实验；
+- □ Evidence Bundle 记录运行时和依赖实际版本，不在正文伪造版本或性能数字。
+
+## 17. 学完后应该能回答什么
+
+1. 数据泄漏为什么必须从预测时刻定义，而不只是看代码是否用了 Pipeline？
+2. 标签代理、实体泄漏、时间泄漏和预处理泄漏分别怎样发生？
+3. 为什么同一个 Seed 不能完全证明切分相同？
+4. Group Split 与 Stratification 冲突时应优先保护什么边界？
+5. Train、Validation、Test 的职责为什么不能互换？
+6. TP=3、FP=1、FN=2、TN=4 时 Precision、Recall 和 F1 分别是多少？
+7. 阈值从 0.6 降到 0.4 为什么可能提高 Recall、降低 Precision？
+8. 没有阈值满足质量与容量约束时，系统应该怎样报告？
+9. 为什么只保存最终 F1 不足以做误差分析和指标复核？
+10. Calibration 与分类排序能力有什么区别？
+11. 如何判断一个误差切片是事实、假设还是小样本噪声？
+12. 怎样避免脚本退出 0 但 Test 根本没有产生预测？
+
+## 18. 来源边界
+
+- scikit-learn Common Pitfalls 用于核对不一致预处理与数据泄漏的典型边界；课程示例的字段和切分是抽象教学设计。
+- Cross-validation 文档用于理解切分器与交叉验证接口；具体 Group/Time 策略必须由部署分布推导。
+- Model Evaluation 文档用于核对混淆矩阵与分类指标接口；指标是否适合作为业务门槛仍取决于错误成本、容量和标签质量。
+- 合成数据只有 20 条，不能用于声称模型泛化、性能提升或生产可用性。所有数值只用于手算与管线验收。

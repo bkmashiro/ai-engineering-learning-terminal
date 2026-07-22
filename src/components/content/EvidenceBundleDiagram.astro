@@ -1,0 +1,150 @@
+---
+---
+
+<figure class="evidence-bundle" aria-labelledby="evidence-bundle-title evidence-bundle-caption">
+  <div class="evidence-bundle__header">
+    <p id="evidence-bundle-title">一次执行的最小证据链</p>
+    <span>同一 runId 连接所有记录</span>
+  </div>
+
+  <div class="evidence-bundle__flow" role="list" aria-label="Evidence Bundle 数据流">
+    <section class="evidence-bundle__node" role="listitem">
+      <span>01 · BEFORE</span>
+      <strong>Manifest</strong>
+      <small>输入 Hash、配置快照、随机种子、依赖身份</small>
+    </section>
+    <span class="evidence-bundle__arrow" aria-hidden="true">→</span>
+    <section class="evidence-bundle__node" role="listitem">
+      <span>02 · DURING</span>
+      <strong>Runner</strong>
+      <small>验证、执行、捕获 stdout / stderr、记录副作用</small>
+    </section>
+    <span class="evidence-bundle__arrow" aria-hidden="true">→</span>
+    <section class="evidence-bundle__node" role="listitem">
+      <span>03 · AFTER</span>
+      <strong>Structured Result</strong>
+      <small>Exit Code、状态、计数、错误分类、Artifact 清单</small>
+    </section>
+  </div>
+
+  <div class="evidence-bundle__proofs">
+    <section>
+      <span>TRACE</span>
+      <strong>步骤证据</strong>
+      <small>每一步的开始、结束、输入摘要、结果与耗时</small>
+    </section>
+    <section>
+      <span>LEDGER</span>
+      <strong>副作用证据</strong>
+      <small>计划执行、实际执行、验证结果与补偿状态</small>
+    </section>
+    <section>
+      <span>ARTIFACT</span>
+      <strong>输出证据</strong>
+      <small>路径、大小、媒体类型、Hash 与可读取验证</small>
+    </section>
+    <section>
+      <span>REPORT</span>
+      <strong>结论分层</strong>
+      <small>当前事实、由事实推导的结论、尚未验证的假设</small>
+    </section>
+  </div>
+
+  <figcaption id="evidence-bundle-caption">
+    Exit Code 只回答进程如何结束。Evidence Bundle 还要证明目标步骤确实执行、产物确实存在且可读取、外部副作用可以核对。
+  </figcaption>
+</figure>
+
+<style>
+  .evidence-bundle {
+    display: grid;
+    gap: 0.85rem;
+    margin-block: 1.5rem;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.875rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 3%, var(--sl-color-bg));
+  }
+
+  .evidence-bundle__header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .evidence-bundle__header p {
+    margin: 0;
+    font-size: 1rem;
+    font-weight: 750;
+  }
+
+  .evidence-bundle__header span,
+  .evidence-bundle__node span,
+  .evidence-bundle__proofs span {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.875rem;
+    font-weight: 750;
+    letter-spacing: 0.04em;
+  }
+
+  .evidence-bundle__flow {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
+    align-items: stretch;
+    gap: 0.55rem;
+  }
+
+  .evidence-bundle__node,
+  .evidence-bundle__proofs section {
+    display: grid;
+    align-content: start;
+    gap: 0.28rem;
+    min-width: 0;
+    padding: 0.875rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.62rem;
+    background: var(--sl-color-bg);
+  }
+
+  .evidence-bundle__node strong,
+  .evidence-bundle__proofs strong { font-size: 0.9rem; }
+
+  .evidence-bundle__node small,
+  .evidence-bundle__proofs small,
+  .evidence-bundle figcaption {
+    color: var(--sl-color-gray-2);
+    font-size: 0.875rem;
+    line-height: 1.55;
+  }
+
+  .evidence-bundle__arrow {
+    align-self: center;
+    color: var(--sl-color-accent-high);
+    font-size: 1.35rem;
+    font-weight: 800;
+  }
+
+  .evidence-bundle__proofs {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.55rem;
+  }
+
+  .evidence-bundle figcaption {
+    padding-top: 0.875rem;
+    border-top: 1px dashed var(--sl-color-gray-5);
+  }
+
+  @media (max-width: 54rem) {
+    .evidence-bundle__flow { grid-template-columns: 1fr; }
+    .evidence-bundle__arrow { justify-self: center; transform: rotate(90deg); }
+    .evidence-bundle__proofs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
+  @media (max-width: 34rem) {
+    .evidence-bundle__header { display: grid; }
+    .evidence-bundle__proofs { grid-template-columns: 1fr; }
+  }
+</style>

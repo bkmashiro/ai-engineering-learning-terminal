@@ -1,0 +1,188 @@
+---
+title: LLM、搜索与检索工程
+description: 围绕语料身份、混合召回、重排、Grounding、无答案和离线评测建立可诊断的搜索系统。
+moduleId: direction-llm-search-retrieval
+stage: directions
+prerequisites:
+  - production-capstone
+outcomes:
+  - 设计从语料摄取到Claim Citation的检索实验闭环
+  - 用分层Evidence定位召回、排序、Grounding与无答案缺口
+estimatedMinutes: 45
+difficulty: advanced
+careerDirections:
+  - llm-search-retrieval
+sourceIds:
+  - rag-paper
+  - beir-paper
+  - elastic-similarity
+  - sklearn-model-evaluation
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import ModulePrerequisites from '../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="direction-llm-search-retrieval" client:load />
+
+<ModulePrerequisites moduleId="direction-llm-search-retrieval" />
+
+## 这条方向实际解决什么问题
+
+LLM、搜索与检索工程解决的是“如何从不断变化、结构不一、权限不同的资料中找到足以支持具体Claim的证据”。生成只是最后一段；更大工作量在语料摄取、解析、去重、版本、<Term id="chunking" />、Sparse/Dense Retrieval、<Term id="reranking" />、权限过滤、上下文打包、<Term id="citation" />、<Term id="no-answer" /> 和评测。
+
+典型失败：
+
+- 文档已更新，索引仍回答旧规则；
+- 解析器丢掉表格标题，Chunk缺乏条件；
+- Dense召回主题相关但规则相反的文本；
+- Sparse召回精确编号，却错过同义问题；
+- Relevant Chunk在Top-20，却被Context Budget丢掉；
+- 引用链接相关但不支持Claim；
+- 权限过滤太晚，私有Chunk进入Prompt或缓存；
+- 评测只包含有答案问题，系统学会总是回答；
+- 一个总分掩盖某类查询完全失败。
+
+## 所需共同前置模块
+
+直接前置包括ML实验、LLM基础、数据可靠性和检索Grounding。生产综合项目提供API、版本、Artifact、SLO和发布Gate；安全模块提供ACL、注入与数据流边界。
+
+## 典型系统边界
+
+```text
+Content Sources
+  ↓ connector / parser / normalization
+Document Registry ── identity/version/ACL
+  ↓
+Chunk Pipeline ── chunker version / source span
+  ↓
+Sparse Index + Dense Index
+  ↓
+Query Service ── ACL → retrieve → merge → rerank → pack
+  ↓
+Answer/Extraction ── Claim → Citation validation → no-answer
+  ↓
+Evaluation + Replay + Index Release Gate
+```
+
+离线和在线两个平面分别版本化。查询响应引用确切 corpusVersion，不能混合 generation。
+
+## 必会机制
+
+### 1. 语料身份与增量更新
+
+文档记录稳定ID、内容版本、Hash、来源URL、解析器版本、ACL和删除状态。变更检测后构建新Chunk；删除要从索引和缓存传播。发布新generation前验证文档/Chunk计数、抽样查询和权限字段。
+
+### 2. Parser质量
+
+HTML、PDF、Markdown、表格和代码块结构不同。解析失败可能比模型选择更影响质量。保存原始到规范文本的Span映射，让Citation回到来源。对无法解析、空文档、乱码和重复内容有隔离报告。
+
+### 3. Chunk策略实验
+
+比较结构切分、固定窗口、Overlap、父子Chunk和Query-time Expansion。指标不只看Recall，还看重复率、平均Token成本、Citation Span完整性和Top-k多样性。
+
+### 4. Sparse/Dense/Hybrid
+
+Sparse处理精确术语、数字、标识；Dense覆盖同义和语义；Hybrid按可复现融合。每个Retriever输出独立排名与版本，便于归因。不要直接相加不同尺度原始分数。
+
+### 5. Reranker与Feature Evidence
+
+保存候选前后排名、分数、模型/规则版本。负例要包含主题相近、条件相反的Hard Negative。若召回没有相关Chunk，Reranker不承担责任。
+
+### 6. ACL与多租户
+
+ACL在Retriever查询时生效；Index、Cache和Trace按Scope隔离。权限变更触发索引/缓存更新。外部响应不泄露“有私有文档但你无权访问”。
+
+### 7. Context Packing
+
+按预算选择Evidence：去重、每文档上限、必要标题、条件句完整、预留回答Token。记录丢弃原因。Context Window增大不能替代检索和排序。
+
+### 8. Grounding与Citation
+
+答案拆原子Claim；每个Claim绑定文档版本、Chunk、Span和Quote Hash。支持“原文事实”和“由多来源推导”两类，推导保存规则。引用失效时不静默跳转。
+
+### 9. No-answer与冲突
+
+评测集包含语料缺失、权限过滤、证据冲突、低置信和问题超范围。无答案是结构状态。冲突时展示来源差异或转人工，不让模型随意选一个。
+
+### 10. 评测与切片
+
+至少报告：<Term id="recall-at-k" />、<Term id="mean-reciprocal-rank" />、Claim Support、Citation Validity、正确拒答、错误回答。按查询类型、语言、文档来源、长度、更新时间、ACL切片；每个指标带分母。
+
+## 可验证作品建议
+
+构建一个公开技术资料检索系统：
+
+- 固定10–50篇公开Fixture文档，含版本更新、表格、重复和无答案材料；
+- Document Registry与两个corpus generation；
+- 结构化Chunker；
+- Sparse基线与一个可选本地Dense适配器；
+- Hybrid merge与规则Reranker；
+- ACL Scope；
+- Claim-Citation Artifact；
+- 有答案、无答案、冲突、旧版本、权限Case；
+- Offline Evaluation CLI与Index Diff。
+
+不需要大数据量。重点是能证明每一层怎样影响最终Claim。
+
+## 作品需要留下哪些 Evidence
+
+```text
+document-manifest.json
+parser-report.json
+chunk-manifest.ndjson
+index-generation.json
+query-traces/
+retrieval-candidates.ndjson
+rerank-diffs.json
+context-packing-report.json
+claims-and-citations.json
+no-answer-verdicts.json
+evaluation-cases.json
+metrics-with-denominators.json
+index-release-gate.json
+```
+
+## 常见“看起来会、实际不会”的缺口
+
+| 看起来会 | 实际缺口 |
+| --- | --- |
+| 接了向量数据库 | 无语料版本、解析质量和ACL |
+| Top-k能返回相关文本 | 不测Recall、Hard Negative和无答案 |
+| 答案有来源链接 | 引用不绑定Claim与Span |
+| 调大Chunk/Context | 重复、预算和条件截断更严重 |
+| 使用Hybrid | 分数尺度混乱、无法解释融合 |
+| 有Reranker | 没保存召回候选，失败无法归因 |
+| 做了离线评测 | Test反复调参、Case没有版本 |
+| 更新索引很快 | 查询混用新旧generation，历史结果不可复查 |
+
+## 学习顺序
+
+1. 文档身份、版本、ACL和Parser Evidence。
+2. 结构Chunk与Span映射。
+3. Sparse基线和可手算Recall/MRR。
+4. Dense与Hybrid实验。
+5. Reranker与Hard Negative。
+6. Context Packing和Token预算。
+7. Claim-Citation、冲突和No-answer。
+8. 评测切片、Replay和Index Release Gate。
+9. 最后接入生成模型，保留确定性抽取基线。
+
+## 抽象岗位能力映射
+
+| 能力 | 可观察产物 |
+| --- | --- |
+| 数据/索引工程 | Registry、Parser、Chunk、Generation发布 |
+| 信息检索 | Sparse/Dense/Hybrid、Rerank、Recall/MRR |
+| LLM Grounding | Context Packing、Claim、Citation和No-answer |
+| 实验方法 | Case版本、切片、Baseline和Index Diff |
+| 安全与权限 | ACL前置、缓存隔离、注入边界 |
+| 可靠性 | 增量更新、回滚、Stale Index对账 |
+| 产品质量 | 可核查答案、冲突展示、无答案体验 |
+
+<Aside type="tip" title="方向验收线">
+给系统一条主题极相似但规则相反的Hard Negative，再把正确Chunk移到Top-20。你应能分别说明召回、重排、预算和Claim验证的结果，而不是只说“模型答错了”。
+</Aside>

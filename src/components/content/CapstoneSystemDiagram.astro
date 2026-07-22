@@ -1,0 +1,104 @@
+---
+---
+
+<figure class="capstone-system" aria-labelledby="capstone-system-title capstone-system-caption">
+  <div class="capstone-system__title">
+    <p id="capstone-system-title">最小生产系统：数据平面与控制平面分开</p>
+    <span>每个边界都有恢复动作</span>
+  </div>
+
+  <div class="capstone-system__plane">
+    <strong>数据平面</strong>
+    <div class="capstone-system__flow">
+      <span>API / Stream</span><b aria-hidden="true">→</b><span>Command Store + Outbox</span><b aria-hidden="true">→</b><span>Queue</span><b aria-hidden="true">→</b><span>Agent Runner</span><b aria-hidden="true">→</b><span>Artifacts / Result</span>
+    </div>
+    <small>处理一次用户任务；允许断线、重试、取消、重复投递和人工接管。</small>
+  </div>
+
+  <div class="capstone-system__plane">
+    <strong>控制平面</strong>
+    <div class="capstone-system__flow">
+      <span>Policy</span><b aria-hidden="true">·</b><span>Evaluation Set</span><b aria-hidden="true">·</b><span>Release Gate</span><b aria-hidden="true">·</b><span>Budgets</span><b aria-hidden="true">·</b><span>Replay</span>
+    </div>
+    <small>决定允许哪些工具、何时发布、何时降级、何时停止自动化。</small>
+  </div>
+
+  <div class="capstone-system__evidence">
+    <section>
+      <span>QUALITY</span>
+      <strong>任务正确率、引用与安全断言</strong>
+    </section>
+    <section>
+      <span>LATENCY</span>
+      <strong>排队、首事件、工具与总时延</strong>
+    </section>
+    <section>
+      <span>COST</span>
+      <strong>每成功任务的模型、检索与工具成本</strong>
+    </section>
+    <section>
+      <span>RELIABILITY</span>
+      <strong>SLO、错误预算、积压与恢复时间</strong>
+    </section>
+  </div>
+
+  <figcaption id="capstone-system-caption">
+    综合项目不是把前面示例粘在一起。它要定义权威状态、协议边界、评测门槛、质量—延迟—成本预算，以及自动化失败后的接管路径。
+  </figcaption>
+</figure>
+
+<style>
+  .capstone-system {
+    display: grid;
+    gap: 0.85rem;
+    margin-block: 1.5rem;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.875rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 3%, var(--sl-color-bg));
+  }
+
+  .capstone-system__title { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+  .capstone-system__title p { margin: 0; font-size: 1rem; font-weight: 750; }
+  .capstone-system__title span,
+  .capstone-system__evidence span {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.875rem;
+    font-weight: 750;
+  }
+
+  .capstone-system__plane {
+    display: grid;
+    grid-template-columns: 7rem minmax(0, 1fr);
+    gap: 0.35rem 0.75rem;
+    align-items: center;
+    padding: 0.75rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.6rem;
+    background: var(--sl-color-bg);
+  }
+
+  .capstone-system__plane > strong { grid-row: 1 / span 2; font-size: 0.88rem; }
+  .capstone-system__flow { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; min-width: 0; }
+  .capstone-system__flow span { padding: 0.35rem 0.48rem; border: 1px solid var(--sl-color-gray-5); border-radius: 0.42rem; font-size: 0.875rem; font-weight: 700; }
+  .capstone-system__flow b { color: var(--sl-color-accent-high); }
+  .capstone-system__plane small,
+  .capstone-system figcaption { color: var(--sl-color-gray-2); font-size: 0.875rem; line-height: 1.5; }
+
+  .capstone-system__evidence { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.55rem; }
+  .capstone-system__evidence section { display: grid; gap: 0.25rem; padding: 0.875rem; border: 1px solid var(--sl-color-gray-5); border-radius: 0.6rem; background: var(--sl-color-bg); }
+  .capstone-system__evidence strong { font-size: 0.875rem; }
+  .capstone-system figcaption { padding-top: 0.875rem; border-top: 1px dashed var(--sl-color-gray-5); }
+
+  @media (max-width: 52rem) {
+    .capstone-system__plane { grid-template-columns: 1fr; }
+    .capstone-system__plane > strong { grid-row: auto; }
+    .capstone-system__evidence { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
+  @media (max-width: 36rem) {
+    .capstone-system__title { display: grid; }
+    .capstone-system__evidence { grid-template-columns: 1fr; }
+  }
+</style>

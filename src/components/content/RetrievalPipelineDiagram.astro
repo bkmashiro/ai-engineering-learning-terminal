@@ -1,0 +1,102 @@
+---
+---
+
+<figure class="retrieval-pipeline" aria-labelledby="retrieval-pipeline-title retrieval-pipeline-caption">
+  <div class="retrieval-pipeline__title">
+    <p id="retrieval-pipeline-title">RAG 是两条流水线，不是一次向量搜索</p>
+    <span>索引版本与查询 Trace 必须关联</span>
+  </div>
+
+  <div class="retrieval-pipeline__lane">
+    <strong>离线索引</strong>
+    <div>
+      <span>Source</span><b aria-hidden="true">→</b><span>Parse</span><b aria-hidden="true">→</b><span>Chunk</span><b aria-hidden="true">→</b><span>Embed / Terms</span><b aria-hidden="true">→</b><span>Index Snapshot</span>
+    </div>
+    <small>保留文档身份、版本、权限、分块边界和可引用位置。</small>
+  </div>
+
+  <div class="retrieval-pipeline__lane">
+    <strong>在线问答</strong>
+    <div>
+      <span>Question</span><b aria-hidden="true">→</b><span>Retrieve</span><b aria-hidden="true">→</b><span>Rerank</span><b aria-hidden="true">→</b><span>Context Pack</span><b aria-hidden="true">→</b><span>Answer Gate</span>
+    </div>
+    <small>候选不足、证据冲突或无法支持关键结论时，进入无答案路径。</small>
+  </div>
+
+  <div class="retrieval-pipeline__checks">
+    <section>
+      <span>RETRIEVAL EVIDENCE</span>
+      <strong>query、候选、分数、过滤原因</strong>
+    </section>
+    <section>
+      <span>GROUNDING EVIDENCE</span>
+      <strong>claim → citation → source span</strong>
+    </section>
+    <section>
+      <span>EVALUATION</span>
+      <strong>Recall@k、MRR、引用正确率、无答案准确率</strong>
+    </section>
+  </div>
+
+  <figcaption id="retrieval-pipeline-caption">
+    生成器只能使用进入上下文的证据。检索失败、分块失败和引用绑定失败需要分别测量，不能都归入“模型答错”。
+  </figcaption>
+</figure>
+
+<style>
+  .retrieval-pipeline {
+    display: grid;
+    gap: 0.75rem;
+    margin-block: 1.5rem;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.875rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 3%, var(--sl-color-bg));
+  }
+
+  .retrieval-pipeline__title { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+  .retrieval-pipeline__title p { margin: 0; font-size: 1rem; font-weight: 750; }
+  .retrieval-pipeline__title span,
+  .retrieval-pipeline__checks span {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.875rem;
+    font-weight: 750;
+  }
+
+  .retrieval-pipeline__lane {
+    display: grid;
+    grid-template-columns: 7rem minmax(0, 1fr);
+    gap: 0.35rem 0.75rem;
+    align-items: center;
+    padding: 0.75rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.6rem;
+    background: var(--sl-color-bg);
+  }
+
+  .retrieval-pipeline__lane > strong { grid-row: 1 / span 2; font-size: 0.875rem; }
+  .retrieval-pipeline__lane div { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; min-width: 0; }
+  .retrieval-pipeline__lane div span {
+    padding: 0.35rem 0.48rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.42rem;
+    font-size: 0.875rem;
+    font-weight: 700;
+  }
+  .retrieval-pipeline__lane b { color: var(--sl-color-accent-high); }
+  .retrieval-pipeline__lane small,
+  .retrieval-pipeline figcaption { color: var(--sl-color-gray-2); font-size: 0.875rem; line-height: 1.5; }
+
+  .retrieval-pipeline__checks { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.55rem; }
+  .retrieval-pipeline__checks section { display: grid; gap: 0.25rem; padding: 0.875rem; border: 1px solid var(--sl-color-gray-5); border-radius: 0.6rem; background: var(--sl-color-bg); }
+  .retrieval-pipeline__checks strong { font-size: 0.875rem; }
+  .retrieval-pipeline figcaption { padding-top: 0.875rem; border-top: 1px dashed var(--sl-color-gray-5); }
+
+  @media (max-width: 48rem) {
+    .retrieval-pipeline__title { display: grid; }
+    .retrieval-pipeline__lane { grid-template-columns: 1fr; }
+    .retrieval-pipeline__lane > strong { grid-row: auto; }
+    .retrieval-pipeline__checks { grid-template-columns: 1fr; }
+  }
+</style>

@@ -1,0 +1,1060 @@
+---
+title: 可复现与证据
+description: 把输入、配置、版本、执行记录、副作用和产物验证组成一次可复查的确定性工程任务。
+moduleId: evidence-first
+stage: reproducibility
+prerequisites: []
+outcomes:
+  - 构建输入相同即可重放并比较结果的确定性CLI
+  - 识别Exit Code为0但目标工作未执行的假成功
+  - 用Trace、Ledger和Artifact验证组成最小Evidence Bundle
+estimatedMinutes: 90
+difficulty: core
+careerDirections: []
+sourceIds:
+  - node-process
+  - slsa-provenance
+  - reproducible-builds
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import { ModuleProgress } from '../../../../components/learning/ModuleProgress';
+import ModulePrerequisites from '../../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../../components/content/Term.astro';
+import EvidenceBundleDiagram from '../../../../components/content/EvidenceBundleDiagram.astro';
+
+<ModuleProgress moduleId="evidence-first" client:load />
+
+<ModulePrerequisites moduleId="evidence-first" />
+
+很多工程任务最后只留下两句记录：“命令执行成功”和“生成了结果”。这两句都可能是真的，也都可能无法证明目标工作发生过。
+
+考虑一个批量检查命令：它读取一个输入目录，对所有 `.json` 文件做结构验证，把摘要写到 `report.json`。第一次运行打印 `passed`，进程退出码是 `0`。第二天有人发现输入目录拼错了，实际扫描到零个文件；旧的 `report.json` 还留在输出目录里，于是流水线继续把旧报告当成新产物发布。
+
+这里没有复杂的模型，也没有分布式事务。故障来自三个普通事实：进程成功结束不等于目标步骤执行；路径存在不等于产物属于本次运行；自然语言日志不能稳定回答“读取了什么、做了什么、留下了什么”。
+
+本课要把这个模糊任务改造成一个可检查的工程协议。输入是一个 <Term id="manifest" />；运行前固定配置、种子与依赖身份；运行中记录 <Term id="trace" /> 和 <Term id="side-effect-ledger" />；运行后验证 <Term id="artifact" /> 的存在、可读性与 Hash；最终输出可机器判断的 <Term id="evidence-bundle" />。任何关键证据缺失都要失败，而不是靠一句“看起来正常”越过门槛。
+
+<Aside type="tip" title="本课的判断线">
+可复现不是“我还能再敲一次命令”。它是：后来的人拿到明确输入、配置和实现身份，能够重放任务；即使结果不同，也能定位差异来自输入、环境、执行路径还是外部副作用。
+</Aside>
+
+## 1. 先定义真正要证明的工程结论
+
+我们把任务写成一句可验收的声明：
+
+> 对 Manifest 指定的全部输入文件执行验证；每个输入恰好产生一条结构化检查结果；本次运行生成一份新的、可读取且 Hash 可核对的报告；若没有输入、遗漏步骤、结果不完整或产物不可验证，命令必须以非零 Exit Code 结束。
+
+这句话包含五种不同证据：
+
+| 要证明的内容 | 不能只靠什么 | 最小可检查证据 |
+| --- | --- | --- |
+| 读取了正确输入 | 工作目录、通配符、日志中的路径 | Manifest 中的规范化路径、大小和输入 Hash |
+| 关键步骤确实执行 | Exit Code 0、最后一行 `done` | Trace 中的步骤开始/结束记录和处理计数 |
+| 每个输入都有结果 | 一个总计数或“全部通过” | 输入身份到 Result 项的一一对应关系 |
+| 产物来自本次运行 | 文件存在、修改时间看起来较新 | 临时文件原子替换、runId、内容 Hash、可读性验证 |
+| 副作用没有漏记 | “只写了一个文件”的假设 | Ledger 中计划、尝试、完成、验证或补偿状态 |
+
+如果只验证最后一行输出，前四类故障仍然可以漏过。Evidence-first 的做法不是增加日志数量，而是先写清楚结论，再为每个结论指定机器可检查的证据。
+
+<EvidenceBundleDiagram />
+
+## 2. 输入 Manifest：把隐式上下文变成数据
+
+<Term id="manifest" /> 不是“一个放路径的配置文件”。它是一次运行的输入契约。命令行参数、当前目录、环境变量、默认配置、系统时间和远程服务版本，都会改变执行结果；只要它们影响结果，就不能继续藏在进程上下文里。
+
+本课使用下面的 Manifest。它是教学用的完整输入格式，字段都能被本地 CLI 验证，不依赖真实 API。
+
+```json title="examples/manifest.json"
+{
+  "schemaVersion": 1,
+  "runId": "run-20260721-001",
+  "inputRoot": "./examples/input",
+  "inputs": [
+    {
+      "path": "alpha.json",
+      "sha256": "由 prepare 脚本生成的 64 位十六进制值"
+    },
+    {
+      "path": "beta.json",
+      "sha256": "由 prepare 脚本生成的 64 位十六进制值"
+    }
+  ],
+  "output": {
+    "reportPath": "./examples/output/report.json"
+  },
+  "execution": {
+    "seed": 7121,
+    "minimumProcessed": 2,
+    "failOnValidationError": true
+  }
+}
+```
+
+设计 Manifest 时要区分“引用输入”和“证明输入身份”。`alpha.json` 是引用；`sha256` 才是本次任务期望读取的内容身份。只存路径意味着文件可以在运行前被悄悄替换，重放时也无法知道差异来自代码还是数据。
+
+### 2.1 规范化路径，但不要扩大权限
+
+输入根目录解析后，子路径必须仍在根目录内。下面这种输入应该被拒绝：
+
+```text
+../private.json
+nested/../../outside.json
+/absolute/path/not-declared-by-the-bundle.json
+```
+
+验证逻辑不是简单搜索 `..`，而是：
+
+1. 把 `inputRoot` 解析为绝对规范路径 `root`；
+2. 把 `root` 与相对输入路径连接并规范化为 `candidate`；
+3. 计算 `relative(root, candidate)`；
+4. 若结果以 `..` 开始或本身是绝对路径，则输入越界；
+5. 再检查文件类型、可读性、大小上限和 Hash。
+
+路径检查解决“读哪里”；Hash 检查解决“读到的是否是声明内容”。二者不能互相替代。
+
+### 2.2 对配置做快照，而不是记录配置文件名
+
+假设 `config.json` 在两次运行之间被修改。Trace 里只写 `config=config.json` 没有重放价值。CLI 应先解析配置，填充默认值，删除不影响语义的表示差异，再保存“有效配置快照”。例如：
+
+```json
+{
+  "failOnValidationError": true,
+  "maximumInputBytes": 1048576,
+  "minimumProcessed": 2,
+  "seed": 7121,
+  "sortKeys": true
+}
+```
+
+快照记录的是程序真正使用的值，而不是用户可能以为自己设置的值。若两个配置文件一个省略 `sortKeys`，另一个显式写 `true`，而默认值正是 `true`，它们的有效配置可以具有相同 Hash。
+
+### 2.3 Seed 只控制你真正接管的随机源
+
+<Term id="deterministic-execution" /> 常被误写成“设置一个随机种子”。Seed 只能约束被同一伪随机数生成器消费的序列，不能自动固定以下因素：
+
+- 目录遍历顺序；
+- 对象键的非规范序列化；
+- 当前时间；
+- 并发任务完成顺序；
+- 依赖库内部未暴露的随机源；
+- 远程服务结果；
+- 硬件和数值内核差异。
+
+本课 CLI 不需要随机算法，但仍接收 `seed`，因为 Evidence Bundle 要明确记录“本次实现没有消费随机数”还是“消费了哪个可控序列”。真实实验若使用随机抽样，应把 PRNG 作为显式依赖注入，而不是在任意函数里直接调用 `Math.random()`。
+
+## 3. 版本身份：不要只写“Node + TypeScript”
+
+执行身份至少分四层：
+
+| 层 | 示例 | 作用 |
+| --- | --- | --- |
+| 任务协议 | Manifest `schemaVersion=1` | 判断输入格式和结果格式能否兼容 |
+| 应用实现 | 构建时注入的 commit 或 source bundle Hash | 判断执行逻辑是否相同 |
+| 运行时 | Node 版本、平台、架构 | 解释运行语义和系统接口差异 |
+| 依赖集合 | lockfile Hash、关键包版本 | 解释解析器或算法实现差异 |
+
+不应在公开产物中写本地绝对仓库路径。实现身份可以来自发布包版本、源码归档 Hash 或构建系统注入的提交标识。若当前目录没有可信的提交信息，结果应明确写 `sourceIdentity.status = "unverified"`，而不是伪造一个版本。
+
+依赖身份也不是把整个 `node_modules` 列表复制进日志。最小做法是保存 lockfile Hash；需要更强的供应链证据时，再连接构建来源与 Provenance。来源中的 SLSA 文档用于说明 Provenance 的结构边界，本课不会把本地生成的一份 JSON 描述成经过第三方认证的供应链证明。
+
+## 4. stdout、stderr 与 Exit Code 各自回答什么
+
+Node 进程的 Exit Code 是操作系统可读取的终止状态。约定通常是 `0` 表示命令按其协议成功，非零表示失败，但“协议成功”必须由程序自己定义。若程序把“扫描到零个文件”定义为正常，Shell 不会替你发现业务目标落空。
+
+本课约定：
+
+| 通道 | 面向对象 | 内容约束 |
+| --- | --- | --- |
+| stdout | 调用程序 | 恰好一行 JSON，格式是 `CliResult` |
+| stderr | 人和日志系统 | 诊断消息；不得成为唯一机器证据 |
+| Exit Code 0 | 调用程序 | 结构化结果为 `succeeded`，全部验收断言通过 |
+| Exit Code 2 | 调用程序 | Manifest、输入或配置无效，未进入执行阶段 |
+| Exit Code 3 | 调用程序 | 执行完成但业务验证失败，例如输入内容不合法 |
+| Exit Code 4 | 调用程序 | 产物写入或产物验证失败 |
+| Exit Code 5 | 调用程序 | 内部未分类错误；结果仍要尽力写出失败阶段 |
+
+一个常见反模式是 stdout 同时打印进度条、欢迎语、彩色日志和最终 JSON。调用方只能再用正则猜哪一段是结果。更稳定的协议是：stdout 只保留机器结果；需要实时进度时，输出到 stderr 或独立事件文件，并让每条事件都是结构化记录。
+
+<Aside type="caution" title="不要用日志文本代替结果 Schema">
+日志可以新增字段、调整措辞和改变顺序；调用方不应靠“包含 success”判断成功。机器契约要有固定 Schema、明确状态和错误代码。
+</Aside>
+
+## 5. Structured Result：成功和失败必须是不同数据形状
+
+<Term id="structured-output" /> 的价值不只是“方便 JSON.parse”。类型要阻止调用方在失败时误读成功字段。
+
+```ts title="src/result-types.ts"
+export interface ArtifactEvidence {
+  path: string;
+  mediaType: 'application/json';
+  bytes: number;
+  sha256: string;
+  readable: boolean;
+  runId: string;
+}
+
+export interface ExecutionIdentity {
+  protocolVersion: 1;
+  node: string;
+  platform: string;
+  architecture: string;
+  sourceIdentity: string;
+  lockfileSha256: string | null;
+}
+
+export type CliResult =
+  | {
+      status: 'succeeded';
+      runId: string;
+      processed: number;
+      passed: number;
+      failed: 0;
+      artifact: ArtifactEvidence;
+      evidenceBundlePath: string;
+    }
+  | {
+      status: 'failed';
+      runId: string | null;
+      phase: 'manifest' | 'input' | 'execution' | 'artifact' | 'internal';
+      code: string;
+      message: string;
+      processed: number;
+      evidenceBundlePath: string | null;
+    };
+```
+
+成功分支把 `failed` 固定为 `0`。如果允许“有验证错误但命令仍成功”，需要另一个状态如 `completed_with_findings`，并让调用方明确接受它。不要用一个布尔值 `success` 配合几十个可空字段；那会产生“`success=true` 但 `artifact=null`”的非法组合。
+
+## 6. Trace：证明执行路径，而不是记录所有内部细节
+
+<Term id="trace" /> 在本课中是一组追加写入的事件。每条记录至少包含：
+
+```ts
+interface TraceEvent {
+  sequence: number;
+  runId: string;
+  step: 'manifest' | 'verify-input' | 'validate' | 'write-artifact' | 'verify-artifact';
+  event: 'started' | 'completed' | 'failed';
+  subject?: string;
+  details: Record<string, string | number | boolean | null>;
+}
+```
+
+这里刻意不使用当前时间作为排序依据。`sequence` 是本次运行内的因果顺序；时间戳可以附加用于性能观察，但不能成为确定性 Golden Test 的比较字段。Trace 也不应记录输入全文、密钥或隐私数据。`subject` 使用 Manifest 中的相对路径，`details` 保存 Hash、字节数和错误类别。
+
+一次正常运行的关键事件应该满足：
+
+```text
+manifest.started
+manifest.completed
+verify-input.started(alpha.json)
+verify-input.completed(alpha.json)
+validate.started(alpha.json)
+validate.completed(alpha.json)
+verify-input.started(beta.json)
+verify-input.completed(beta.json)
+validate.started(beta.json)
+validate.completed(beta.json)
+write-artifact.started
+write-artifact.completed
+verify-artifact.started
+verify-artifact.completed
+```
+
+最后有 `verify-artifact.completed` 还不够。验收器要检查每个 Manifest 输入都出现一组 `verify-input.completed` 与 `validate.completed`，并且没有未知输入。这是在防止“命令退出 0 但测试根本没运行”。
+
+### 6.1 计数门槛不能写死在实现里
+
+测试框架常出现“找不到测试文件时仍退出 0”的配置。CLI 应同时验证：
+
+```text
+processed == manifest.inputs.length
+processed >= execution.minimumProcessed
+unique(result.inputPath) == manifest.inputs
+```
+
+第一条保证没有漏项；第二条防止错误 Manifest 本身为空；第三条防止重复处理一个输入来凑计数。三条缺一不可。
+
+## 7. Side-effect Ledger：把“做了什么”拆成可恢复状态
+
+本课只有文件写入，但仍要使用 <Term id="side-effect-ledger" />。原因是文件系统操作也可能部分成功：临时文件写完但重命名失败、报告写完但 Bundle 写失败、旧文件仍存在。
+
+Ledger 项可以这样表示：
+
+```ts
+interface LedgerEntry {
+  effectId: string;
+  kind: 'write-file' | 'rename-file';
+  target: string;
+  state: 'planned' | 'attempted' | 'completed' | 'verified' | 'failed';
+  expectedSha256: string | null;
+  observedSha256: string | null;
+  errorCode: string | null;
+}
+```
+
+一次 Artifact 写入使用两个副作用：
+
+1. `write-file(report.tmp.<runId>)`；
+2. `rename-file(report.tmp.<runId>, report.json)`。
+
+在同一文件系统中，重命名通常可以作为发布新文件的原子切换手段，但代码仍必须处理失败，不能把它泛化成跨文件系统或远程对象存储的原子保证。写入完成后再打开最终路径读取、解析、检查 `runId` 与 Hash，把 Ledger 状态推进到 `verified`。
+
+Ledger 不是用来声称 Exactly-once。进程可能在写入成功后、更新 Ledger 前崩溃，因此恢复逻辑必须通过观察目标文件补全事实。可靠系统的关键不是相信最后一条日志，而是能把声明状态与实际世界对账。
+
+## 8. Hash 与 Canonicalization：相同语义不一定有相同字节
+
+Hash 对字节序列计算。下面两个 JSON 对象语义上相同，但原始文本 Hash 不同：
+
+```json
+{"a":1,"b":2}
+```
+
+```json
+{
+  "b": 2,
+  "a": 1
+}
+```
+
+因此需要先决定比较目标：
+
+- 输入 Manifest 中的 `sha256` 证明原始输入字节身份；
+- 配置快照 Hash 可以对排序后的规范 JSON 计算，证明有效配置语义；
+- Artifact Hash 证明最终发布文件的精确字节；
+- Golden Test 可以去除环境字段后比较规范化结果。
+
+本课使用递归键排序，再以 UTF-8 编码并添加结尾换行。规范函数必须自己接受和返回明确值：
+
+```ts
+function canonicalize(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (item !== null && typeof item === 'object') {
+      return Object.fromEntries(
+        Object.entries(item as Record<string, unknown>)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, child]) => [key, normalize(child)]),
+      );
+    }
+    return item;
+  };
+
+  return `${JSON.stringify(normalize(value), null, 2)}\n`;
+}
+```
+
+注意边界：`localeCompare` 的实现与 Locale 参数会影响排序。对于只允许 ASCII 字段名的内部 Schema，可以使用明确的码点比较；若需要跨实现的标准 Canonical JSON，应采用公开规范，而不是把这段教学函数当成通用标准。
+
+## 9. 可逐步执行的例子：识别一次假成功
+
+Manifest 声明两个输入，最小处理数也是两个。实际目录中只有 `alpha.json`，但输出目录残留上次运行的 `report.json`。
+
+错误实现执行过程：
+
+1. 用通配符扫描 `input/*.json`，得到一个文件；
+2. 验证 `alpha.json` 通过；
+3. 因为没有失败项，打印 `passed`；
+4. 没有写新报告，但检查 `report.json` 存在；
+5. Exit Code 0。
+
+Evidence-first 验收器逐项计算：
+
+```text
+manifest.inputs.length = 2
+observed verified inputs = 1
+processed = 1
+minimumProcessed = 2
+artifact.runId = run-previous
+current runId = run-20260721-001
+```
+
+得到四个当前事实：缺少一个输入、处理数不足、Artifact 的 runId 不属于本次运行、没有 `write-artifact.completed`。由这些事实可以推导“本次任务未完成”。至于“beta.json 为什么缺失”，仍只是未验证假设，可能是路径错误、文件没有同步、权限拒绝或 Manifest 过期。
+
+这种分层报告比“可能是目录问题”更可靠：
+
+| 层级 | 示例 | 是否可以直接写进结论 |
+| --- | --- | --- |
+| 当前事实 | Manifest 有 2 项，Trace 只完成 1 项 | 可以，来自可检查记录 |
+| 推导结论 | 运行不满足完整性断言 | 可以，写明推导规则 |
+| 未验证假设 | 输入同步任务可能漏了 beta.json | 只能列为下一步验证，不得冒充根因 |
+
+## 10. 一个确定性 TypeScript CLI
+
+下面是教学用的完整单文件实现，使用 Node 标准库，无真实网络调用、无密钥、不会执行用户代码。输入文件要求是 JSON 对象并包含字符串字段 `id`。为便于阅读，Manifest 的运行时 Schema 使用手写校验；生产项目可以换成项目已有的 Schema 验证器，但验证失败仍要映射为稳定错误代码。
+
+```ts title="examples/evidence-cli.ts"
+import { createHash } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
+import {
+  access,
+  mkdir,
+  readFile,
+  rename,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
+import { dirname, isAbsolute, relative, resolve } from 'node:path';
+import process from 'node:process';
+
+interface ManifestInput {
+  path: string;
+  sha256: string;
+}
+
+interface Manifest {
+  schemaVersion: 1;
+  runId: string;
+  inputRoot: string;
+  inputs: ManifestInput[];
+  output: { reportPath: string };
+  execution: {
+    seed: number;
+    minimumProcessed: number;
+    failOnValidationError: boolean;
+  };
+}
+
+type Phase = 'manifest' | 'input' | 'execution' | 'artifact' | 'internal';
+
+type TraceEvent = {
+  sequence: number;
+  runId: string;
+  step: 'manifest' | 'verify-input' | 'validate' | 'write-artifact' | 'verify-artifact';
+  event: 'started' | 'completed' | 'failed';
+  subject?: string;
+  details: Record<string, string | number | boolean | null>;
+};
+
+type LedgerEntry = {
+  effectId: string;
+  kind: 'write-file' | 'rename-file';
+  target: string;
+  state: 'planned' | 'attempted' | 'completed' | 'verified' | 'failed';
+  expectedSha256: string | null;
+  observedSha256: string | null;
+  errorCode: string | null;
+};
+
+type ItemResult = {
+  inputPath: string;
+  inputSha256: string;
+  status: 'passed' | 'failed';
+  code: 'VALID' | 'INVALID_JSON' | 'MISSING_ID';
+};
+
+class CliFailure extends Error {
+  constructor(
+    readonly phase: Phase,
+    readonly code: string,
+    message: string,
+    readonly exitCode: 2 | 3 | 4 | 5,
+  ) {
+    super(message);
+  }
+}
+
+function sha256(bytes: string | Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+function compareAscii(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function canonicalize(value: unknown): string {
+  function normalize(item: unknown): unknown {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (item !== null && typeof item === 'object') {
+      return Object.fromEntries(
+        Object.entries(item as Record<string, unknown>)
+          .sort(([left], [right]) => compareAscii(left, right))
+          .map(([key, child]) => [key, normalize(child)]),
+      );
+    }
+    return item;
+  }
+  return `${JSON.stringify(normalize(value), null, 2)}\n`;
+}
+
+function parseManifest(raw: unknown): Manifest {
+  if (raw === null || typeof raw !== 'object') {
+    throw new CliFailure('manifest', 'MANIFEST_NOT_OBJECT', 'Manifest必须是JSON对象', 2);
+  }
+  const value = raw as Record<string, unknown>;
+  const execution = value.execution as Record<string, unknown> | undefined;
+  const output = value.output as Record<string, unknown> | undefined;
+  const inputs = value.inputs;
+
+  if (value.schemaVersion !== 1) {
+    throw new CliFailure('manifest', 'UNSUPPORTED_SCHEMA', '只支持schemaVersion=1', 2);
+  }
+  if (typeof value.runId !== 'string' || !/^[a-zA-Z0-9_-]{6,80}$/.test(value.runId)) {
+    throw new CliFailure('manifest', 'INVALID_RUN_ID', 'runId格式无效', 2);
+  }
+  if (typeof value.inputRoot !== 'string' || value.inputRoot.length === 0) {
+    throw new CliFailure('manifest', 'INVALID_INPUT_ROOT', 'inputRoot不能为空', 2);
+  }
+  if (!Array.isArray(inputs) || inputs.length === 0) {
+    throw new CliFailure('manifest', 'EMPTY_INPUTS', 'Manifest至少声明一个输入', 2);
+  }
+  if (!output || typeof output.reportPath !== 'string') {
+    throw new CliFailure('manifest', 'INVALID_OUTPUT', '缺少output.reportPath', 2);
+  }
+  if (
+    !execution ||
+    !Number.isInteger(execution.seed) ||
+    !Number.isInteger(execution.minimumProcessed) ||
+    (execution.minimumProcessed as number) < 1 ||
+    typeof execution.failOnValidationError !== 'boolean'
+  ) {
+    throw new CliFailure('manifest', 'INVALID_EXECUTION_CONFIG', 'execution配置无效', 2);
+  }
+
+  const normalizedInputs: ManifestInput[] = inputs.map((item, index) => {
+    if (item === null || typeof item !== 'object') {
+      throw new CliFailure('manifest', 'INVALID_INPUT_ENTRY', `inputs[${index}]不是对象`, 2);
+    }
+    const record = item as Record<string, unknown>;
+    if (typeof record.path !== 'string' || isAbsolute(record.path)) {
+      throw new CliFailure('manifest', 'INVALID_INPUT_PATH', `inputs[${index}].path必须是相对路径`, 2);
+    }
+    if (typeof record.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(record.sha256)) {
+      throw new CliFailure('manifest', 'INVALID_INPUT_HASH', `inputs[${index}].sha256无效`, 2);
+    }
+    return { path: record.path, sha256: record.sha256 };
+  });
+
+  const uniquePaths = new Set(normalizedInputs.map((item) => item.path));
+  if (uniquePaths.size !== normalizedInputs.length) {
+    throw new CliFailure('manifest', 'DUPLICATE_INPUT_PATH', '输入路径不能重复', 2);
+  }
+
+  return {
+    schemaVersion: 1,
+    runId: value.runId,
+    inputRoot: value.inputRoot,
+    inputs: normalizedInputs.sort((a, b) => compareAscii(a.path, b.path)),
+    output: { reportPath: output.reportPath },
+    execution: {
+      seed: execution.seed as number,
+      minimumProcessed: execution.minimumProcessed as number,
+      failOnValidationError: execution.failOnValidationError as boolean,
+    },
+  };
+}
+
+function resolveWithin(root: string, declaredPath: string): string {
+  const candidate = resolve(root, declaredPath);
+  const fromRoot = relative(root, candidate);
+  if (fromRoot === '' || fromRoot.startsWith('..') || isAbsolute(fromRoot)) {
+    throw new CliFailure('input', 'PATH_OUTSIDE_ROOT', `输入越过根目录: ${declaredPath}`, 2);
+  }
+  return candidate;
+}
+
+function validateDocument(bytes: Buffer, inputPath: string): ItemResult {
+  try {
+    const parsed: unknown = JSON.parse(bytes.toString('utf8'));
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { inputPath, inputSha256: sha256(bytes), status: 'failed', code: 'MISSING_ID' };
+    }
+    const id = (parsed as Record<string, unknown>).id;
+    return typeof id === 'string' && id.length > 0
+      ? { inputPath, inputSha256: sha256(bytes), status: 'passed', code: 'VALID' }
+      : { inputPath, inputSha256: sha256(bytes), status: 'failed', code: 'MISSING_ID' };
+  } catch {
+    return { inputPath, inputSha256: sha256(bytes), status: 'failed', code: 'INVALID_JSON' };
+  }
+}
+
+async function optionalFileHash(path: string): Promise<string | null> {
+  try {
+    return sha256(await readFile(path));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function main(manifestPath: string): Promise<number> {
+  const trace: TraceEvent[] = [];
+  const ledger: LedgerEntry[] = [];
+  let sequence = 0;
+  let runId: string | null = null;
+  let processed = 0;
+  let bundlePath: string | null = null;
+
+  const emit = (
+    step: TraceEvent['step'],
+    event: TraceEvent['event'],
+    details: TraceEvent['details'],
+    subject?: string,
+  ): void => {
+    if (!runId) return;
+    trace.push({ sequence: ++sequence, runId, step, event, subject, details });
+  };
+
+  try {
+    const manifestAbsolute = resolve(manifestPath);
+    const manifestDirectory = dirname(manifestAbsolute);
+    const rawManifest = JSON.parse(await readFile(manifestAbsolute, 'utf8')) as unknown;
+    const manifest = parseManifest(rawManifest);
+    runId = manifest.runId;
+    emit('manifest', 'started', { manifestPath: 'manifest.json' });
+
+    const inputRoot = resolve(manifestDirectory, manifest.inputRoot);
+    const reportPath = resolve(manifestDirectory, manifest.output.reportPath);
+    bundlePath = `${reportPath}.evidence.json`;
+    const effectiveConfig = {
+      failOnValidationError: manifest.execution.failOnValidationError,
+      maximumInputBytes: 1_048_576,
+      minimumProcessed: manifest.execution.minimumProcessed,
+      seed: manifest.execution.seed,
+      sortKeys: true,
+    };
+    emit('manifest', 'completed', {
+      inputCount: manifest.inputs.length,
+      manifestSha256: sha256(canonicalize(manifest)),
+      configSha256: sha256(canonicalize(effectiveConfig)),
+    });
+
+    const itemResults: ItemResult[] = [];
+    for (const declared of manifest.inputs) {
+      emit('verify-input', 'started', {}, declared.path);
+      const absolutePath = resolveWithin(inputRoot, declared.path);
+      await access(absolutePath, fsConstants.R_OK);
+      const info = await stat(absolutePath);
+      if (!info.isFile()) {
+        throw new CliFailure('input', 'INPUT_NOT_FILE', `${declared.path}不是普通文件`, 2);
+      }
+      if (info.size > effectiveConfig.maximumInputBytes) {
+        throw new CliFailure('input', 'INPUT_TOO_LARGE', `${declared.path}超过大小限制`, 2);
+      }
+      const bytes = await readFile(absolutePath);
+      const observedHash = sha256(bytes);
+      if (observedHash !== declared.sha256) {
+        throw new CliFailure('input', 'INPUT_HASH_MISMATCH', `${declared.path}内容身份不匹配`, 2);
+      }
+      emit('verify-input', 'completed', { bytes: bytes.length, sha256: observedHash }, declared.path);
+
+      emit('validate', 'started', {}, declared.path);
+      const itemResult = validateDocument(bytes, declared.path);
+      itemResults.push(itemResult);
+      processed += 1;
+      emit('validate', 'completed', { status: itemResult.status, code: itemResult.code }, declared.path);
+    }
+
+    if (processed !== manifest.inputs.length || processed < manifest.execution.minimumProcessed) {
+      throw new CliFailure('execution', 'INSUFFICIENT_EXECUTION', '实际处理数量不满足Manifest', 3);
+    }
+    if (new Set(itemResults.map((item) => item.inputPath)).size !== manifest.inputs.length) {
+      throw new CliFailure('execution', 'NON_UNIQUE_RESULTS', '结果没有与输入一一对应', 3);
+    }
+
+    const failed = itemResults.filter((item) => item.status === 'failed').length;
+    if (failed > 0 && manifest.execution.failOnValidationError) {
+      throw new CliFailure('execution', 'VALIDATION_FAILED', `${failed}个输入未通过验证`, 3);
+    }
+
+    const report = {
+      schemaVersion: 1,
+      runId,
+      seed: manifest.execution.seed,
+      processed,
+      passed: processed - failed,
+      failed,
+      items: itemResults,
+    };
+    const reportBytes = canonicalize(report);
+    const expectedReportHash = sha256(reportBytes);
+    const temporaryPath = `${reportPath}.tmp.${runId}`;
+    await mkdir(dirname(reportPath), { recursive: true });
+
+    const writeEffect: LedgerEntry = {
+      effectId: `${runId}:write-report`,
+      kind: 'write-file',
+      target: manifest.output.reportPath,
+      state: 'planned',
+      expectedSha256: expectedReportHash,
+      observedSha256: null,
+      errorCode: null,
+    };
+    ledger.push(writeEffect);
+    emit('write-artifact', 'started', { expectedSha256: expectedReportHash });
+    writeEffect.state = 'attempted';
+    await writeFile(temporaryPath, reportBytes, { encoding: 'utf8', flag: 'wx' });
+    writeEffect.state = 'completed';
+
+    const renameEffect: LedgerEntry = {
+      effectId: `${runId}:publish-report`,
+      kind: 'rename-file',
+      target: manifest.output.reportPath,
+      state: 'attempted',
+      expectedSha256: expectedReportHash,
+      observedSha256: null,
+      errorCode: null,
+    };
+    ledger.push(renameEffect);
+    await rename(temporaryPath, reportPath);
+    renameEffect.state = 'completed';
+    emit('write-artifact', 'completed', { bytes: Buffer.byteLength(reportBytes), sha256: expectedReportHash });
+
+    emit('verify-artifact', 'started', {});
+    await access(reportPath, fsConstants.R_OK);
+    const observedBytes = await readFile(reportPath);
+    const observedHash = sha256(observedBytes);
+    const observedReport = JSON.parse(observedBytes.toString('utf8')) as { runId?: unknown };
+    if (observedHash !== expectedReportHash || observedReport.runId !== runId) {
+      throw new CliFailure('artifact', 'ARTIFACT_VERIFICATION_FAILED', 'Artifact Hash或runId不匹配', 4);
+    }
+    writeEffect.state = 'verified';
+    writeEffect.observedSha256 = observedHash;
+    renameEffect.state = 'verified';
+    renameEffect.observedSha256 = observedHash;
+    emit('verify-artifact', 'completed', { readable: true, sha256: observedHash });
+
+    const lockfilePath = resolve(manifestDirectory, '../../pnpm-lock.yaml');
+    const bundle = {
+      schemaVersion: 1,
+      runId,
+      status: 'succeeded',
+      manifest: {
+        sha256: sha256(canonicalize(manifest)),
+        effectiveConfigSha256: sha256(canonicalize(effectiveConfig)),
+      },
+      executionIdentity: {
+        protocolVersion: 1,
+        node: process.version,
+        platform: process.platform,
+        architecture: process.arch,
+        sourceIdentity: process.env.SOURCE_IDENTITY ?? 'unverified',
+        lockfileSha256: await optionalFileHash(lockfilePath),
+      },
+      trace,
+      ledger,
+      artifact: {
+        path: manifest.output.reportPath,
+        mediaType: 'application/json',
+        bytes: observedBytes.length,
+        sha256: observedHash,
+        readable: true,
+        runId,
+      },
+      assertions: {
+        allDeclaredInputsProcessed: processed === manifest.inputs.length,
+        minimumProcessedReached: processed >= manifest.execution.minimumProcessed,
+        resultIdentityIsUnique: new Set(itemResults.map((item) => item.inputPath)).size === manifest.inputs.length,
+        artifactBelongsToRun: observedReport.runId === runId,
+      },
+    };
+    await writeFile(bundlePath, canonicalize(bundle), 'utf8');
+
+    process.stdout.write(`${JSON.stringify({
+      status: 'succeeded',
+      runId,
+      processed,
+      passed: processed,
+      failed: 0,
+      artifact: bundle.artifact,
+      evidenceBundlePath: manifest.output.reportPath + '.evidence.json',
+    })}\n`);
+    return 0;
+  } catch (error) {
+    const failure = error instanceof CliFailure
+      ? error
+      : new CliFailure('internal', 'UNEXPECTED_ERROR', '发生未分类内部错误', 5);
+    process.stderr.write(`[${failure.code}] ${failure.message}\n`);
+    process.stdout.write(`${JSON.stringify({
+      status: 'failed',
+      runId,
+      phase: failure.phase,
+      code: failure.code,
+      message: failure.message,
+      processed,
+      evidenceBundlePath: bundlePath,
+    })}\n`);
+    return failure.exitCode;
+  }
+}
+
+const manifestPath = process.argv[2];
+if (!manifestPath) {
+  process.stderr.write('用法: node evidence-cli.js <manifest.json>\n');
+  process.exitCode = 2;
+} else {
+  process.exitCode = await main(manifestPath);
+}
+```
+
+这段实现仍有一个有意保留的边界：失败发生时，它会向 stdout 返回失败 Result，但不会保证失败 Bundle 已经持久化。若课程产物要进入长期流水线，应在 `catch` 中以“尽力而为”的方式写失败 Bundle，并将“写失败证据也失败”记录为第二层错误。不能为了保住诊断文件而把原始失败覆盖掉。
+
+## 11. 验证 Artifact：存在只是第一关
+
+一次完整验证按以下顺序执行：
+
+<Steps>
+1. 检查最终路径存在，而且是期望文件类型；拒绝目录、设备文件和越界链接。
+2. 以只读方式打开文件，确认当前进程确实有读取权限。
+3. 检查字节数边界，避免空文件或异常大的输出被继续消费。
+4. 读取全部字节并计算 Hash，与写入前预期值比较。
+5. 按媒体类型解析；JSON 需要通过 Result Schema，而不是只要 `JSON.parse` 成功。
+6. 检查 `runId`、输入 Hash 列表、处理数量和完成状态属于本次运行。
+7. 将验证事实写回 Ledger 与 Bundle，只有此后才允许 Exit Code 0。
+</Steps>
+
+“文件存在且可读”也不是永久事实。验证结束后文件仍可能被修改。因此下游消费时应再次按 Bundle 中的 Hash 验证，或把产物放入内容寻址、不可变的存储位置。Evidence Bundle 的价值在于提供比较依据，而不是消除所有竞态。
+
+## 12. Golden Test：比较稳定语义，不比较环境噪声
+
+<Term id="golden-test" /> 保存一份经过审核的期望输出。它适合检测 Schema、排序、错误代码或报告结构的意外变化，但很容易因时间戳、绝对路径、平台版本而变成脆弱测试。
+
+本课对报告本身做 Golden Test，对完整 Bundle 做结构断言：
+
+```ts title="examples/evidence-cli.test.ts"
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+
+async function runCli(manifest: string): Promise<{ code: number; stdout: string; stderr: string }> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['dist/evidence-cli.js', manifest], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, SOURCE_IDENTITY: 'fixture-source-v1' },
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => resolve({ code: code ?? 5, stdout, stderr }));
+  });
+}
+
+const execution = await runCli('fixtures/happy/manifest.json');
+assert.equal(execution.code, 0);
+assert.equal(execution.stderr, '');
+
+const cliResult = JSON.parse(execution.stdout) as {
+  status: 'succeeded';
+  runId: string;
+  processed: number;
+  passed: number;
+  failed: 0;
+  artifact: {
+    path: string;
+    mediaType: 'application/json';
+    bytes: number;
+    sha256: string;
+    readable: boolean;
+    runId: string;
+  };
+  evidenceBundlePath: string;
+};
+assert.equal(cliResult.status, 'succeeded');
+assert.equal(cliResult.runId, 'fixture-run-001');
+assert.equal(cliResult.processed, 2);
+assert.equal(cliResult.passed, 2);
+assert.equal(cliResult.failed, 0);
+assert.equal(cliResult.artifact.path, './output/report.json');
+assert.equal(cliResult.artifact.mediaType, 'application/json');
+assert.ok(cliResult.artifact.bytes > 0);
+assert.match(cliResult.artifact.sha256, /^[a-f0-9]{64}$/);
+assert.equal(cliResult.artifact.readable, true);
+assert.equal(cliResult.artifact.runId, 'fixture-run-001');
+assert.equal(cliResult.evidenceBundlePath, './output/report.json.evidence.json');
+
+const actualReport = await readFile('fixtures/happy/output/report.json', 'utf8');
+const goldenReport = await readFile('fixtures/happy/golden/report.json', 'utf8');
+assert.equal(actualReport, goldenReport);
+```
+
+上例已经逐项断言 `artifact` 的稳定协议字段，没有用快照把平台相关路径吞进去。好的 Golden Test 先明确哪些变化应当让测试失败；如果每次升级 Node 都要无脑更新整份 Snapshot，它就失去了审核信号。
+
+## 13. 失败优先报告
+
+失败报告首先写已经确认的最小事实，然后写推导，再列待验证项。推荐结构：
+
+```json
+{
+  "status": "failed",
+  "phase": "artifact",
+  "code": "ARTIFACT_VERIFICATION_FAILED",
+  "facts": [
+    "预期报告sha256为abc…",
+    "最终路径可读取",
+    "读取到的sha256为def…",
+    "Artifact中的runId与当前runId相同"
+  ],
+  "conclusions": [
+    {
+      "rule": "observedHash != expectedHash",
+      "result": "最终Artifact字节不等于Runner准备发布的字节"
+    }
+  ],
+  "hypotheses": [
+    "重命名后有另一个进程改写文件",
+    "目标路径位于具有额外转换行为的存储层"
+  ],
+  "nextChecks": [
+    "检查Ledger中rename完成后的文件元数据",
+    "在隔离临时目录重放同一Manifest"
+  ]
+}
+```
+
+不要写“磁盘损坏导致 Hash 不一致”，除非已经有文件系统或硬件证据。也不要为了简洁只保留异常堆栈；堆栈说明代码在哪里抛错，不说明业务断言为什么失败。
+
+## 14. 故障诊断矩阵
+
+| 注入故障 | 表面现象 | 必须失败的断言 | 推荐错误码 | 恢复动作 |
+| --- | --- | --- | --- | --- |
+| Manifest 声明 2 项但目录缺 1 项 | 只处理到一个输入 | 每个声明输入都完成 Hash 验证 | `ENOENT` 映射为 `INPUT_NOT_FOUND` | 修复输入同步或更新 Manifest 后使用新 runId 重放 |
+| 输入内容被修改 | 路径仍存在，JSON 也能解析 | 观察 Hash 等于 Manifest Hash | `INPUT_HASH_MISMATCH` | 确认应使用旧内容还是生成新 Manifest |
+| 扫描逻辑返回空集合 | 命令可能很快退出 0 | `processed >= minimumProcessed` | `INSUFFICIENT_EXECUTION` | 修复发现规则；不能复用旧 Artifact |
+| 写入完成后文件被截断 | 路径存在 | 可读、可解析、Hash 匹配、runId 匹配 | `ARTIFACT_VERIFICATION_FAILED` | 保留临时文件和 Ledger，重新发布或隔离写入者 |
+| 旧 Artifact 残留 | 下游看到合法 JSON | Artifact runId 等于本次 runId | `STALE_ARTIFACT` | 在运行前隔离输出路径；不要把删除失败当成功 |
+| Golden 文件与协议同步变更 | 大量 Snapshot 差异 | Schema 与明确稳定字段 | `GOLDEN_MISMATCH` | 审核协议变更后再更新 Golden，不自动覆盖 |
+| Bundle 写入失败 | 主报告可能正确 | Evidence Bundle 本身可读取 | `EVIDENCE_WRITE_FAILED` | 将任务标为失败或明确降级；不能声称可复查完成 |
+
+这张表的重点不是给所有系统统一错误码，而是让每个失败都有“检测依据—分类—恢复动作”。如果恢复动作只是“重试”，就还没有处理未知结果、旧产物和重复副作用。
+
+## 15. 三个故障注入实验
+
+### 实验一：Exit Code 0，但目标步骤没有运行
+
+目标：证明“进程成功”不能替代执行完整性断言。
+
+1. 复制正常 fixture；
+2. 暂时把处理循环改成 `for (const declared of manifest.inputs.slice(0, 0))`；
+3. 保持代码在循环后生成空报告；
+4. 运行 CLI；
+5. 观察 `processed !== manifest.inputs.length` 和 `processed < minimumProcessed` 是否把 Exit Code 改为 3；
+6. 检查 stdout 的失败 Result 是否包含 `INSUFFICIENT_EXECUTION`；
+7. 检查输出目录中即使有旧报告也没有被当作本次成功证据。
+
+验收：只要处理数为零，命令必须失败；删除 `minimumProcessed` 断言后测试应能稳定暴露回归。
+
+### 实验二：Artifact 存在，但不可相信
+
+目标：区分“存在”“可读取”“属于本次运行”和“内容相同”。
+
+1. 完成一次正常运行；
+2. 保留 `report.json`；
+3. 新运行使用不同 runId，并在 `rename` 前注入错误使发布中止；
+4. 错误实现若只检查 `report.json` 存在，会把旧文件当成功；
+5. 正确实现应检查 `observedReport.runId !== currentRunId`；
+6. 再把当前报告最后一个字节改掉，验证 Hash 断言失败；
+7. 把文件权限改为当前进程不可读，验证可读性错误被分类。
+
+验收：三个变体分别留下稳定错误，不允许返回成功 Result。
+
+### 实验三：输入路径相同，内容身份不同
+
+目标：证明路径不是输入身份。
+
+1. 根据 `alpha.json` 生成 Manifest Hash；
+2. 保持文件名不变，修改一个字段值；
+3. 运行 CLI；
+4. 验证在进入业务 `validate` 步骤前就以 `INPUT_HASH_MISMATCH` 失败；
+5. Trace 中可以有 `verify-input.started`，不能有该输入的 `validate.completed`；
+6. 重新生成 Manifest 后再运行，确认新结果 Bundle 中的 Manifest Hash 也变化。
+
+验收：内容变化不能被 Golden Report 或旧 Bundle 隐藏。
+
+### 实验四：副作用完成，Ledger 尚未更新时崩溃
+
+目标：理解 Ledger 状态不是现实世界的唯一真相。
+
+1. 在 `rename` 成功后、`renameEffect.state = 'completed'` 前注入进程退出；
+2. 重启恢复命令；
+3. 恢复命令读取目标文件，检查 runId 与预期 Hash；
+4. 若匹配，把恢复记录写为 `observed-completed`；若不匹配，隔离文件；
+5. 不要盲目再次写入，除非写入协议本身幂等。
+
+验收：恢复逻辑通过观察补全状态，而不是只相信内存中的最后一个赋值。
+
+## 16. 最小 Evidence Bundle 的目录结构
+
+一个可以提交到 CI Artifact 或本地归档的最小目录：
+
+```text
+evidence/run-20260721-001/
+├── manifest.json
+├── effective-config.json
+├── result.json
+├── trace.ndjson
+├── ledger.json
+├── artifacts.json
+├── execution-identity.json
+└── report.json
+```
+
+目录中的每个文件都有角色：
+
+- `manifest.json`：声明输入和目标；
+- `effective-config.json`：记录解析默认值后的配置；
+- `result.json`：调用方读取的终态；
+- `trace.ndjson`：按序追加的执行记录；
+- `ledger.json`：副作用计划、尝试、完成和验证状态；
+- `artifacts.json`：产物路径、媒体类型、大小、Hash 和所属 runId；
+- `execution-identity.json`：协议、实现、运行时与依赖身份；
+- `report.json`：本任务的业务产物。
+
+Bundle 也要有保留策略。它可能包含输入路径、错误片段或内部版本身份；公开网站示例只能使用抽象数据。生产环境要对字段分类、最小化采集、设置访问边界与删除期限，不能因为“为了可复现”就永久保存所有原始内容。
+
+## 17. 决策表：证据做到哪一层
+
+| 任务类型 | 最低证据 | 什么时候还不够 |
+| --- | --- | --- |
+| 本地纯函数转换 | 输入 Hash、有效配置、实现身份、结果 Hash、Golden Test | 涉及平台相关数值或并行非确定性时 |
+| 写本地 Artifact | 上述证据 + 临时写入、可读性、Schema、runId、最终 Hash | 有多个进程竞争同一路径时 |
+| 调用远程只读 API | 请求摘要、服务版本或响应身份、缓存策略、响应 Hash | 远程结果随时间变化且无法固定快照时 |
+| 触发远程副作用 | 幂等键、请求身份、未知结果状态、Ledger、对账与补偿 | 外部系统不提供查询或幂等语义时 |
+| ML/LLM 实验 | 数据集身份、切分、种子、代码/依赖、指标脚本、原始预测 | 硬件内核、供应商模型或数据版本不可固定时 |
+| Agent 长任务 | 状态快照、工具契约、每步 Trace、预算、取消、Artifact、回放夹具 | 工具访问真实世界且副作用不可逆时 |
+
+“证据越多越好”不是决策原则。应从要复查的结论、风险与恢复成本反推最小证据。收集不能解释任何断言的字段只会增加存储和泄漏面。
+
+## 18. 验收条件
+
+课程产物只有同时满足以下条件才算完成：
+
+- □ Manifest Schema 能拒绝空输入、重复路径、绝对路径、无效 Hash 和未知版本；
+- □ 每个输入在读取后先核对字节 Hash，再进入业务验证；
+- □ 有效配置和执行身份进入 Bundle；
+- □ stdout 恰好输出一个 Structured Result，stderr 只承载诊断；
+- □ Exit Code 0 只在输入完整、业务断言通过、Artifact 验证完成后出现；
+- □ Trace 能证明每个声明输入都经历关键步骤；
+- □ Ledger 能区分计划、尝试、完成、验证与失败；
+- □ Artifact 经过存在、类型、可读性、大小、Schema、runId 与 Hash 验证；
+- □ Golden Test 去除了明确的环境噪声，但保留协议变化信号；
+- □ 至少完成三个故障注入实验，并保存失败 Result；
+- □ 报告把事实、推导和假设分层，不把猜测写成根因；
+- □ Bundle 中没有密钥、Cookie、真实账号数据或本地绝对仓库路径。
+
+## 19. 学完后应该能回答什么
+
+1. 为什么 Exit Code 0 不能证明测试或验证步骤真的运行？
+2. Manifest 中路径、原始字节 Hash 和有效配置 Hash 各证明什么？
+3. Seed 能控制哪些不确定性，不能控制哪些？
+4. stdout、stderr、Structured Result 和 Exit Code 应如何分工？
+5. 怎样证明一个 Artifact 是本次运行新生成、可读取且内容正确的？
+6. Trace 与普通日志的区别是什么？哪些字段不应进入公开 Trace？
+7. Side-effect Ledger 为什么需要 `verified`，而不只需要 `completed`？
+8. 为什么副作用完成后崩溃会让 Ledger 与现实不一致？恢复时应相信什么？
+9. Golden Test 应比较哪些稳定语义，为什么不应整包 Snapshot 所有环境字段？
+10. 如何把当前事实、推导结论与未验证假设写成失败优先报告？
+11. 一个最小 Evidence Bundle 至少包含哪些文件？
+12. 在调用远程副作用时，Evidence-first 还需要增加哪些幂等、对账或补偿机制？
+
+## 20. 来源边界
+
+- Node.js Process 文档用于核对进程退出状态、标准流等运行时接口；课程定义的 Exit Code 分类是本项目协议，不是 Node 强制标准。
+- Reproducible Builds 材料用于理解“相同来源在受控环境中得到可比较产物”的目标；本课 CLI 的可复现性边界仅覆盖声明的输入、配置与实现身份。
+- SLSA Provenance 用于理解构建来源和材料身份应如何结构化；本地 Evidence Bundle 不等于经过认证的 SLSA 等级或第三方保证。
+- 本课所有 Hash、路径、runId 和 Artifact 都是抽象教学数据。没有给出性能数字，也没有声称文件重命名能为跨文件系统或远程存储提供通用原子性。

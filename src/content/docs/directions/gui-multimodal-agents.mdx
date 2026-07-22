@@ -1,0 +1,232 @@
+---
+title: GUI、OS 与多模态 Agent
+description: 把视觉或可访问树观察映射到受限动作，并用执行后状态和任务断言验证成功。
+moduleId: direction-gui-multimodal-agents
+stage: directions
+prerequisites:
+  - production-capstone
+outcomes:
+  - 设计可验证、可重置、受权限控制的GUI动作空间
+  - 区分视觉观察、动作执行、后置条件、重试与回滚
+estimatedMinutes: 45
+difficulty: advanced
+careerDirections:
+  - gui-multimodal-agents
+sourceIds:
+  - webdriver2
+  - webarena-paper
+  - osworld-paper
+  - wcag-22
+  - nist-ai-600-1
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import ModulePrerequisites from '../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="direction-gui-multimodal-agents" client:load />
+
+<ModulePrerequisites moduleId="direction-gui-multimodal-agents" />
+
+## 这条方向实际解决什么问题
+
+GUI、OS与多模态Agent把屏幕、DOM、可访问树、窗口状态或图像观察转换成受限动作，并验证动作后的真实状态。它不是“模型会看截图并点击”这么简单。坐标会漂移，窗口可能被遮挡，控件会异步加载，点击可能触发不可逆操作，截图相似也不代表任务完成。
+
+典型问题：
+
+- 视觉模型识别到按钮，但坐标属于旧截图；
+- DOM元素存在但被覆盖或不可交互；
+- 点击成功却打开错误窗口；
+- 文本输入因焦点错误写入别处；
+- UI显示成功Toast，后端状态没有变化；
+- 重试一次点击，造成双重提交；
+- Agent跨应用读取不应访问的窗口或剪贴板；
+- Benchmark环境没有可靠重置，后一个Case继承前一个状态；
+- 用截图像素相似度判成功，实际数据错误。
+
+方向目标：每一步都有Observation ID、Action Contract、Capability、Postcondition和恢复策略；评测环境可重置，成功由任务状态断言而不是视觉印象决定。
+
+## 所需共同前置模块
+
+Agent状态/工具、安全评测和生产综合项目是核心。网络与数据可靠性用于处理异步UI、重复动作和远端提交；ML实验用于设计基准与误差切片；可访问性知识帮助使用语义化Observation，而不是只依赖像素。
+
+## 典型系统边界
+
+```text
+Environment
+  ├─ DOM / accessibility tree
+  ├─ screenshot / OCR-free visual features
+  ├─ window/process state
+  └─ application task state
+       ↓
+Observer → normalized Observation
+       ↓
+Planner Proposal
+       ↓
+Policy Gate ── app/window/action/data scope
+       ↓
+Action Executor
+       ↓
+Postcondition Observer → verified / failed / unknown
+       ↓
+State / Trace / Replay Artifact
+```
+
+Observation与Action都要版本绑定：`proposal.observationId`。执行前若界面版本已变化，应重新观察而不是使用陈旧坐标。
+
+## 必会机制
+
+### 1. 多通道Observation
+
+优先组合：
+
+- DOM/可访问树：角色、名称、状态、层级；
+- Screenshot：视觉位置、Canvas、非语义内容；
+- Window State：前台窗口、尺寸、DPI、缩放；
+- App State：测试夹具可查询的后端事实。
+
+不要把全部信息压成截图。语义树更稳定也更可访问；视觉通道补充没有结构的内容。
+
+### 2. Observation Schema
+
+```ts
+interface GuiObservation {
+  observationId: string;
+  environmentVersion: number;
+  activeApplication: string;
+  viewport: { width: number; height: number; scale: number };
+  nodes: Array<{
+    nodeId: string;
+    role: string;
+    name: string;
+    bounds: [number, number, number, number] | null;
+    enabled: boolean;
+    visible: boolean;
+    value: string | null;
+  }>;
+  screenshotSha256: string | null;
+}
+```
+
+敏感文本要脱敏或排除，不能默认把整个桌面送入模型。
+
+### 3. 受限Action Space
+
+```text
+focus(nodeId)
+click(nodeId, expectedObservationId)
+type(nodeId, text, replaceMode)
+select(nodeId, option)
+scroll(containerId, direction, amount)
+waitFor(predicate, deadline)
+```
+
+优先节点身份而不是裸坐标。确需坐标点击时，限定应用/窗口/区域，并执行前重新验证窗口与Observation。
+
+### 4. Postcondition
+
+动作返回“已发送”不等于成功。验证：
+
+```text
+点击提交 → 表单状态submitted + 后端Fixture新增一条记录
+打开窗口 → activeWindowId匹配 + 标题/控件存在
+输入文本 → node.value精确匹配
+删除 → 项目不再存在 + 操作日志出现一次
+```
+
+Toast只能作辅助证据。
+
+### 5. 幂等与重复动作
+
+提交按钮可能无幂等性。Action Command要带业务Token，应用Fixture支持查询。超时后先观察：按钮是否禁用、记录是否创建、URL/状态是否变化，再决定重试。
+
+### 6. 权限与确认
+
+Capability按应用、窗口、动作和数据Scope授予。读取屏幕不等于允许点击；点击不等于允许提交；删除、发送和购买类高影响动作要求确认。本课程作品使用抽象本地界面，不涉及真实账号或交易。
+
+### 7. Resettable Environment
+
+每个Case从已知Snapshot开始：固定数据库、窗口尺寸、Locale、时间、网络Fixture。结束后验证清理。重置失败为Invalid，不算Agent Fail。
+
+### 8. 评测
+
+成功断言依赖环境状态：数据库Fixture、DOM值、文件Hash、应用事件。记录步骤数、重复动作、无效动作、Handoff、终态。截图用于调试，不作为唯一Oracle。
+
+### 9. 多模态误差切片
+
+按：分辨率、缩放、主题、遮挡、滚动、控件角色、文本长度、视觉相似控件、语言。每个切片带分母。不要只展示最好录屏。
+
+## 可验证作品建议
+
+构建一个本地“任务面板”GUI Lab：
+
+- 固定Web应用，有列表、表单、确认对话框和异步状态；
+- Observer输出DOM/可访问树与可选Screenshot Hash；
+- Action Executor只支持节点级动作；
+- Agent在Fixture Planner下完成创建、编辑、取消任务；
+- 注入遮挡、旧Observation、重复点击、异步延迟和权限拒绝；
+- Postcondition读应用Fixture API；
+- 每个Case可重置；
+- 支持键盘等价动作和Reduced Motion。
+
+## 作品需要留下哪些 Evidence
+
+```text
+environment-snapshot.json
+observation-schema.json
+action-contracts.json
+capability-policy.json
+case-fixtures/
+traces/<case>.ndjson
+screenshots/<observationId>.png-or-hash
+postcondition-results.json
+reset-validation.json
+fault-injection-report.json
+slice-metrics.json
+```
+
+截图若包含测试Canary或敏感区域，应使用合成数据并控制公开范围。
+
+## 常见“看起来会、实际不会”的缺口
+
+| 看起来会 | 实际缺口 |
+| --- | --- |
+| 能看图点击 | 不绑定Observation，坐标陈旧 |
+| 能控制浏览器 | 使用任意脚本/选择器，无动作权限边界 |
+| 任务录屏成功 | 环境不可重置，无法重复评测 |
+| 截图看起来对 | 后端状态或文件实际错误 |
+| 失败就再点一次 | 提交非幂等，产生重复副作用 |
+| 能跨应用操作 | 窗口/剪贴板/文件Scope过宽 |
+| Benchmark分数高 | 只测单一分辨率与无干扰路径 |
+| 有视觉Trace | 没有结构化Action、Postcondition和错误码 |
+
+## 学习顺序
+
+1. 在固定Web Fixture上实现环境Snapshot与Reset。
+2. 用DOM/可访问树建Observation Schema。
+3. 实现受限节点级Action与Postcondition。
+4. 加状态机、预算、取消和重复检测。
+5. 加截图通道和视觉缺口，不替代语义通道。
+6. 加权限、确认与敏感区域遮蔽。
+7. 加陈旧Observation、遮挡、延迟、重复点击故障。
+8. 做执行式评测与切片报告。
+9. 再扩展到多窗口或OS环境。
+
+## 抽象岗位能力映射
+
+| 能力 | 可观察产物 |
+| --- | --- |
+| 多模态Observation | DOM/A11y/Screenshot融合Schema |
+| 自动化执行 | 受限Action、状态同步和Postcondition |
+| Agent Runtime | Observation绑定、预算、取消、循环检测 |
+| 安全 | App/Window/Data Capability与确认 |
+| 基准工程 | Resettable Environment、Invalid分类、切片 |
+| 可靠性 | 重复动作、Unknown Outcome、回滚/Handoff |
+| 可访问性 | 语义节点、键盘路径与非视觉状态验证 |
+
+<Aside type="tip" title="方向验收线">
+在Agent点击提交后立即丢失响应，再改变窗口焦点并重投同一动作。作品必须先查询真实后置条件，不能在新窗口再次提交；这比一次顺利录屏更能证明工程能力。
+</Aside>

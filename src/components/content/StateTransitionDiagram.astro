@@ -1,0 +1,134 @@
+---
+---
+
+<figure class="state-transition" aria-labelledby="state-transition-title state-transition-caption">
+  <div class="state-transition__title">
+    <p id="state-transition-title">命令、事件、状态与不变量</p>
+    <span>转换函数是唯一写入口</span>
+  </div>
+
+  <div class="state-transition__lane">
+    <section>
+      <span>COMMAND</span>
+      <strong>StartTask</strong>
+      <small>表达意图；可能被拒绝</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section class="state-transition__gate">
+      <span>GUARD</span>
+      <strong>state = queued</strong>
+      <small>版本、权限、前置条件</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section>
+      <span>EVENT</span>
+      <strong>TaskStarted</strong>
+      <small>已经提交的事实</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section>
+      <span>STATE</span>
+      <strong>running</strong>
+      <small>由事件折叠得到</small>
+    </section>
+  </div>
+
+  <div class="state-transition__checks">
+    <section>
+      <span>INVARIANT</span>
+      <strong>终态不可重新启动</strong>
+      <small>`completed + StartTask` 必须返回可分类拒绝，而不是偷偷改回 running。</small>
+    </section>
+    <section>
+      <span>CONCURRENCY</span>
+      <strong>expectedVersion = 7</strong>
+      <small>只有当前版本仍为 7 时才能提交事件；否则重新读取并重算命令。</small>
+    </section>
+    <section>
+      <span>EVIDENCE</span>
+      <strong>eventId + previous + next</strong>
+      <small>记录转换前后状态、命令身份、事件身份与拒绝原因。</small>
+    </section>
+  </div>
+
+  <figcaption id="state-transition-caption">
+    命令不是事实，事件不是任意消息，状态也不是可随处修改的字段。把写入集中到转换函数，才能测试非法路径和并发冲突。
+  </figcaption>
+</figure>
+
+<style>
+  .state-transition {
+    display: grid;
+    gap: 0.85rem;
+    margin-block: 1.5rem;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.875rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 3%, var(--sl-color-bg));
+  }
+
+  .state-transition__title {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 1rem;
+  }
+
+  .state-transition__title p { margin: 0; font-size: 1rem; font-weight: 750; }
+  .state-transition__title span,
+  .state-transition section > span {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.875rem;
+    font-weight: 750;
+  }
+
+  .state-transition__lane {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, auto));
+    align-items: stretch;
+    gap: 0.45rem;
+  }
+
+  .state-transition__lane section,
+  .state-transition__checks section {
+    display: grid;
+    align-content: start;
+    gap: 0.25rem;
+    min-width: 0;
+    padding: 0.75rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.6rem;
+    background: var(--sl-color-bg);
+  }
+
+  .state-transition__lane b {
+    align-self: center;
+    color: var(--sl-color-accent-high);
+    font-size: 1.2rem;
+  }
+
+  .state-transition__lane strong,
+  .state-transition__checks strong { font-size: 0.875rem; }
+  .state-transition small,
+  .state-transition figcaption { color: var(--sl-color-gray-2); font-size: 0.875rem; line-height: 1.5; }
+  .state-transition__gate { border-style: dashed !important; }
+
+  .state-transition__checks {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.55rem;
+  }
+
+  .state-transition figcaption { padding-top: 0.875rem; border-top: 1px dashed var(--sl-color-gray-5); }
+
+  @media (max-width: 58rem) {
+    .state-transition__lane { grid-template-columns: 1fr; }
+    .state-transition__lane b { justify-self: center; transform: rotate(90deg); }
+    .state-transition__checks { grid-template-columns: 1fr; }
+  }
+
+  @media (max-width: 34rem) {
+    .state-transition__title { display: grid; }
+  }
+</style>

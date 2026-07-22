@@ -1,0 +1,230 @@
+---
+title: Agent 应用与产品工程
+description: 把长任务状态、流式反馈、取消、恢复和人工接管设计成用户能理解、能控制、能验证的产品边界。
+moduleId: direction-agent-applications
+stage: directions
+prerequisites:
+  - production-capstone
+outcomes:
+  - 设计覆盖正常、等待、失败、取消和接管的交互状态模型
+  - 用执行证据验证用户可控性，而不是只演示一次成功对话
+estimatedMinutes: 45
+difficulty: advanced
+careerDirections:
+  - agent-applications
+sourceIds:
+  - wcag-22
+  - http-semantics
+  - mdn-sse
+  - opentelemetry-spec
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import ModulePrerequisites from '../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="direction-agent-applications" client:load />
+
+<ModulePrerequisites moduleId="direction-agent-applications" />
+
+## 这条方向实际解决什么问题
+
+Agent 应用工程解决的不是“做一个聊天框”。它把一个可能持续数分钟、会调用工具、会等待确认、会部分失败的后台任务，转换成用户能够理解和控制的交互。
+
+用户必须看见：系统接受了什么目标、当前处于哪个可验证阶段、哪些动作正在等待权限、取消是否真的生效、失败后哪些结果仍可用、继续执行会产生什么副作用。只显示“正在思考”或不断追加自然语言文本，无法承担这些职责。
+
+典型问题：
+
+- 请求已经提交，但浏览器断线后用户不知道任务是否还在运行；
+- 模型要求确认高影响动作，界面只提供一个含义模糊的“继续”按钮；
+- 工具失败后界面重新开始整个任务，重复了已完成副作用；
+- 用户取消，前端停止动画，但 Worker 仍在后台执行；
+- 最终答案有引用，界面却不能定位到支持具体 Claim 的原文；
+- 屏幕阅读器只听到不断变化的日志，无法知道任务终态；
+- 移动端的事件流或长 Tool 参数造成横向溢出。
+
+这条方向的核心产品能力是“可控自动化”：模型可以帮助选择动作，但用户和程序始终掌握状态、权限、停止与恢复边界。
+
+## 所需共同前置模块
+
+共同底座不是可选阅读：
+
+| 前置 | 在应用层直接使用的机制 |
+| --- | --- |
+| 可复现与证据 | 把 UI 展示连接到真实 Result、Trace 和 Artifact，而不是前端假状态 |
+| 状态、事件与复杂度 | 设计 `queued/running/waiting/cancelling/terminal` 等交互状态和非法转换 |
+| 网络、流式与取消 | SSE 续传、Event ID、断线重连、Deadline 与 Cancellation |
+| 事务、缓存与队列 | 避免重复提交；解释后端旧状态、消息重投与部分失败 |
+| LLM 与检索 | 展示上下文、Citation 和无答案边界 |
+| Agent 状态与工具 | 展示 Proposal、Capability、确认和 Tool Outcome |
+| 安全评测 | 把恶意内容、越权动作和正常任务一起做回归测试 |
+| 生产化综合项目 | 将产品交互接入真实状态机、SLO、降级和人工接管 |
+
+## 典型系统边界
+
+```text
+User Intent
+  ↓
+Client State Machine
+  ↓ command + idempotency key
+Task API ── authoritative state/event stream
+  ↓
+Agent Runner ── proposal / policy / tool / artifact
+  ↓
+User-visible Result + Citation + Recovery Actions
+```
+
+客户端保存的是“观察到的版本”，不是权威状态。断线重连后按 Event ID 补拉；事件版本低于当前视图时忽略，出现 Gap 时重新查询快照。UI 不能根据动画结束或 HTTP 连接关闭推导 Task 完成。
+
+前端可建模：
+
+```ts
+interface TaskViewState {
+  taskId: string;
+  observedVersion: number;
+  status:
+    | 'submitting'
+    | 'queued'
+    | 'running'
+    | 'waiting_confirmation'
+    | 'cancelling'
+    | 'needs_human'
+    | 'completed'
+    | 'no_answer'
+    | 'failed'
+    | 'cancelled';
+  stage: string | null;
+  pendingConfirmation: ConfirmationView | null;
+  recoverableActions: string[];
+  terminalArtifact: ArtifactView | null;
+}
+```
+
+## 必会机制
+
+### 1. 命令与观察分离
+
+“提交”“取消”“确认”是 Command；事件流和查询响应是 Observation。点击取消后界面先显示“取消请求已发送”，只有权威事件进入 `cancelled` 才显示“已取消”。若进入 `needs_human`，界面说明存在未确认副作用。
+
+### 2. 流式状态，而不是流式文案
+
+事件应是结构化类型：
+
+```text
+task.queued
+task.stage_changed
+tool.confirmation_required
+tool.completed
+artifact.verified
+task.completed
+task.failed
+```
+
+自然语言进度是派生展示。客户端能按 `taskId/version/eventId` 去重与续传。
+
+### 3. 可解释确认
+
+确认面板至少显示：工具、资源 Scope、参数摘要、是否有副作用、是否可撤回、有效期限、确认后系统下一步。确认 Token 绑定 Proposal Hash；参数变化后旧确认失效。
+
+### 4. 取消与恢复
+
+取消控件必须有状态：可取消、取消中、已取消、无法确认。恢复不是“再试一次”按钮，而是选择明确动作：从上次安全 Checkpoint 继续、只重试失败工具、重新检索、转人工、放弃剩余步骤。
+
+### 5. Citation 交互
+
+每个 Claim 的引用应能展开到文档版本、Chunk 和支持 Span。引用失效时显示不可验证，不自动跳到文档首页。无答案终态清楚解释“在可访问资料中没有足够证据”。
+
+### 6. 可访问性
+
+关键状态用文字与语义元素表达，不只靠颜色和动画。实时区域要节制，避免每个 Token 都触发屏幕阅读器；把阶段变化和终态放入适当 `aria-live` 区域。所有确认、取消、引用展开与恢复控件支持键盘；焦点在状态变化后移动到可预期位置。尊重 `prefers-reduced-motion`。
+
+### 7. 乐观 UI 的边界
+
+可以立即显示用户提交内容，但不能提前显示“任务已创建”或“取消完成”。业务状态以服务端版本为准。重复提交使用同一个 Idempotency Key，页面刷新后仍能恢复 Task ID。
+
+## 可验证作品建议
+
+构建一个“公开资料核查工作台”：
+
+- 提交一个问题；
+- 显示 Task 状态与离散 Stage；
+- 通过 SSE 流式接收事件，支持断线续传；
+- 展示检索 Evidence 和 Claim Citation；
+- 至少一个工具需要用户确认；
+- 支持取消、失败恢复、无答案和人工接管；
+- 所有数据来自固定 Fixture 或本地模拟服务，不调用真实付费 API；
+- 提供键盘可操作和窄屏布局。
+
+不要把作品重点放在视觉特效。状态、Evidence 与恢复动作应在关闭动画后仍清楚。
+
+## 作品需要留下哪些 Evidence
+
+```text
+interaction-state-machine.json
+sample-event-stream.ndjson
+e2e-normal-path.trace.json
+e2e-disconnect-replay.trace.json
+e2e-cancellation.trace.json
+confirmation-proposal-and-token.json
+citation-validation-report.json
+accessibility-check-results.json
+mobile-overflow-screenshots-or-measurements.json
+failure-matrix.md
+```
+
+关键 E2E 断言：
+
+- 同一 Event ID 不重复渲染；
+- 事件 Gap 触发快照重取；
+- 关闭浏览器连接不取消任务；
+- 点击取消后不会立即伪装终态；
+- 参数变化使旧确认不可用；
+- Tool Failure 后只提供协议允许的恢复动作；
+- completed 页面只有在 Artifact 验证后出现；
+- 无答案不显示无引用猜测；
+- 页面宽度不超过 viewport；
+- 键盘能完成提交、确认、取消和查看 Citation。
+
+## 常见“看起来会、实际不会”的缺口
+
+| 看起来会 | 实际缺口 |
+| --- | --- |
+| 能做聊天流式输出 | 不会 Event ID、续传、去重和终态协议 |
+| 有“停止生成”按钮 | 只停前端渲染，后台工具未取消或对账 |
+| 有工具确认弹窗 | 没显示资源和副作用，确认不绑定参数 |
+| 能展示思考步骤 | 没有权威 Run State，只有文案时间线 |
+| 有引用卡片 | 引用不到支持 Claim 的稳定 Span |
+| 失败后能重试 | 每次从头开始，可能重复副作用 |
+| UI 很顺滑 | 键盘、屏幕阅读器、Reduced Motion 和窄屏失败 |
+| 有历史对话 | 把对话历史误当长期记忆，没有 Scope、来源和撤销 |
+
+## 学习顺序
+
+1. 先画 Task/Client 两个状态机和事件协议。
+2. 用固定事件 Fixture 做纯前端渲染，覆盖全部终态。
+3. 接入 Idempotent Create、Query、Cancel API。
+4. 加 SSE 断线、Last Event ID、Gap 恢复。
+5. 加 Tool Confirmation 与 Proposal Hash。
+6. 加 Citation Span、无答案和 Artifact 验证展示。
+7. 加失败恢复和 Human Handoff。
+8. 做键盘、屏幕阅读器、Reduced Motion 与移动端验收。
+9. 最后接入真实 Runner 适配器，并保留 Fixture 模式用于回归。
+
+## 抽象岗位能力映射
+
+| 能力 | 可观察产物 |
+| --- | --- |
+| 复杂交互状态建模 | 状态图、转换表、非法事件测试 |
+| 流式协议工程 | SSE续传、去重、Gap恢复Trace |
+| 人机协作设计 | 确认、取消、恢复和Handoff协议 |
+| AI结果可核查性 | Claim-Citation UI与无答案路径 |
+| 前后端边界 | Command/Observation、Version和Idempotency |
+| 可访问性工程 | 键盘、语义、Live Region和窄屏测试 |
+| 可靠性与故障产品化 | 用户可行动错误、降级和恢复Evidence |
+
+<Aside type="tip" title="方向验收线">
+作品评审时，不先演示成功回答。先断网、重复提交、注入工具失败、取消任务并切到窄屏；系统仍能解释当前事实与安全下一步，才说明产品边界成立。
+</Aside>

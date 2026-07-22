@@ -1,0 +1,205 @@
+---
+title: 游戏 AI 与交互式叙事
+description: 把确定性世界状态、行为选择、规划、记忆和生成内容分层，保证可玩性、叙事约束和可回放性。
+moduleId: direction-game-ai-interactive-narrative
+stage: directions
+prerequisites:
+  - production-capstone
+outcomes:
+  - 区分世界模拟、决策、规划、记忆与生成内容的职责
+  - 用回放、断言和Fallback验证NPC行为与叙事边界
+estimatedMinutes: 45
+difficulty: advanced
+careerDirections:
+  - game-ai-interactive-narrative
+sourceIds:
+  - behavior-trees-book
+  - interactive-narrative-paper
+  - opentelemetry-spec
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import ModulePrerequisites from '../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="direction-game-ai-interactive-narrative" client:load />
+
+<ModulePrerequisites moduleId="direction-game-ai-interactive-narrative" />
+
+## 这条方向实际解决什么问题
+
+游戏AI与交互式叙事解决“角色如何在可玩世界规则内做出可解释、可重复、对玩家有响应的行为”。生成模型可以写对白、概括记忆或提出候选计划，但世界状态、物理规则、任务进度、资源消耗和不可逆结果应由确定性系统裁决。
+
+典型失败：
+
+- NPC对白声称拿到钥匙，世界状态没有钥匙；
+- 生成计划要求穿过锁门或使用不存在的道具；
+- 两个角色同时占用唯一资源，没有冲突裁决；
+- 玩家重载存档后行为完全不可解释地变化；
+- 长期记忆无限增长，旧事实和已撤销事实继续影响行为；
+- 行为树卡在Running节点，角色永久不再响应；
+- 叙事生成绕过内容边界或泄露系统状态；
+- 作品只展示一段精彩对话，没有系统性可玩性测试。
+
+方向目标是分层：世界模拟是真相，决策系统选择合法动作，生成系统只在受约束槽位提供文本或候选，所有结果能回放和验证。
+
+## 所需共同前置模块
+
+状态事件用于世界与任务状态；Evidence用于种子、输入和Replay；ML/LLM基础用于模型边界；Agent状态工具用于有限步行为与工具契约；安全评测用于内容和动作权限；生产综合项目用于Artifact、版本、预算和回归。
+
+## 典型系统边界
+
+```text
+World Simulation (authoritative)
+  ├─ entities/components
+  ├─ rules/invariants
+  ├─ time/ticks
+  └─ events
+       ↓ observation
+Decision Layer
+  ├─ Behavior Tree / Utility / Planner
+  ├─ blackboard / working memory
+  └─ action proposal
+       ↓ validate
+World Action Executor
+       ↓ committed event
+Narrative Layer
+  ├─ dialogue realization
+  ├─ summary/memory compression
+  └─ bounded generation
+       ↓
+Player-visible text / animation
+```
+
+生成文本不能直接修改World State。它提出结构化Action或填充已批准内容槽位。
+
+## 必会机制
+
+### 1. 确定性世界状态
+
+实体、位置、资源、关系、任务和时间以结构数据保存。每个Tick有Seed/输入事件和版本。世界不变量：资源不能负数、唯一道具只有一个Owner、锁门需钥匙、终止任务不可重复完成。
+
+### 2. Observation
+
+角色只看到允许范围：视野、已知事实、听闻信息。不要把完整World State塞给模型。Observation带时间和来源，旧观察可能失效。
+
+### 3. 行为选择
+
+<Term id="behavior-tree" />、Utility或规划器各有边界：
+
+- Behavior Tree：可视化控制流、Reactive，复杂树维护成本高；
+- Utility：按特征评分，需调权重并防抖动；
+- Planner：从前置/效果搜索动作，需限制状态空间与时间；
+- LLM Proposal：处理开放语义，但必须经过动作合法性验证。
+
+可组合：确定性高层状态机 + Behavior Tree + 受限对白生成。
+
+### 4. Action Contract
+
+```ts
+interface WorldAction {
+  actorId: string;
+  type: 'move' | 'take' | 'give' | 'speak' | 'wait';
+  targetId: string | null;
+  parameters: Record<string, string | number>;
+  expectedWorldVersion: number;
+}
+```
+
+Executor检查范围、前置条件、资源冲突和版本。成功产生World Event；失败返回稳定原因，决策层重新规划。
+
+### 5. Blackboard与记忆
+
+Blackboard是当前行为共享状态，长期角色记忆是有来源和时间的事实/摘要。区分：亲眼观察、传闻、推断、已撤销。记忆压缩不能把猜测升级为事实。
+
+### 6. 叙事约束
+
+对白输入由角色知识、语气、当前目标和允许事实构成。输出Schema可包含 `utterance`, `referencedFactIds`, `intent`。Validator检查引用事实属于角色知识、没有改变世界、长度和内容边界。
+
+### 7. Fallback
+
+模型不可用或输出无效时，系统使用模板、已有对白或安全动作 `wait/ask-for-clarification`。可玩核心不能依赖每次生成成功。
+
+### 8. Replay
+
+保存初始世界Snapshot、玩家输入、Seed、World Events、决策版本和生成Artifact身份。Replay首先验证确定性世界轨迹；自然语言若来自外部模型，可使用录制输出或只比较结构约束。
+
+### 9. 测试
+
+- 单元：动作前置条件与不变量；
+- Simulation：数千固定Tick检查死锁、资源和终止；
+- Scenario：玩家动作序列与任务结果；
+- Narrative：事实引用、角色知识和禁止内容；
+- Playtest：节奏与体验，保留结构事件和反馈分类。
+
+## 可验证作品建议
+
+构建一个小型“封闭房间NPC Lab”：
+
+- 3个房间、2个角色、1把钥匙、1扇锁门、1个任务；
+- World State与事件日志；
+- 一个Behavior Tree或Utility决策器；
+- 一个受限Planner Fixture，可替换为模型但默认离线；
+- 对白只引用角色已知Fact；
+- 保存/加载与Replay；
+- 注入锁冲突、道具竞争、无效计划、生成失败和记忆过期；
+- Fallback保证任务仍可继续。
+
+## 作品需要留下哪些 Evidence
+
+```text
+world-schema.json
+invariants.md
+action-contracts.json
+behavior-tree-or-utility-config.json
+scenario-fixtures/
+world-events.ndjson
+replay-manifest.json
+fact-memory-ledger.json
+narrative-validation-report.json
+simulation-failure-report.json
+playtest-observation-template.md
+```
+
+## 常见“看起来会、实际不会”的缺口
+
+| 看起来会 | 实际缺口 |
+| --- | --- |
+| NPC对白自然 | 世界事实与对白不一致 |
+| 接了LLM做NPC | 没有Action Schema、预算和Fallback |
+| 有行为树 | 没有Running/失败/中断测试，树会卡死 |
+| NPC有记忆 | 所有对话永久保存，无来源与撤销 |
+| 有规划 | 动作前置条件不完整，计划不可执行 |
+| 支持存档 | 不保存Seed、版本和事件，无法Replay |
+| 有内容过滤 | 只检查最终文本，动作仍可越界 |
+| 有精彩Demo | 没场景矩阵、Simulation和失败Evidence |
+
+## 学习顺序
+
+1. 世界Schema、Tick和不变量。
+2. Action Contract与版本冲突。
+3. 固定规则/Behavior Tree基线。
+4. Observation、Blackboard和角色知识。
+5. Scenario Test与Replay。
+6. 受限Planning或LLM Proposal。
+7. 叙事生成、Fact Citation和Fallback。
+8. Simulation、故障注入和Playtest。
+
+## 抽象岗位能力映射
+
+| 能力 | 可观察产物 |
+| --- | --- |
+| 游戏系统建模 | ECS/World State、Tick、事件和不变量 |
+| 决策AI | Behavior Tree、Utility、Planning取舍 |
+| Agent边界 | Observation、Action Proposal、Validator |
+| 叙事系统 | 角色知识、Fact Memory、受限生成 |
+| 测试与回放 | Scenario、Simulation、Seed和Event Replay |
+| 安全与Fallback | 动作权限、内容边界、无模型可玩路径 |
+| 体验分析 | Playtest事件、失败分类和节奏证据 |
+
+<Aside type="tip" title="方向验收线">
+让两个NPC在同一Tick争夺唯一钥匙，并让其中一个生成“我已经拿到了钥匙”的对白。世界执行器必须只接受一个动作，另一个对白验证必须失败或改写；这是分层是否成立的直接证据。
+</Aside>

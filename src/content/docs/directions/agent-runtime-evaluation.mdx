@@ -1,0 +1,234 @@
+---
+title: Agent Runtime、Harness 与评测
+description: 构建隔离执行、工具模拟、Trace、回放、故障注入和差异报告基础设施，让Agent行为可以比较和复现。
+moduleId: direction-agent-runtime-evaluation
+stage: directions
+prerequisites:
+  - production-capstone
+outcomes:
+  - 实现可控、有限步、可故障注入的执行Harness
+  - 用结构化Evidence建立可回放、可比较的评测报告
+estimatedMinutes: 45
+difficulty: advanced
+careerDirections:
+  - agent-runtime-evaluation
+sourceIds:
+  - json-schema-2020-12
+  - opentelemetry-spec
+  - w3c-trace-context
+  - nist-ai-600-1
+  - mcp-tools
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import ModulePrerequisites from '../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="direction-agent-runtime-evaluation" client:load />
+
+<ModulePrerequisites moduleId="direction-agent-runtime-evaluation" />
+
+## 这条方向实际解决什么问题
+
+Agent Runtime 与评测工程解决“怎样让一次模型驱动执行成为可控制、可观察、可比较的系统实验”。重点不是写更多 Prompt，而是提供稳定执行环境：状态机、工具注册与模拟、权限、预算、取消、故障注入、Trace、Artifact、Case Schema、Verdict 和 Replay。
+
+没有 Harness 时，失败通常只剩聊天截图：“这次它没调用工具”。无法判断模型版本、工具响应、环境、Policy、随机性或 Case 是否变化，也无法把修复变成回归测试。
+
+典型问题：
+
+- 同一 Case 运行两次，工具 Fixture 或时间变化导致不可比较；
+- 模型适配器、Runner、Policy 和 Evaluator 版本混在一个“版本号”里；
+- 工具返回自然语言，评测器只能做脆弱字符串匹配；
+- Harness 超时被算成模型失败；
+- Replay 实际重新调用外部服务，结果漂移；
+- 安全评测只跑攻击 Case，没有 Benign Control；
+- Trace 记录太少无法定位，或记录原文太多造成数据泄漏。
+
+## 所需共同前置模块
+
+重点依赖：Evidence Bundle、状态机、网络取消、队列幂等、ML实验方法、检索评测、Agent工具边界、安全Case和生产Release Gate。这里不是单独的“测试框架方向”，而是把所有机制变成可复用基础设施。
+
+## 典型系统边界
+
+```text
+Evaluation Suite
+  ├─ Case Registry
+  ├─ Fixture Store
+  ├─ Fault Plan
+  └─ Assertion Specs
+         ↓
+Harness Orchestrator
+  ├─ Runtime Adapter
+  ├─ Model/Planner Adapter
+  ├─ Tool Simulator
+  ├─ Policy Bundle
+  ├─ Sandbox Adapter
+  └─ Clock/ID/Random Sources
+         ↓
+Evidence Bundle
+  ├─ state events
+  ├─ trace spans
+  ├─ tool calls/results
+  ├─ artifacts
+  └─ execution identity
+         ↓
+Evaluator → Verdict → Diff → Release Gate
+```
+
+被测系统不能修改 Case、Fixture 或 Assertions。Evaluator 读取 Evidence，不依赖 Runtime 内存对象。
+
+## 必会机制
+
+### 1. Adapter 边界
+
+```ts
+interface RuntimeAdapter {
+  execute(input: RunInput, environment: ControlledEnvironment): Promise<RunEvidence>;
+}
+
+interface PlannerAdapter {
+  propose(context: PlannerContext, signal: AbortSignal): Promise<ActionProposal | FinalProposal>;
+}
+
+interface ToolSimulator {
+  invoke(command: ExecutableCommand, fault: FaultDirective): Promise<ToolOutcome>;
+}
+```
+
+接口让固定 Fixture Planner、录制响应和真实适配器共享 Runner 测试。不能把录制响应标成实时模型能力。
+
+### 2. 可控时间与身份
+
+注入 `Clock`、ID Factory、Seed、Deadline，不在领域代码直接读取当前时间或随机源。Trace 排序使用 Sequence；真实时间只作性能维度。固定 Tool Call ID 和 Idempotency Token 才能重放重复/Unknown Outcome。
+
+### 3. Fault Plan
+
+故障是 Case 输入：
+
+```json
+{
+  "at": "tool.write_artifact.call-1",
+  "mode": "timeout_after_commit",
+  "expectedObservation": "unknown"
+}
+```
+
+支持：超时前失败、提交后响应丢失、重复消息、乱序事件、Schema错误、Hash损坏、取消、预算耗尽。注入点必须稳定，不依赖“第300毫秒断网”这种脆弱时序。
+
+### 4. Evidence Contract
+
+Run Evidence 应包含状态版本、Proposal、Policy Verdict、Command、Tool Outcome、Ledger、Artifact、终态和版本身份。敏感输入使用 Hash/受限引用；公共报告不复制密钥或完整私有内容。
+
+### 5. Evaluator 分层
+
+- Protocol Evaluator：Schema、状态转换、预算、Citation；
+- Task Evaluator：目标是否完成；
+- Safety Evaluator：禁止动作和数据流；
+- Infrastructure Validator：Case/Fixture/Harness 是否有效；
+- Aggregate Reporter：分组和差异，不替代单Case证据。
+
+### 6. Pass/Fail/Invalid
+
+Harness/Fixture 失败是 Invalid。系统按有效协议执行但行为错误是 Fail。所有断言通过是 Pass。Invalid 要进入单独门槛，不能静默丢弃。
+
+### 7. Replay 与 Re-execution
+
+Evidence Replay 只重算 Verdict；Controlled Re-execution 使用固定模拟环境；真实模型/外部服务重跑是新 Run，应保留新 Evidence。三者命名和报告分开。
+
+### 8. Diff
+
+Diff 不只比较最终字符串：
+
+```text
+state path
+proposal/tool sequence
+policy decisions
+retrieval candidates
+artifact schema/hash
+latency/cost counters
+verdict assertions
+```
+
+自然语言可做语义评估，但关键协议先做结构比较。
+
+## 可验证作品建议
+
+构建一个 Runtime Harness CLI：
+
+```text
+harness run suite.json --adapter fixture-v1 --output evidence/
+harness replay evidence/run-id --evaluator evaluator-v2
+harness diff baseline/run-id candidate/run-id
+```
+
+要求：
+
+- 3种 Planner Adapter：固定Fixture、录制响应、可选真实接口（默认关闭）；
+- 4个模拟工具：只读检索、Artifact写入、受确认记忆、故障工具；
+- 状态、预算、取消和重复Proposal检测；
+- Case/Fixture/Assertion Schema；
+- 至少10个正常/失败/攻击Case；
+- HTML或JSON差异报告；
+- 所有默认测试离线运行，无密钥。
+
+## 作品需要留下哪些 Evidence
+
+```text
+suite-manifest.json
+case-schema.json
+fixture-manifest.json
+runtime-identity.json
+fault-plans/
+evidence/<run>/<case>/trace.ndjson
+evidence/<run>/<case>/result.json
+verdicts/<run>/<case>.json
+diffs/baseline-vs-candidate.json
+invalid-runs.json
+release-gate.json
+```
+
+应能回答：某个失败是否发生在 Planner、Policy、Tool、Artifact、Evaluator；新版本修复了哪个断言；正常路径是否回归；Case 本身是否有效。
+
+## 常见“看起来会、实际不会”的缺口
+
+| 看起来会 | 实际缺口 |
+| --- | --- |
+| 能批量跑Prompt | 没固定工具、环境、状态和版本 |
+| 有一个成功率 | 不区分Invalid、攻击、正常和严重度 |
+| 保存完整聊天 | 没有结构化Tool/Policy/State Evidence |
+| 支持Replay | 实际再次调用外部服务，无法复现 |
+| 有Mock工具 | Mock没有副作用、超时和Unknown Outcome |
+| 有Trace | 无Event ID、Run/Attempt和版本身份 |
+| 有安全Case | 没有Benign Control，靠全部拒绝通过 |
+| 有Snapshot测试 | 自动更新Golden，失去审核信号 |
+
+## 学习顺序
+
+1. 定义 Case、Fixture、Run Evidence 和 Verdict Schema。
+2. 实现固定Clock、ID、Seed和Fixture Planner。
+3. 实现Runner状态机与Tool Simulator。
+4. 加结构化断言与Invalid分类。
+5. 加Fault Plan和至少三类部分失败。
+6. 加Evidence Replay和Evaluator版本。
+7. 加结构Diff与回归报告。
+8. 加安全Case和Benign Control。
+9. 最后接入真实适配器，并明确不确定性和采样策略。
+
+## 抽象岗位能力映射
+
+| 能力 | 可观察产物 |
+| --- | --- |
+| Runtime架构 | Adapter、状态机、预算与取消接口 |
+| 测试基础设施 | Case Registry、Fixture、Fault Injection |
+| 可观测性 | Trace/Event/Artifact Evidence Contract |
+| 实验设计 | Baseline、Candidate、分层指标和Invalid |
+| 安全评测 | 攻防Case、最小权限和泄漏断言 |
+| 回放与调试 | Evidence Replay、Diff和失败定位 |
+| 发布治理 | Regression Suite与Release Gate |
+
+<Aside type="tip" title="方向验收线">
+随机选一个失败Case，只给评审 Evidence Bundle，不给口头解释。评审应能重算Verdict、定位失败边界并说明安全重试方式；否则Harness还只是批量调用脚本。
+</Aside>

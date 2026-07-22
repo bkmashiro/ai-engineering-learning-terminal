@@ -1,0 +1,220 @@
+---
+title: AI 后端与可靠性工程
+description: 围绕流式API、状态、队列、存储、容量和成本构建在断线、重投、积压和下游故障下仍能收敛的服务。
+moduleId: direction-ai-backend-reliability
+stage: directions
+prerequisites:
+  - production-capstone
+outcomes:
+  - 设计跨API、数据库、队列和Worker的可靠异步边界
+  - 用SLO、积压、对账和故障演练管理恢复
+estimatedMinutes: 45
+difficulty: advanced
+careerDirections:
+  - ai-backend-reliability
+sourceIds:
+  - http-semantics
+  - postgresql-transaction-isolation
+  - rabbitmq-confirms
+  - rabbitmq-dead-lettering
+  - redis-eviction
+  - google-sre-slos
+  - opentelemetry-spec
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import ModulePrerequisites from '../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="direction-ai-backend-reliability" client:load />
+
+<ModulePrerequisites moduleId="direction-ai-backend-reliability" />
+
+## 这条方向实际解决什么问题
+
+AI 后端可靠性工程处理“计算慢、成本高、结果非确定、工具会失败”的服务。核心仍是后端系统：API协议、任务状态、数据库事务、消息投递、缓存、Artifact、容量、SLO、故障恢复。模型只是一个具有特殊延迟与错误形态的依赖。
+
+典型故障：
+
+- 客户端超时后重试，创建重复任务并重复计费；
+- DB已提交、队列消息未发，任务永久queued；
+- Worker完成外部调用后Ack丢失，副作用重复；
+- SSE服务重启，内存事件丢失，客户端无法续传；
+- 缓存显示旧状态，管理命令覆盖终态；
+- 下游限流，Worker持续重试造成队列雪崩；
+- 模型响应慢，连接和线程资源先耗尽；
+- 成功率看起来正常，但P95排队时间和每成功任务成本持续上升。
+
+方向目标不是“永不失败”，而是每类失败都可分类、可限制故障半径、可对账并最终收敛。
+
+## 所需共同前置模块
+
+最直接前置：状态事件、网络流式、事务缓存队列、Agent工具与生产综合项目。ML/检索/安全模块用于理解质量、索引、工具权限和评测依赖，避免后端只看HTTP成功。
+
+## 典型系统边界
+
+```text
+Edge/API
+  ├─ authentication/rate limit
+  ├─ idempotency
+  └─ request validation
+       ↓
+Command Store + Event Store + Outbox
+       ↓
+Broker / Scheduler
+       ↓
+Worker Pool
+  ├─ model adapter
+  ├─ retrieval adapter
+  ├─ tool host
+  └─ artifact writer
+       ↓
+Result API / SSE Projection / Cache
+
+Control: SLO, capacity, cost, deploy, reconciliation, incident response
+```
+
+权威状态在数据库或可证明的事件存储；Cache和SSE都是投影。跨资源不声称Exactly-once。
+
+## 必会机制
+
+### 1. API Idempotency
+
+创建命令要求 <Term id="idempotency-key" /> 与请求指纹。相同键同请求返回首次Task；不同请求稳定冲突。保留期覆盖客户端重试和恢复窗口。
+
+### 2. State/Event/Version
+
+每个Task有明确状态机、版本条件和Event ID。终态不可被普通重试重开。Cancel、Timeout和Deadline语义分开。
+
+### 3. Transactional Outbox与Inbox
+
+业务状态和Outbox同事务；Publisher用稳定Message ID；Consumer Inbox检查Message ID与Payload Hash。Confirm/Ack只证明各自协议阶段。
+
+### 4. Effect Ledger
+
+模型调用通常只读但仍有成本；写工具具有副作用。Unknown Outcome先查询或对账。Artifact写入回读Hash后才完成Task。
+
+### 5. Backpressure与接入保护
+
+当到达率持续高于处理率，Buffer只延迟故障。需要组合：接入限流、并发上限、队列容量、优先级、过载拒绝、任务合并、Deadline丢弃和降级。不能无限扩Queue。
+
+Little's Law在稳定系统中的关系：
+
+```text
+L = λW
+```
+
+它可帮助连接在途数、到达率与平均停留时间，但真实系统是否稳定、分布是否合适需要测量。不要用公式替代尾延迟和突发分析。
+
+### 6. Retry Budget
+
+重试流量也占容量。设置每层有限Retry，统一Deadline，使用退避与抖动；错误分类决定是否重试。若API、Worker、SDK三层各重试三次，最坏调用数可能乘法增长。应指定唯一责任层或共享预算。
+
+### 7. Cache作为派生视图
+
+Cache Key带Schema/租户/Scope；状态值带Version。写后失效失败可通过TTL/事件重建；关键写命令读取权威状态。Eviction是正常路径。
+
+### 8. SLO与Error Budget
+
+SLI围绕用户可见Task：接受延迟、首事件、终态时间、Artifact可读、取消生效。按Stage分解，但不要用内部指标替代用户结果。<Term id="error-budget" /> 连接可靠性与发布节奏。
+
+### 9. Capacity与成本
+
+容量模型至少包含：
+
+```text
+arrival rate
+service time distribution
+worker concurrency
+queue wait
+model/tool quotas
+memory per in-flight run
+artifact bandwidth
+retry amplification
+cost per attempt/success
+```
+
+做压测时使用模拟模型/工具，避免花费和外部波动；再对真实依赖做小规模校准。
+
+### 10. Reconciliation与Runbook
+
+扫描租约过期、Outbox滞留、Unknown Effect、Artifact差异和投影滞后。恢复动作通过命令/事件，而不是手改状态。
+
+## 可验证作品建议
+
+构建一个离线可运行的异步 Agent 服务骨架：
+
+- `POST /tasks`、`GET /tasks/:id`、`POST /cancellation`、SSE；
+- PostgreSQL风格Schema和内存/本地适配器；
+- Outbox Publisher、Broker Simulator、Worker Inbox；
+- 模拟模型与Artifact Store；
+- 超时后提交、Confirm丢失、Ack丢失、Worker崩溃故障注入；
+- Cache投影和Version比较；
+- Reconciliation CLI；
+- SLO/积压/成本报告；
+- 不调用真实付费API。
+
+## 作品需要留下哪些 Evidence
+
+```text
+api-openapi-or-schema.json
+state-transition-table.md
+database-schema.sql
+message-contracts.json
+fault-plan.json
+load-shape.json
+normal-run.trace.ndjson
+duplicate-request.trace.ndjson
+unknown-effect-ledger.json
+reconciliation-report.json
+slo-definition.json
+capacity-report.json
+cost-accounting.json
+runbook.md
+```
+
+关键数值必须带环境：并发、Fixture延迟分布、机器/容器限制、持续时间和版本。不能把模拟吞吐称为真实模型容量。
+
+## 常见“看起来会、实际不会”的缺口
+
+| 看起来会 | 实际缺口 |
+| --- | --- |
+| API能返回任务ID | 没Idempotency与请求指纹 |
+| 使用消息队列 | 无Outbox，DB与消息双写丢失 |
+| 配置了重试 | Unknown Outcome与重复副作用未处理 |
+| 使用Redis缓存 | 把Cache当权威，Version/失效缺失 |
+| 有SSE | 无持久Event ID和断线续传 |
+| 有自动扩容 | 不看外部Quota、Queue Age和Retry放大 |
+| 有监控Dashboard | 没用户SLI、分母和Runbook动作 |
+| 声称Exactly-once | 没说明范围，外部副作用仍重复 |
+
+## 学习顺序
+
+1. 单进程状态机与Idempotent API。
+2. 数据库事务、Outbox和Event Store。
+3. Broker模拟、Inbox与重复投递。
+4. SSE持久事件和取消协议。
+5. Effect Ledger、Artifact验证与对账。
+6. Cache投影和版本恢复。
+7. Backpressure、Retry Budget和容量测试。
+8. SLO、Error Budget、告警与Runbook。
+9. 安全、成本与发布Gate整合。
+
+## 抽象岗位能力映射
+
+| 能力 | 可观察产物 |
+| --- | --- |
+| API与协议设计 | Idempotency、Problem Details、SSE、取消 |
+| 数据可靠性 | 事务、Outbox、Inbox、Ledger与对账 |
+| 分布式状态 | Version、租约、重复、乱序和终态 |
+| 性能与容量 | 压测Shape、Queue Age、Backpressure和资源模型 |
+| 可观测性 | Trace、SLI、成本与故障分类 |
+| 运维响应 | Runbook、降级、回滚和事故Evidence |
+| AI依赖工程 | 模型/检索/工具Adapter、Quota与质量终态 |
+
+<Aside type="tip" title="方向验收线">
+把Worker在Artifact写入后、数据库终态提交前杀掉，再重复投递消息。系统若能用同一Effect身份验证Artifact、完成状态并只发一次终态事件，才说明可靠性机制真正连起来。
+</Aside>

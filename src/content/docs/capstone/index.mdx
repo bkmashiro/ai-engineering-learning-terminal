@@ -1,0 +1,1026 @@
+---
+title: 生产化综合项目
+description: 把API、状态、队列、检索、工具、安全评测、Trace、SLO、成本预算和人工接管组合成可运营的最小Agent系统。
+moduleId: production-capstone
+stage: production-capstone
+prerequisites:
+  - safety-evaluation
+outcomes:
+  - 完成数据平面与控制平面的端到端协议设计
+  - 建立质量、延迟、成本和可靠性的可执行发布门槛
+  - 实现可回放、可对账、可降级并支持人工接管的最小系统
+estimatedMinutes: 90
+difficulty: core
+careerDirections: []
+sourceIds:
+  - google-sre-slos
+  - opentelemetry-spec
+  - http-problem-details
+  - postgresql-transaction-isolation
+  - rabbitmq-confirms
+  - nist-ai-600-1
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import CapstoneSystemDiagram from '../../../components/content/CapstoneSystemDiagram.astro';
+import ModulePrerequisites from '../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="production-capstone" client:load />
+
+<ModulePrerequisites moduleId="production-capstone" />
+
+综合项目不是把前面课程的代码复制到一个目录。生产系统需要一个明确用户路径：请求如何被接受，状态怎样持久化，断线如何恢复，队列怎样重投，检索证据怎样绑定，工具如何授权，失败如何对账，什么指标阻止发布，预算耗尽时如何降级或转人工。
+
+本课设计一个“公开技术资料核查 Agent”。用户提交一个问题和允许的公开语料 Scope；系统异步检索、生成带 Citation 的核查报告，并保存 JSON Artifact。它不访问真实私有数据，不调用真实收费模型，不执行任意代码。课程产物是可替换适配器的最小系统骨架与完整协议，不声称示例已达到生产容量或安全认证。
+
+核心目标：
+
+```text
+输入：Question Manifest + Idempotency Key +公开Corpus Scope
+输出：Grounded Report Artifact + Evidence Bundle
+终态：completed | no_answer | failed | cancelled | needs_human
+```
+
+系统必须处理：客户端重试、SSE 断线、重复消息、Worker 崩溃、检索无答案、工具 Unknown Outcome、策略拒绝、预算耗尽、Artifact 验证失败和人工接管。
+
+<CapstoneSystemDiagram />
+
+## 1. 用户路径与系统不变量
+
+用户路径：
+
+<Steps>
+1. 客户端提交问题，获得稳定 Task ID 和事件流 URL。
+2. 客户端订阅状态事件；断线后使用 Last Event ID 续传。
+3. Worker 检索公开语料，形成 Claim 与 Citation。
+4. Policy Gate 验证工具、Scope、预算和数据流。
+5. 系统生成并验证 Report Artifact。
+6. 客户端读取终态和 Artifact；失败时看到可行动错误，不看到内部敏感细节。
+7. 需要人工处理时，审核者读取 Handoff Bundle，并通过同一状态协议提交决定。
+</Steps>
+
+不变量：
+
+```text
+I1 同一Idempotency Key与请求指纹只对应一个Task。
+I2 Task每次状态变化有版本、事件和Trace。
+I3 completed要求Report Artifact可读、Schema有效、Hash匹配、Citation可验证。
+I4 no_answer要求没有无支持Claim。
+I5 failed/cancelled后Runner不启动新工具。
+I6 未授权语料不能进入检索候选、上下文、Trace或Artifact。
+I7 外部副作用Unknown时不能自动声称完成。
+I8 客户端断线不取消Task，显式取消才传播Cancellation。
+I9 控制平面规则和评测版本进入每次Run身份。
+I10 所有自动化终态都能回放到输入、状态、工具和Artifact证据。
+```
+
+## 2. 数据平面与控制平面
+
+### 2.1 数据平面
+
+处理单次任务：
+
+```text
+API → Command DB + Outbox → Broker → Worker/Agent Runner
+    → Retrieval Index → Tool Host → Artifact Store → Result API/SSE
+```
+
+### 2.2 控制平面
+
+决定系统怎样运行：
+
+```text
+Tool Registry
+Policy Bundle
+Corpus Generation
+Evaluation Suite
+Release Gate
+SLO / Error Budget
+Cost Budget
+Feature/Degradation Configuration
+Replay and Incident Review
+```
+
+把两者分开能避免在每次请求里动态修改安全策略。控制平面变更先经过版本化评测，再发布一个不可变 Bundle ID；Run 只引用它。
+
+## 3. API 契约
+
+### 3.1 创建任务
+
+```http
+POST /v1/research-tasks
+Idempotency-Key: intent-7c1f...
+Content-Type: application/json
+```
+
+```json
+{
+  "question": "任务自动重试耗尽后进入什么状态？",
+  "corpusScope": ["public-engineering-docs"],
+  "output": {"format": "grounded-report-v1"},
+  "limits": {"maxSteps": 8, "maxEvidenceChunks": 6}
+}
+```
+
+成功接受：
+
+```json
+{
+  "taskId": "task-01J...",
+  "status": "queued",
+  "version": 0,
+  "eventsUrl": "/v1/research-tasks/task-01J.../events",
+  "resultUrl": "/v1/research-tasks/task-01J..."
+}
+```
+
+Idempotency Key 绑定规范化请求指纹。相同键不同请求返回 Problem Details 风格错误；错误响应包含稳定 `type`、`title`、`status`、`code`、`traceId`，不暴露堆栈或内部路径。
+
+### 3.2 查询任务
+
+```json
+{
+  "taskId": "task-01J...",
+  "status": "running",
+  "version": 5,
+  "stage": "retrieving",
+  "progress": {"completedSteps": 2, "maximumSteps": 8},
+  "result": null,
+  "error": null
+}
+```
+
+Progress 只能表示可证实步骤，不伪造百分比。若流程分支不确定，使用离散 Stage 与已完成计数。
+
+### 3.3 取消
+
+```http
+POST /v1/research-tasks/{taskId}/cancellation
+If-Match: "task-version-5"
+```
+
+取消返回 `cancelling` 或已终态结果。它不以关闭 SSE 连接作为取消信号。
+
+## 4. SSE 事件协议
+
+复用网络课程的 SSE、Event ID、Deadline 与背压边界。事件：
+
+```text
+id: task-01J:6
+event: task.stage_changed
+data: {"taskId":"task-01J","version":6,"stage":"validating-citations"}
+```
+
+终态：
+
+```text
+id: task-01J:9
+event: task.completed
+data: {"taskId":"task-01J","version":9,"resultUrl":"...","artifactSha256":"..."}
+```
+
+协议要求：
+
+- Event ID 单调对应 Task Version；
+- 客户端用 Last Event ID 续传；
+- 服务端从持久事件表重放，不只依赖内存 Buffer；
+- 终态事件后连接关闭；
+- Heartbeat 不推进业务版本；
+- 慢客户端有 Buffer 上限，超过后断开并允许续传；
+- SSE 断线不改变 Task 状态。
+
+## 5. 状态机
+
+```text
+queued
+  ├─ claimed → running
+  └─ cancel → cancelled
+running
+  ├─ evidence-insufficient → no_answer
+  ├─ report-verified → completed
+  ├─ policy/hard-failure → failed
+  ├─ unresolved-effect/conflict → needs_human
+  └─ cancel-requested → cancelling
+cancelling
+  ├─ stopped+reconciled → cancelled
+  └─ unknown-effect → needs_human
+needs_human
+  ├─ approve/recover → running or completed
+  ├─ reject → failed
+  └─ cancel → cancelled
+```
+
+终态：`completed`、`no_answer`、`failed`、`cancelled`。`needs_human` 是等待状态，不是失败；有明确 SLA、Owner 和可执行动作。
+
+状态记录：
+
+```ts
+interface ResearchTaskState {
+  taskId: string;
+  status: 'queued' | 'running' | 'cancelling' | 'needs_human' | 'completed' | 'no_answer' | 'failed' | 'cancelled';
+  version: number;
+  attempt: number;
+  stage: string;
+  runId: string | null;
+  corpusVersion: string;
+  policyBundleId: string;
+  evaluationBaselineId: string;
+  artifact: { uri: string; sha256: string; bytes: number } | null;
+  terminalCode: string | null;
+}
+```
+
+## 6. 持久化 Schema
+
+```sql title="examples/capstone-schema.sql"
+CREATE TABLE research_task (
+  task_id text PRIMARY KEY,
+  idempotency_scope text NOT NULL,
+  idempotency_key text NOT NULL,
+  request_fingerprint text NOT NULL,
+  status text NOT NULL,
+  version bigint NOT NULL DEFAULT 0,
+  attempt integer NOT NULL DEFAULT 0,
+  stage text NOT NULL,
+  run_id text,
+  corpus_version text NOT NULL,
+  policy_bundle_id text NOT NULL,
+  evaluation_baseline_id text NOT NULL,
+  request_json jsonb NOT NULL,
+  artifact_uri text,
+  artifact_sha256 text,
+  artifact_bytes bigint,
+  terminal_code text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (idempotency_scope, idempotency_key)
+);
+
+CREATE TABLE research_task_event (
+  task_id text NOT NULL REFERENCES research_task(task_id),
+  version bigint NOT NULL,
+  event_id text NOT NULL UNIQUE,
+  event_type text NOT NULL,
+  payload jsonb NOT NULL,
+  payload_sha256 text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (task_id, version)
+);
+
+CREATE TABLE research_outbox (
+  outbox_id text PRIMARY KEY,
+  task_id text NOT NULL REFERENCES research_task(task_id),
+  task_version bigint NOT NULL,
+  event_type text NOT NULL,
+  payload jsonb NOT NULL,
+  published_at timestamptz,
+  attempts integer NOT NULL DEFAULT 0,
+  next_attempt_at timestamptz
+);
+
+CREATE TABLE research_run (
+  run_id text PRIMARY KEY,
+  task_id text NOT NULL REFERENCES research_task(task_id),
+  attempt integer NOT NULL,
+  status text NOT NULL,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  deadline_at timestamptz NOT NULL,
+  max_steps integer NOT NULL,
+  max_tool_calls integer NOT NULL,
+  corpus_version text NOT NULL,
+  policy_bundle_id text NOT NULL,
+  runner_version text NOT NULL,
+  trace_id text NOT NULL,
+  UNIQUE (task_id, attempt)
+);
+
+CREATE TABLE research_effect_ledger (
+  effect_id text PRIMARY KEY,
+  run_id text NOT NULL REFERENCES research_run(run_id),
+  tool_name text NOT NULL,
+  proposal_hash text NOT NULL,
+  idempotency_token text NOT NULL UNIQUE,
+  state text NOT NULL,
+  request_sha256 text NOT NULL,
+  observed_sha256 text,
+  error_code text,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+Artifact 内容不直接塞进状态行；状态只保存身份与验证结果。大 Trace 和评测 Evidence 放 Artifact Store，数据库保存索引和 Hash。
+
+## 7. 请求到 Worker 的事务链
+
+### 7.1 API 事务
+
+```text
+validate request
+→ acquire idempotency record
+→ insert Task queued/v0
+→ insert TaskCreated event
+→ insert Outbox work message
+→ commit
+→ return Task identity
+```
+
+响应断线后，同键返回同 Task。
+
+### 7.2 Outbox Publisher
+
+稳定 `outboxId` 发布；Confirm 未知时同 ID 重发。Worker Inbox 去重。积压指标按最老未发布年龄和待发布数量报告，不能只看发布速率。
+
+### 7.3 Worker Claim
+
+Worker 用版本和租约条件 Claim：
+
+```sql
+UPDATE research_task
+SET status = 'running',
+    version = version + 1,
+    attempt = attempt + 1,
+    run_id = $run_id,
+    stage = 'planning'
+WHERE task_id = $task_id
+  AND status = 'queued'
+  AND version = $expected_version;
+```
+
+随后在同事务写事件与 Run。Claim 失败则读取现状态；重复消息可能对应已运行或终态任务。
+
+## 8. Agent Runner 流程
+
+```text
+1. Load immutable Run Configuration
+2. Validate Question Manifest and Scope
+3. Retrieve candidates under ACL
+4. Rerank and pack evidence
+5. Planner proposes answer/tool action
+6. Policy Gate validates Schema/Capability/Budget
+7. Tool Host executes and verifies
+8. Claim-Citation Validator checks report
+9. Artifact Writer publishes with stable token
+10. Artifact Reader verifies Schema/Hash/runId
+11. Task transaction commits terminal state + event + outbox
+```
+
+每步产生 Trace Span 和结构化结果。模型适配器可替换为 Fixture Planner；系统测试不依赖真实模型。
+
+## 9. Report Artifact Schema
+
+```ts
+interface GroundedReportV1 {
+  schemaVersion: 1;
+  taskId: string;
+  runId: string;
+  corpusVersion: string;
+  status: 'answered' | 'no_answer';
+  question: string;
+  answer: string | null;
+  claims: Array<{
+    claimId: string;
+    text: string;
+    citations: Array<{
+      documentId: string;
+      documentVersion: string;
+      chunkId: string;
+      startOffset: number;
+      endOffset: number;
+      quoteSha256: string;
+    }>;
+  }>;
+  retrievalEvidence: {
+    candidateChunkIds: string[];
+    selectedChunkIds: string[];
+  };
+  limitations: string[];
+}
+```
+
+Artifact Validator：
+
+```text
+schema valid
+identity matches current Task/Run/Corpus
+answered ⇒ answer non-empty and every Claim cited
+no_answer ⇒ answer null and claims empty
+all Citations resolve to same corpusVersion
+quote Hash valid
+artifact bytes/hash match Ledger
+```
+
+## 10. 质量、延迟、成本与可靠性预算
+
+四类目标不能压成一个分数。
+
+### 10.1 Quality
+
+离线 Case：
+
+```text
+answer correctness assertion
+claim support rate
+citation validity
+correct no-answer
+forbidden claim absence
+benign completion
+attack block
+```
+
+发布门槛可以要求所有高严重度断言通过，同时比较聚合退化。具体阈值由实际评测历史制定，本课不伪造百分比。
+
+### 10.2 Latency
+
+拆分：
+
+```text
+queue_wait
+first_event_latency
+retrieval_latency
+planner_latency
+external_tool_latency
+artifact_validation_latency
+total_terminal_latency
+```
+
+总延迟：
+
+```text
+T_total = T_queue + T_runner + T_artifact + T_terminal_commit
+```
+
+Runner 内：
+
+```text
+T_runner = Σ[i=1…n] (T_plan,i + T_policy,i + T_tool,i)
+```
+
+并行检索时不能简单相加，要按关键路径计算。报告 p50/p95 等分位必须来自真实测量，不能从平均值推导。
+
+### 10.3 Cost
+
+<Term id="cost-budget" />：
+
+```text
+cost_per_task = model_input + model_output + retrieval + tool + storage + evaluation amortization
+cost_per_success = total eligible task cost / successful grounded tasks
+```
+
+失败重试也消耗成本。预算在 Run 开始前和每步前检查；估算不确定时保留上界。超过预算：缩小候选、切换受控低成本路径、返回 no_answer 或 Handoff；不能无限追加调用。
+
+### 10.4 Reliability
+
+<Term id="service-level-objective" /> 对用户可见结果定义。示例 SLI：
+
+```text
+eligible task 在15分钟内进入 completed/no_answer/needs_human 且状态可查询
+```
+
+注意 `failed` 是否算好事件由用户承诺决定。若系统承诺“给出可行动终态”，`needs_human` 可能算可用但不算自动成功；要分两个 SLI。
+
+<Term id="error-budget" /> 手算示例：某窗口有 10,000 个 eligible tasks，SLO 目标为 99%。允许坏事件：
+
+```text
+10,000 × (1 - 0.99) = 100
+```
+
+若已出现 80 个坏事件，剩余预算 20。这个数字只是算术示例，不是建议目标。真实目标要基于用户需求和历史能力。
+
+## 11. SLI 事件与分母
+
+可靠性指标最容易被分母操纵。必须定义：
+
+```text
+eligible = 请求通过Schema、在公开支持范围、未被用户立即取消
+bad = 在期限内没有可查询终态，或终态Artifact不可验证
+excluded = 明确测试流量、调用方违反协议、平台外部不可控事件（是否排除需公开规则）
+```
+
+不能在事故后临时扩大 Exclusion。原始任务事件保留，聚合规则版本化。
+
+## 12. 降级路径
+
+系统容量或依赖异常时，降级必须保持安全属性：
+
+| 条件 | 降级 | 仍必须保持 |
+| --- | --- | --- |
+| Planner依赖不可用 | 使用确定性检索摘要或 no_answer | Citation验证、Scope过滤 |
+| Dense Index不可用 | Sparse-only | 标记检索模式，评测覆盖 |
+| Reranker超时 | 规则排序或降低k | Evidence Threshold，不强答 |
+| Artifact Store写慢 | 保持Task运行/重试同Token | 不先标completed |
+| Queue积压 | 接入限流、返回排队状态 | Idempotency与取消 |
+| Cost预算接近上限 | 减少候选/Step，转Handoff | 不绕过Policy |
+| Evaluation服务不可用 | 阻断新发布，线上沿用已验证Bundle | 不动态加载未评版本 |
+
+降级不是关闭引用、权限或Artifact验证来换速度。
+
+## 13. Reconciliation：声明状态与现实世界对账
+
+<Term id="reconciliation" /> 扫描：
+
+```text
+running且租约过期
+Outbox未发布超过阈值
+Effect Ledger处于unknown
+completed但Artifact缺失/Hash不符
+Artifact存在但Task非终态
+needs_human超过处理期限
+SSE投影版本落后权威事件
+```
+
+对账器只根据观察生成命令/事件：
+
+```text
+ArtifactRecovered
+EffectStillUnknown
+RunLeaseExpired
+OutboxRepublishRequested
+HumanReviewEscalated
+```
+
+不要直接修数据库字段而不留事件。
+
+## 14. Human Handoff 设计
+
+Handoff UI 不在本课重做网站，但协议必须定义：
+
+```ts
+interface HandoffBundle {
+  handoffId: string;
+  taskId: string;
+  runId: string;
+  stateVersion: number;
+  reasonCode: string;
+  userGoal: string;
+  trustedEvidenceRefs: string[];
+  pendingAction: object | null;
+  unknownEffects: string[];
+  allowedDecisions: Array<'approve_recovery' | 'reject' | 'request_more_evidence' | 'cancel'>;
+  expiresAt: string;
+}
+```
+
+审核决定使用版本条件；如果状态已变化，旧界面提交必须冲突，不覆盖新结果。审核者不应看到无必要 Secret 或其他 Scope 数据。
+
+## 15. Release Gate
+
+发布对象：
+
+```text
+runnerVersion
+modelAdapterVersion/config identity
+policyBundleId
+toolRegistryVersion
+corpus/chunker/retriever/reranker versions
+evaluatorVersion
+```
+
+门槛：
+
+<Steps>
+1. Static checks：Schema、权限映射、工具版本、无未知Source/Term。
+2. Unit tests：状态机、幂等、Citation、Budget和Policy。
+3. Deterministic integration：Fixture Planner +模拟工具覆盖正常/故障。
+4. Security suite：攻击Case与Benign Control。
+5. Retrieval suite：Recall、MRR、No-answer、Citation。
+6. Replay：旧失败Case在新版本通过，旧正常Case不回归。
+7. Limited release：受控流量与清晰回滚条件。
+8. Compare：质量、延迟、成本、可靠性分别评估。
+9. Promote or rollback：记录决策与Evidence Bundle。
+</Steps>
+
+任何高严重度越权、Artifact验证失败或Invalid评测过高都应阻止自动发布。具体门槛不在正文虚构。
+
+## 16. 最小 TypeScript 协议骨架
+
+下面代码不实现HTTP服务器或真实Broker，而是给出端到端纯领域层：创建命令、Worker终态提交、SLO分类和Release Gate。它可由API、数据库和Harness适配器调用。
+
+```ts title="examples/capstone-domain.ts"
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+
+type TerminalStatus = 'completed' | 'no_answer' | 'failed' | 'cancelled';
+type TaskStatus = 'queued' | 'running' | 'cancelling' | 'needs_human' | TerminalStatus;
+
+type ResearchRequest = {
+  question: string;
+  corpusScope: string[];
+  output: { format: 'grounded-report-v1' };
+  limits: { maxSteps: number; maxEvidenceChunks: number };
+};
+
+type Task = {
+  taskId: string;
+  status: TaskStatus;
+  version: number;
+  attempt: number;
+  requestFingerprint: string;
+  request: ResearchRequest;
+  corpusVersion: string;
+  policyBundleId: string;
+  artifact: { uri: string; sha256: string; bytes: number } | null;
+  terminalCode: string | null;
+};
+
+type DomainEvent = {
+  eventId: string;
+  taskId: string;
+  version: number;
+  type: string;
+  payload: Record<string, unknown>;
+};
+
+type IdempotencyRecord = {
+  key: string;
+  fingerprint: string;
+  taskId: string;
+};
+
+type ArtifactCandidate = {
+  uri: string;
+  bytes: string;
+  taskId: string;
+  runId: string;
+  corpusVersion: string;
+};
+
+type GroundedReport = {
+  schemaVersion: 1;
+  taskId: string;
+  runId: string;
+  corpusVersion: string;
+  status: 'answered' | 'no_answer';
+  question: string;
+  answer: string | null;
+  claims: Array<{ claimId: string; text: string; citations: Array<{ chunkId: string; quoteSha256: string }> }>;
+};
+
+type EvaluationSummary = {
+  suiteValid: boolean;
+  highSeverityFailures: number;
+  benignRegressions: number;
+  citationFailures: number;
+  invalidRuns: number;
+  totalRuns: number;
+};
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function canonical(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (item !== null && typeof item === 'object') {
+      return Object.fromEntries(Object.entries(item as Record<string, unknown>)
+        .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+        .map(([key, child]) => [key, normalize(child)]));
+    }
+    return item;
+  };
+  return JSON.stringify(normalize(value));
+}
+
+function validateRequest(request: ResearchRequest): void {
+  if (request.question.trim().length < 5 || request.question.length > 2000) {
+    throw new Error('INVALID_QUESTION_LENGTH');
+  }
+  if (request.corpusScope.length === 0 || request.corpusScope.some((scope) => scope !== 'public-engineering-docs')) {
+    throw new Error('UNSUPPORTED_CORPUS_SCOPE');
+  }
+  if (!Number.isInteger(request.limits.maxSteps) || request.limits.maxSteps < 1 || request.limits.maxSteps > 12) {
+    throw new Error('INVALID_MAX_STEPS');
+  }
+  if (!Number.isInteger(request.limits.maxEvidenceChunks) || request.limits.maxEvidenceChunks < 1 || request.limits.maxEvidenceChunks > 10) {
+    throw new Error('INVALID_EVIDENCE_LIMIT');
+  }
+}
+
+class DomainStore {
+  readonly tasks = new Map<string, Task>();
+  readonly events = new Map<string, DomainEvent[]>();
+  readonly idempotency = new Map<string, IdempotencyRecord>();
+  readonly artifacts = new Map<string, string>();
+
+  createTask(input: {
+    idempotencyKey: string;
+    request: ResearchRequest;
+    taskId: string;
+    eventId: string;
+    corpusVersion: string;
+    policyBundleId: string;
+  }): Task {
+    validateRequest(input.request);
+    const fingerprint = sha256(canonical(input.request));
+    const existing = this.idempotency.get(input.idempotencyKey);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) throw new Error('IDEMPOTENCY_KEY_REQUEST_CONFLICT');
+      return structuredClone(this.tasks.get(existing.taskId)!);
+    }
+    if (this.tasks.has(input.taskId)) throw new Error('TASK_ID_CONFLICT');
+    const task: Task = {
+      taskId: input.taskId,
+      status: 'queued',
+      version: 0,
+      attempt: 0,
+      requestFingerprint: fingerprint,
+      request: structuredClone(input.request),
+      corpusVersion: input.corpusVersion,
+      policyBundleId: input.policyBundleId,
+      artifact: null,
+      terminalCode: null,
+    };
+    this.tasks.set(task.taskId, task);
+    this.idempotency.set(input.idempotencyKey, { key: input.idempotencyKey, fingerprint, taskId: task.taskId });
+    this.events.set(task.taskId, [{
+      eventId: input.eventId,
+      taskId: task.taskId,
+      version: 0,
+      type: 'TaskCreated',
+      payload: { corpusVersion: task.corpusVersion, policyBundleId: task.policyBundleId },
+    }]);
+    return structuredClone(task);
+  }
+
+  claim(taskId: string, expectedVersion: number, eventId: string): Task {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new Error('TASK_NOT_FOUND');
+    if (task.status !== 'queued' || task.version !== expectedVersion) throw new Error('CLAIM_CONFLICT');
+    task.status = 'running';
+    task.version += 1;
+    task.attempt += 1;
+    this.events.get(taskId)!.push({
+      eventId, taskId, version: task.version, type: 'TaskClaimed', payload: { attempt: task.attempt },
+    });
+    return structuredClone(task);
+  }
+
+  commitReport(input: {
+    taskId: string;
+    expectedVersion: number;
+    eventId: string;
+    artifact: ArtifactCandidate;
+  }): Task {
+    const task = this.tasks.get(input.taskId);
+    if (!task) throw new Error('TASK_NOT_FOUND');
+    if (task.status !== 'running' || task.version !== input.expectedVersion) throw new Error('TERMINAL_COMMIT_CONFLICT');
+    const report = JSON.parse(input.artifact.bytes) as GroundedReport;
+    if (
+      report.schemaVersion !== 1 ||
+      report.taskId !== task.taskId ||
+      report.corpusVersion !== task.corpusVersion ||
+      input.artifact.taskId !== task.taskId ||
+      input.artifact.corpusVersion !== task.corpusVersion
+    ) throw new Error('ARTIFACT_IDENTITY_MISMATCH');
+    if (report.status === 'answered') {
+      if (!report.answer || report.claims.length === 0 || report.claims.some((claim) => claim.citations.length === 0)) {
+        throw new Error('GROUNDED_REPORT_INCOMPLETE');
+      }
+    } else if (report.answer !== null || report.claims.length !== 0) {
+      throw new Error('NO_ANSWER_REPORT_HAS_CLAIMS');
+    }
+
+    const artifactSha256 = sha256(input.artifact.bytes);
+    this.artifacts.set(input.artifact.uri, input.artifact.bytes);
+    const readBack = this.artifacts.get(input.artifact.uri);
+    if (readBack === undefined || sha256(readBack) !== artifactSha256) {
+      throw new Error('ARTIFACT_READBACK_FAILED');
+    }
+
+    task.status = report.status === 'answered' ? 'completed' : 'no_answer';
+    task.version += 1;
+    task.artifact = { uri: input.artifact.uri, sha256: artifactSha256, bytes: Buffer.byteLength(input.artifact.bytes) };
+    task.terminalCode = report.status === 'answered' ? 'GROUNDED_REPORT_VERIFIED' : 'NO_SUPPORTED_ANSWER';
+    this.events.get(task.taskId)!.push({
+      eventId: input.eventId,
+      taskId: task.taskId,
+      version: task.version,
+      type: task.status === 'completed' ? 'TaskCompleted' : 'TaskNoAnswer',
+      payload: { artifact: task.artifact, terminalCode: task.terminalCode },
+    });
+    return structuredClone(task);
+  }
+}
+
+function classifySli(input: {
+  eligible: boolean;
+  userCancelledImmediately: boolean;
+  terminalWithinDeadline: boolean;
+  status: TaskStatus;
+  artifactVerified: boolean;
+}): 'excluded' | 'good' | 'bad' {
+  if (!input.eligible || input.userCancelledImmediately) return 'excluded';
+  if (!input.terminalWithinDeadline) return 'bad';
+  if (input.status === 'completed' || input.status === 'no_answer') {
+    return input.artifactVerified ? 'good' : 'bad';
+  }
+  if (input.status === 'needs_human') return 'good'; // 示例：可行动终态SLI；自动成功SLI应另算。
+  return 'bad';
+}
+
+function releaseGate(summary: EvaluationSummary): { allowed: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  if (!summary.suiteValid) reasons.push('EVALUATION_SUITE_INVALID');
+  if (summary.highSeverityFailures > 0) reasons.push('HIGH_SEVERITY_FAILURE');
+  if (summary.benignRegressions > 0) reasons.push('BENIGN_REGRESSION');
+  if (summary.citationFailures > 0) reasons.push('CITATION_VALIDATION_FAILURE');
+  if (summary.totalRuns === 0 || summary.invalidRuns === summary.totalRuns) reasons.push('NO_VALID_EVALUATION_RUNS');
+  return { allowed: reasons.length === 0, reasons };
+}
+
+const store = new DomainStore();
+const request: ResearchRequest = {
+  question: '任务自动重试耗尽后进入什么状态？',
+  corpusScope: ['public-engineering-docs'],
+  output: { format: 'grounded-report-v1' },
+  limits: { maxSteps: 8, maxEvidenceChunks: 6 },
+};
+const created = store.createTask({
+  idempotencyKey: 'intent-000001', request, taskId: 'task-1', eventId: 'evt-0',
+  corpusVersion: 'corpus-v1', policyBundleId: 'policy-v1',
+});
+assert.equal(created.status, 'queued');
+assert.equal(store.createTask({
+  idempotencyKey: 'intent-000001', request, taskId: 'unused', eventId: 'unused',
+  corpusVersion: 'corpus-v1', policyBundleId: 'policy-v1',
+}).taskId, 'task-1');
+
+const running = store.claim('task-1', 0, 'evt-1');
+const report: GroundedReport = {
+  schemaVersion: 1,
+  taskId: 'task-1',
+  runId: 'run-1',
+  corpusVersion: 'corpus-v1',
+  status: 'answered',
+  question: request.question,
+  answer: '重试耗尽后进入隔离处理路径。',
+  claims: [{
+    claimId: 'c1', text: '重试耗尽后进入隔离处理路径。',
+    citations: [{ chunkId: 'retry-v1#2', quoteSha256: 'a'.repeat(64) }],
+  }],
+};
+const completed = store.commitReport({
+  taskId: 'task-1', expectedVersion: running.version, eventId: 'evt-2',
+  artifact: {
+    uri: 'artifacts/task-1/report.json',
+    bytes: JSON.stringify(report),
+    taskId: 'task-1', runId: 'run-1', corpusVersion: 'corpus-v1',
+  },
+});
+assert.equal(completed.status, 'completed');
+assert.equal(classifySli({
+  eligible: true, userCancelledImmediately: false, terminalWithinDeadline: true,
+  status: completed.status, artifactVerified: true,
+}), 'good');
+assert.deepEqual(releaseGate({
+  suiteValid: true, highSeverityFailures: 0, benignRegressions: 0,
+  citationFailures: 0, invalidRuns: 0, totalRuns: 20,
+}), { allowed: true, reasons: [] });
+```
+
+这段代码的 `DomainStore` 不是并发数据库；它用于领域规则单测。真实适配器必须用事务、唯一约束和版本条件实现等价原子性。Citation 的 Quote Hash 在完整系统中还要解析 Corpus 验证；示例只验证结构，不能据此声称 Citation 内容已验证。
+
+## 17. 端到端故障矩阵
+
+| 故障 | 用户可见状态 | 内部证据 | 自动恢复 | 何时转人工 |
+| --- | --- | --- | --- | --- |
+| 创建响应断线 | 可用同键查询 | Idempotency Record | 返回首次Task | 键指纹冲突 |
+| Outbox Confirm未知 | Task仍queued | Outbox attempts/confirm | 同ID重发 | 长时间无法发布 |
+| Queue重复投递 | 状态不重复推进 | Inbox、Task version | 幂等Ack | Payload身份冲突 |
+| Worker崩溃 | running后租约过期 | Run、Trace、Ledger | 对账后重试 | 外部副作用unknown |
+| Dense检索不可用 | running/降级模式 | Retrieval mode | Sparse-only | 无证据且任务高影响 |
+| Citation验证失败 | 不得completed | Claim/Citation diff | 缩小Claim或no_answer | 证据冲突 |
+| Artifact写超时 | running/needs_human | Effect Ledger unknown | 同Token查询/重试 | 存储不可查询 |
+| Cancel与完成竞争 | 由状态规则裁决 | versions/events | 重算转换 | 副作用冲突无法决定 |
+| Policy拒绝工具 | 可能no_answer/failed | Policy code | 选择低权限替代 | 用户可确认高影响动作 |
+| 预算耗尽 | no_answer/needs_human | cost/step counters | 受控降级 | 已有重要部分结果 |
+| 评测Suite Invalid | 不发布新版本 | Invalid reason | 修Harness重跑 | 规则含义不清 |
+| SLO预算快速消耗 | 服务降级/冻结发布 | SLI raw events | 限流、回滚、扩容 | 持续用户影响 |
+
+## 18. 故障注入实验
+
+### 实验一：响应断线 + 重复队列 + Ack丢失
+
+1. 创建事务提交后丢弃HTTP响应；
+2. 客户端用同一Idempotency Key重试；
+3. Outbox发布两次相同Message ID；
+4. Worker第一次完成后Ack丢失；
+5. 第二次投递通过Inbox返回首次结果；
+6. 断言只有一个Task、一个Run Attempt、一个Artifact身份；
+7. SSE重放只出现一次终态Version。
+
+验收：三个重复来源叠加仍不重复副作用。
+
+### 实验二：检索服务部分降级
+
+1. 注入Dense Retriever超时；
+2. 系统切到Sparse-only并在Trace记录模式；
+3. 有充分证据Case仍完成；
+4. 只有Dense能召回的Case应no_answer，不得猜测；
+5. 质量报告按模式分桶；
+6. 恢复Dense后回放失败Case；
+7. Release Gate不把降级结果与完整模式无差别比较。
+
+验收：降级保持Grounding，不以强答换可用性。
+
+### 实验三：Artifact写成功、终态事务失败
+
+1. Artifact Store完成写入并验证；
+2. 注入数据库终态提交失败；
+3. Task仍running，Ledger记录Artifact verified；
+4. 重投Worker读取同Token，不重写Artifact；
+5. 再次提交终态；
+6. 对账器能发现“Artifact存在但Task非终态”；
+7. Event/SSE只在事务成功后发布终态。
+
+验收：Artifact与状态通过对账收敛，客户端不会提前看到completed。
+
+### 实验四：高严重度安全回归阻断发布
+
+1. 新Policy版本意外允许未确认memory write；
+2. 攻击Case产生ToolStarted；
+3. Evaluation Verdict Fail；
+4. `highSeverityFailures=1`；
+5. Release Gate返回不允许；
+6. 当前线上Bundle保持旧版本；
+7. 修复后旧失败Case与Benign Case都重跑。
+
+验收：控制平面能阻止坏版本进入数据平面。
+
+### 实验五：错误预算手算与响应
+
+1. 固定窗口10,000个eligible tasks、目标99%；
+2. 计算预算100；
+3. 注入80个超时坏事件；
+4. 剩余20；
+5. 再注入25个，预算耗尽5；
+6. 按预先规则冻结高风险发布、启动事故响应或降级；
+7. 不修改分母来恢复指标。
+
+验收：原始事件、聚合规则和发布动作可以互相追踪。
+
+## 19. Runbook 最小内容
+
+```text
+症状：SSE正常但终态延迟上升
+检查：queue_wait、oldest_outbox_age、running lease、artifact write latency
+区分：接入过载 / Worker不足 / 下游依赖 / 对账积压
+立即动作：保护接入、暂停非必要发布、启用已评测降级
+禁止动作：删除未确认消息、手工把running改completed、绕过Artifact验证
+恢复验证：积压下降、终态SLI恢复、重复/unknown effect扫描清零
+后续Evidence：事件时间线、版本、配置差异、失败Case和修复回放
+```
+
+Runbook 要可执行，不只写“检查日志”。每个动作有安全边界与恢复验收。
+
+## 20. 综合项目验收条件
+
+- □ API有创建、查询、取消和SSE续传协议；
+- □ Idempotency Key与请求指纹绑定，响应丢失可查询；
+- □ Task、Event、Outbox在一个数据库事务中提交；
+- □ Worker使用Inbox、版本Claim、租约和稳定Run身份；
+- □ Runner固定Corpus、Policy、Tool Registry和Evaluator版本；
+- □ 检索保留候选、重排、预算与权限Evidence；
+- □ Tool Proposal经过Schema、Capability、确认、预算和Postcondition；
+- □ Artifact使用稳定Token写入、回读、Schema与Hash验证；
+- □ completed/no_answer/failed/cancelled/needs_human语义明确；
+- □ Cancellation与外部副作用对账，不把断线当取消；
+- □ Reconciliation覆盖过期租约、Unknown Effect、Outbox和Artifact差异；
+- □ Quality、Latency、Cost、Reliability分别有指标和门槛；
+- □ SLI分母、Good/Bad/Excluded与规则版本明确；
+- □ Release Gate同时运行正常、故障、安全和回放Case；
+- □ 降级路径保持权限、Citation和Artifact验证；
+- □ Handoff Bundle有版本、Evidence、允许动作和过期边界；
+- □ 至少执行三个端到端故障注入实验；
+- □ Evidence Bundle能从用户请求追到终态Artifact与Release版本；
+- □ 没有真实密钥、私有路径、真实账号或公司特定内容。
+
+## 21. 学完后应该能回答什么
+
+1. 数据平面和控制平面分别处理什么，为什么要分开？
+2. 创建Task时哪些记录必须在同一事务提交？
+3. SSE断线与Task取消为什么必须是不同协议？
+4. completed终态必须满足哪些Artifact和Citation不变量？
+5. Outbox、Inbox、Effect Ledger和Reconciliation各修复哪种部分失败？
+6. Quality、Latency、Cost和Reliability为什么不能合成一个模糊总分？
+7. 总延迟应如何按关键路径拆分？
+8. 10,000个事件、99% SLO时错误预算是多少？
+9. 什么是eligible、good、bad和excluded，为什么分母规则要版本化？
+10. 降级为什么不能绕过权限或Grounding门槛？
+11. Release Gate至少要覆盖哪些测试层？
+12. 哪些故障可以自动对账，哪些应转Human Handoff？
+13. Artifact已写但Task未终态时怎样恢复？
+14. 一个可运营Runbook为什么必须包含禁止动作和恢复验收？
+
+## 22. 来源边界
+
+- Google SRE SLO材料用于理解用户可见SLI、SLO和错误预算；示例99%与10,000事件仅用于手算，不是任何项目建议目标。
+- OpenTelemetry Specification用于Trace、Metric和Log信号边界；课程没有绑定具体采集后端或保存所有内容。
+- HTTP Problem Details用于结构化错误响应参考；具体扩展字段和安全脱敏由本项目协议定义。
+- PostgreSQL与RabbitMQ文档用于事务隔离、Confirm/Ack等边界；跨资源流程不被描述为Exactly-once。
+- NIST生成式AI风险材料用于控制平面风险结构参考；本综合项目自测不构成认证、合规或生产安全保证。
+- 所有延迟、成本、SLO、任务、语料和工具数据均为抽象教学示例；没有给出未经真实环境测量的性能数字。

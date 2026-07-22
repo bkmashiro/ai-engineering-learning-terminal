@@ -1,0 +1,122 @@
+---
+---
+
+<figure class="agent-boundary" aria-labelledby="agent-boundary-title agent-boundary-caption">
+  <div class="agent-boundary__title">
+    <p id="agent-boundary-title">模型只能提出候选动作，程序决定是否执行</p>
+    <span>Proposal ≠ Permission</span>
+  </div>
+
+  <div class="agent-boundary__flow">
+    <section class="agent-boundary__untrusted">
+      <span>UNTRUSTED CONTEXT</span>
+      <strong>用户输入、检索文本、工具输出</strong>
+      <small>其中可能包含错误、旧数据或注入指令</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section>
+      <span>MODEL</span>
+      <strong>Action Proposal</strong>
+      <small>工具名、参数、理由摘要</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section class="agent-boundary__gate">
+      <span>POLICY GATE</span>
+      <strong>Schema + Capability + Budget</strong>
+      <small>拒绝、要求确认或产生可执行命令</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section>
+      <span>TOOL EXECUTOR</span>
+      <strong>Timeout + Idempotency + Verify</strong>
+      <small>程序执行，模型不持有真实凭据</small>
+    </section>
+  </div>
+
+  <div class="agent-boundary__stores">
+    <section>
+      <span>RUN STATE</span>
+      <strong>本次任务的权威状态</strong>
+      <small>步骤、预算、待处理动作、终态</small>
+    </section>
+    <section>
+      <span>WORKING MEMORY</span>
+      <strong>可丢弃的上下文视图</strong>
+      <small>摘要、候选、最近观察</small>
+    </section>
+    <section>
+      <span>LONG-TERM MEMORY</span>
+      <strong>通过写入策略筛选</strong>
+      <small>来源、作用域、保留期、撤销方式</small>
+    </section>
+    <section>
+      <span>TRACE</span>
+      <strong>可审计公开记录</strong>
+      <small>候选动作、校验、调用、结果与停止原因</small>
+    </section>
+  </div>
+
+  <figcaption id="agent-boundary-caption">
+    把所有历史都塞进 Prompt 不是状态管理。Runner 需要把权威状态、临时上下文、持久记忆和审计记录分开，并为每个写入点定义权限。
+  </figcaption>
+</figure>
+
+<style>
+  .agent-boundary {
+    display: grid;
+    gap: 0.85rem;
+    margin-block: 1.5rem;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.875rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 3%, var(--sl-color-bg));
+  }
+
+  .agent-boundary__title { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+  .agent-boundary__title p { margin: 0; font-size: 1rem; font-weight: 750; }
+  .agent-boundary__title span,
+  .agent-boundary section > span {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.875rem;
+    font-weight: 750;
+  }
+
+  .agent-boundary__flow {
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) auto minmax(0, 0.85fr) auto minmax(0, 1.15fr) auto minmax(0, 1.1fr);
+    align-items: stretch;
+    gap: 0.45rem;
+  }
+
+  .agent-boundary section {
+    display: grid;
+    align-content: start;
+    gap: 0.27rem;
+    min-width: 0;
+    padding: 0.75rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.6rem;
+    background: var(--sl-color-bg);
+  }
+
+  .agent-boundary__flow b { align-self: center; color: var(--sl-color-accent-high); font-size: 1.2rem; }
+  .agent-boundary__gate { border: 2px solid var(--sl-color-accent) !important; }
+  .agent-boundary__untrusted { border-style: dashed !important; }
+  .agent-boundary__stores { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.55rem; }
+  .agent-boundary strong { font-size: 0.875rem; }
+  .agent-boundary small,
+  .agent-boundary figcaption { color: var(--sl-color-gray-2); font-size: 0.875rem; line-height: 1.5; }
+  .agent-boundary figcaption { padding-top: 0.875rem; border-top: 1px dashed var(--sl-color-gray-5); }
+
+  @media (max-width: 62rem) {
+    .agent-boundary__flow { grid-template-columns: 1fr; }
+    .agent-boundary__flow b { justify-self: center; transform: rotate(90deg); }
+    .agent-boundary__stores { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
+  @media (max-width: 38rem) {
+    .agent-boundary__title { display: grid; }
+    .agent-boundary__stores { grid-template-columns: 1fr; }
+  }
+</style>

@@ -29,6 +29,7 @@ pnpm gate
 ```bash
 pnpm check
 pnpm test
+pnpm verify:snippets
 pnpm build
 pnpm audit:public
 pnpm test:e2e
@@ -51,17 +52,15 @@ scripts/                 发布前安全门禁
 
 英文来源只能经过摘录选择、中文改写、术语复核和主控验收后进入课程；不发布整篇机器翻译。
 
-## 第一版
+## 当前课程覆盖
 
-- 教学网站式的清晰导航和排版；
-- 完整学习路线与方向筛选；
-- 两节基础补给课与 `Workflow 与 Agent` 首课；
-- 系统分层、网络生命周期、上下文预算与架构选择图；
-- 可切换正常/故障路径的 SVG Agent Loop；
-- 带版本号的浏览器本地学习进度；
-- 从 canonical typed data 生成的前置模块链接和术语 Peek；
-- 七个抽象就业方向；
-- 术语和来源索引。
+- 共同底座：可复现与证据、状态与事件、网络与取消、事务与队列、机器学习实验；
+- LLM 应用：Token、Attention、上下文、检索、引用与无答案；
+- Agent 工程：Workflow 边界、工具契约、状态、记忆与可审计 Runner；
+- 安全与生产：威胁模型、可执行评测、回放、SLO、降级、对账与综合项目；
+- 七个抽象方向页，每页包含系统边界、必会机制、作品 Evidence、能力缺口和学习顺序；
+- 静态教学图、故障注入实验、浏览器本地学习进度、Canonical Glossary 和公开来源索引；
+- 内容深度与教材代码检查、路由与移动端 E2E 断言、axe 无障碍检查和公开内容安全门禁。
 
 ## 部署
 

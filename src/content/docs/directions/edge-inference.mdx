@@ -1,0 +1,215 @@
+---
+title: 端侧与推理工程
+description: 在固定设备与质量门槛下测量模型转换、量化、算子支持、内存、延迟、能耗和包体取舍。
+moduleId: direction-edge-inference
+stage: directions
+prerequisites:
+  - production-capstone
+outcomes:
+  - 建立可复现的端侧模型转换与基准方法
+  - 用质量、延迟、峰值内存、包体和能耗Evidence解释取舍
+estimatedMinutes: 45
+difficulty: advanced
+careerDirections:
+  - edge-inference
+sourceIds:
+  - onnxruntime-quantization
+  - mlperf-tiny
+  - sklearn-model-evaluation
+  - reproducible-builds
+sourceLocale: zh-CN
+lastReviewed: 2026-07-21
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import ModulePrerequisites from '../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="direction-edge-inference" client:load />
+
+<ModulePrerequisites moduleId="direction-edge-inference" />
+
+## 这条方向实际解决什么问题
+
+端侧与推理工程解决“在具体设备、运行时和质量约束下，让模型稳定执行”。模型文件能导出不等于能部署；一次延迟快不等于尾延迟、内存、热管理和能耗可接受；量化后文件变小不等于任务质量保持。
+
+典型问题：
+
+- 转换成功但某个算子回退到CPU或不受支持；
+- 动态Shape造成重复编译或内存峰值；
+- 只测Warm Run，隐藏首次加载和初始化；
+- 只报平均延迟，P95受热降频或后台任务影响；
+- <Term id="quantization" /> 后总体Accuracy相近，但关键少数类Recall下降；
+- 校准数据不代表部署输入，静态量化误差大；
+- 设备包体、模型、Tokenizer和运行时版本不匹配；
+- Benchmark没有固定线程、功耗模式和输入Shape；
+- 从一台设备数字外推所有设备。
+
+方向目标：为一个确定设备矩阵建立端到端Evidence，从源模型身份、转换、算子覆盖、数值误差，到Warm-up/Steady Latency、峰值内存、包体和能耗。
+
+## 所需共同前置模块
+
+Evidence-first用于Manifest、版本和Artifact；ML实验用于数据切分、指标和误差分析；LLM基础用于Token、Prefill/Decode与KV Cache；生产项目用于SLO、成本和Release Gate。端侧不是只做编译，还要证明任务质量。
+
+## 典型系统边界
+
+```text
+Source Model + Tokenizer/Preprocessor
+  ↓ export
+Intermediate Graph
+  ↓ optimize / quantize
+Target Runtime Package
+  ↓ deploy
+Device Runtime
+  ├─ CPU/GPU/NPU delegates
+  ├─ memory allocator
+  ├─ threading
+  └─ power/thermal state
+       ↓
+Predictions / Tokens
+       ↓
+Quality + Latency + Memory + Energy Evaluation
+```
+
+每个箭头都有版本和Hash。预处理/后处理必须与训练语义一致。
+
+## 必会机制
+
+### 1. Export Contract
+
+记录输入名称、dtype、Shape范围、动态维度、输出语义、Tokenizer/Normalization版本。用固定Golden Inputs比较源框架和目标运行时输出。转换警告和未映射算子不能忽略。
+
+### 2. Operator Coverage
+
+生成算子清单：目标Delegate支持、回退、融合、动态。一个不支持算子可能导致整个子图回退。报告实际执行Provider，不只看配置请求。
+
+### 3. Quantization
+
+常见：动态权重量化、静态整数量化、混合精度。记录：
+
+```text
+weight/activation dtype
+per-tensor or per-channel
+symmetric/asymmetric
+calibration dataset identity
+excluded operators
+quantization parameters
+```
+
+校准数据只用于量化参数，不得混入最终Test。质量按总体和切片比较。
+
+### 4. 数值对齐
+
+对固定输入比较：最大绝对误差、平均误差、Top-k一致、任务预测变化。浮点小差异不一定改变任务结果；任务指标不变也可能掩盖某切片。两层都要报告。
+
+### 5. Warm-up与Steady State
+
+分开测：
+
+- load time；
+- first inference；
+- warm-up若干次；
+- steady runs；
+- 长时间运行与热状态。
+
+不丢弃Warm-up却不报告，也不把Warm结果冒充首次体验。
+
+### 6. Latency Distribution
+
+保存每次样本，计算p50/p95/p99需有足够样本并说明方法。固定线程、Affinity、功耗模式、设备温度、输入Shape和并发。不要指定Matplotlib颜色等与课程无关的装饰，报告数据优先。
+
+### 7. Memory
+
+区分：模型文件、加载后常驻、输入/输出Buffer、临时Arena、KV Cache、峰值RSS/设备内存。对LLM分别测Prefill与Decode，Token长度改变内存和延迟。
+
+### 8. Energy
+
+设备有可信计量接口时记录能量/推理或平均功率与时长；没有时明确未测，不用CPU时间假装能耗。控制屏幕、网络、后台进程和温度。
+
+### 9. Package与兼容性
+
+Artifact包含模型、Tokenizer、运行时库、配置和License/来源记录。设备矩阵测试OS/架构/加速器版本。失败提供受控Fallback，例如CPU或更小模型，但重新评估延迟与质量。
+
+### 10. Release Gate
+
+门槛同时包含：转换成功、无未知算子回退、Golden对齐、任务质量切片、延迟、内存、包体、稳定运行和崩溃率。具体数值由目标设备与产品需求制定，不能使用通用“行业标准”替代。
+
+## 可验证作品建议
+
+选择一个小型公开或自建合成分类模型：
+
+- 保存源模型与数据Manifest；
+- 导出到一个公开推理格式；
+- 生成FP32和至少一种量化版本；
+- 固定20–100个Golden Inputs；
+- 比较数值与任务指标；
+- 在一台明确设备上测Load、First、Steady延迟；
+- 测峰值内存与包体；
+- 若能可靠测量再加能耗；
+- 注入不支持Shape、未知类别和Fallback。
+
+不需要追求最好数字。重点是测量协议和Evidence完整。
+
+## 作品需要留下哪些 Evidence
+
+```text
+source-model-manifest.json
+export-config.json
+operator-coverage.json
+quantization-config.json
+calibration-manifest.json
+golden-inputs.json
+numerical-diff.csv
+task-metrics-by-slice.json
+benchmark-environment.json
+latency-samples.csv
+memory-samples.csv
+energy-report-or-not-measured.json
+package-manifest.json
+compatibility-matrix.json
+release-gate.json
+```
+
+每个性能结果带：设备型号抽象标识、OS/Runtime版本、线程、功耗模式、输入Shape、样本数、Warm-up和环境温度/状态可得信息。公开内容不要包含私人设备账号或本地绝对路径。
+
+## 常见“看起来会、实际不会”的缺口
+
+| 看起来会 | 实际缺口 |
+| --- | --- |
+| 模型能导出 | 不检查算子回退和输出语义 |
+| 文件变小 | 不测关键切片质量和校准代表性 |
+| 延迟很低 | 只测一次Warm Run、无环境说明 |
+| 用了NPU/GPU | 实际部分或全部回退CPU |
+| 有平均延迟 | 无尾延迟、First Run和长时间热状态 |
+| 内存可接受 | 只看模型文件，不看峰值Arena/KV Cache |
+| 报了能耗 | 计量方法不可信或未控制其他负载 |
+| 一台设备通过 | 没有兼容矩阵、Fallback和包版本身份 |
+
+## 学习顺序
+
+1. 固定源模型、数据、预处理和Golden Inputs。
+2. 导出并做数值对齐。
+3. 检查算子覆盖与实际Provider。
+4. 建立可复现Latency/Memory基准。
+5. 进行量化与校准数据审计。
+6. 比较任务指标和误差切片。
+7. 加长时间、热状态、并发和Fallback测试。
+8. 建Package Manifest、兼容矩阵和Release Gate。
+9. 只有计量可靠时再加入能耗优化。
+
+## 抽象岗位能力映射
+
+| 能力 | 可观察产物 |
+| --- | --- |
+| 模型转换 | Export Contract、Graph和Operator Coverage |
+| 数值工程 | Golden对齐、误差与任务指标 |
+| 性能工程 | Warm-up、分位延迟、Memory和Profile |
+| 量化 | Calibration、配置、切片质量和调试 |
+| 设备/运行时 | Provider、线程、兼容矩阵和Fallback |
+| 可复现基准 | Manifest、环境、原始样本与统计脚本 |
+| 发布治理 | Package身份、多维门槛和回滚 |
+
+<Aside type="tip" title="方向验收线">
+把输入长度、线程数和设备功耗状态改动隐藏起来，再比较两个模型的平均延迟，会得到没有意义的结论。作品必须让第三方从Manifest重建测量条件，并看到原始样本与质量切片。
+</Aside>

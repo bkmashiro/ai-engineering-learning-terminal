@@ -1,0 +1,127 @@
+---
+---
+
+<figure class="reliability-boundary" aria-labelledby="reliability-boundary-title reliability-boundary-caption">
+  <div class="reliability-boundary__title">
+    <p id="reliability-boundary-title">事务边界之外，使用可重试协议收敛</p>
+    <span>不声称 Exactly-once</span>
+  </div>
+
+  <div class="reliability-boundary__flow">
+    <section>
+      <span>HTTP COMMAND</span>
+      <strong>Idempotency Key</strong>
+      <small>同一业务意图使用同一键</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section class="reliability-boundary__transaction">
+      <span>ONE DB TRANSACTION</span>
+      <strong>Task + Idempotency Record + Outbox</strong>
+      <small>业务状态与待发布事件一起提交</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section>
+      <span>BROKER</span>
+      <strong>At-least-once Delivery</strong>
+      <small>发布和消费都可能重试</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section>
+      <span>WORKER</span>
+      <strong>Inbox / Effect Ledger</strong>
+      <small>先去重，再执行可验证副作用</small>
+    </section>
+  </div>
+
+  <div class="reliability-boundary__recovery">
+    <section>
+      <span>UNKNOWN OUTCOME</span>
+      <strong>查询幂等记录</strong>
+      <small>超时后先查状态，不用新键盲目重放。</small>
+    </section>
+    <section>
+      <span>PARTIAL EFFECT</span>
+      <strong>对账或补偿</strong>
+      <small>补偿是新的业务动作，不是数据库回滚的远程版本。</small>
+    </section>
+    <section>
+      <span>POISON MESSAGE</span>
+      <strong>有限重试后隔离</strong>
+      <small>保留输入、错误分类和重放条件，不无限 requeue。</small>
+    </section>
+    <section>
+      <span>CACHE</span>
+      <strong>只作派生视图</strong>
+      <small>命中与否不能改变权威写入规则。</small>
+    </section>
+  </div>
+
+  <figcaption id="reliability-boundary-caption">
+    数据库事务只能原子地保护它覆盖的资源。跨数据库、消息代理和外部 API 的流程，需要幂等记录、Outbox、去重、对账与补偿共同收敛。
+  </figcaption>
+</figure>
+
+<style>
+  .reliability-boundary {
+    display: grid;
+    gap: 0.85rem;
+    margin-block: 1.5rem;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.875rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 3%, var(--sl-color-bg));
+  }
+
+  .reliability-boundary__title { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+  .reliability-boundary__title p { margin: 0; font-size: 1rem; font-weight: 750; }
+  .reliability-boundary__title span,
+  .reliability-boundary section > span {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.875rem;
+    font-weight: 750;
+  }
+
+  .reliability-boundary__flow {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) auto minmax(0, 1.35fr) auto minmax(0, 0.9fr) auto minmax(0, 1fr);
+    align-items: stretch;
+    gap: 0.45rem;
+  }
+
+  .reliability-boundary section {
+    display: grid;
+    align-content: start;
+    gap: 0.28rem;
+    min-width: 0;
+    padding: 0.75rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.6rem;
+    background: var(--sl-color-bg);
+  }
+
+  .reliability-boundary__transaction { border-width: 2px !important; border-color: var(--sl-color-accent) !important; }
+  .reliability-boundary__flow b { align-self: center; color: var(--sl-color-accent-high); font-size: 1.2rem; }
+  .reliability-boundary strong { font-size: 0.875rem; }
+  .reliability-boundary small,
+  .reliability-boundary figcaption { color: var(--sl-color-gray-2); font-size: 0.875rem; line-height: 1.5; }
+
+  .reliability-boundary__recovery {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.55rem;
+  }
+
+  .reliability-boundary figcaption { padding-top: 0.875rem; border-top: 1px dashed var(--sl-color-gray-5); }
+
+  @media (max-width: 62rem) {
+    .reliability-boundary__flow { grid-template-columns: 1fr; }
+    .reliability-boundary__flow b { justify-self: center; transform: rotate(90deg); }
+    .reliability-boundary__recovery { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
+  @media (max-width: 36rem) {
+    .reliability-boundary__title { display: grid; }
+    .reliability-boundary__recovery { grid-template-columns: 1fr; }
+  }
+</style>
