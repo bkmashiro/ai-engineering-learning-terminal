@@ -871,6 +871,19 @@ async function runAcceptanceProbes(): Promise<void> {
   assert.equal(deadline.reason, 'deadline-exhausted');
 
   const writeProposal: ToolProposal = { kind: 'tool', tool: 'saveDraft', arguments: { draftId: 'draft-1' } };
+  const adapterUnknownWrite = await runControlledAgent(
+    'preserve recovery metadata for an adapter-reported unknown write',
+    scriptedDependencies([writeProposal], [{ status: 'unknown', code: 'write-response-lost' }]),
+    testOptions(),
+  );
+  assert.equal(adapterUnknownWrite.reason, 'unknown-effect');
+  assert.equal(
+    adapterUnknownWrite.trace.some(
+      (event) => event.type === 'effect.reconciliation-required' && event.detail.recovery === 'query',
+    ),
+    true,
+  );
+
   const uncertainWriteDependencies = scriptedDependencies([writeProposal], []);
   uncertainWriteDependencies.invoke = async () => await new Promise<ToolResult>(() => undefined);
   const uncertainWrite = await runControlledAgent(
@@ -932,7 +945,7 @@ await runAcceptanceProbes();
 
 参数规范化会递归排序对象键，但保留数组顺序，因为数组通常表达有序参数；如果某个数组在业务上是集合，应由该工具的Schema先定义去重和排序规则。模型与工具Adapter的一次调用必须对应一次可计费尝试，不能在内部隐藏不扣预算的重试。
 
-代码末尾的十三组Acceptance Probe会实际检查深层规范化、状态变化后的合法重复、无进展循环、模型错误、完成验证错误、模型调用预算、只读未知结果、依赖输入隔离、Run Deadline、未知写入、执行中取消写入、执行中取消读取与预先取消。仓库的Snippet Gate会先用TypeScript strict编译，再真正执行它：
+代码末尾的十四组Acceptance Probe会实际检查深层规范化、状态变化后的合法重复、无进展循环、模型错误、完成验证错误、模型调用预算、只读未知结果、依赖输入隔离、Run Deadline、Adapter报告的未知写入、Timeout后的未知写入、执行中取消写入、执行中取消读取与预先取消。仓库的Snippet Gate会先用TypeScript strict编译，再真正执行它：
 
 ```bash
 pnpm verify:snippets
