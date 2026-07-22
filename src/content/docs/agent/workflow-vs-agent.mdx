@@ -385,12 +385,19 @@ run.stopped           completion | failure | cancellation | budget | handoff
 
 单看最终答案会漏掉危险的“碰巧成功”：系统可能调用过越权工具，或重复写入后只展示最后一次结果。过程断言与结果断言都需要。
 
-### 12. 一个可编译的最小Runner
+### 12. 一个可执行的最小Runner
 
-下面的实现只演示本章边界：模型提出一步，程序维护预算、动作白名单、重复检测、Timeout和完成验证。下一章会继续展开工具契约、Capability、权威状态与记忆写入。
+下面的实现只演示本章边界：模型提出一步，程序维护模型与工具预算、动作白名单、状态版本、重复检测、Timeout和完成验证。下一章会继续展开工具契约、Capability、权威状态与记忆写入。
 
-```ts title="examples/workflow-runner.ts"
+```ts title="examples/workflow-runner.runnable.ts"
+import assert from 'node:assert/strict';
+
 type ToolName = 'lookup' | 'saveDraft';
+
+interface ToolPolicy {
+  sideEffect: 'none' | 'write';
+  canQuery: boolean;
+}
 
 type ToolProposal = {
   kind: 'tool';
@@ -417,8 +424,11 @@ type StopReason =
   | 'invalid-proposal'
   | 'repeated-proposal'
   | 'step-budget-exhausted'
+  | 'model-call-budget-exhausted'
   | 'tool-call-budget-exhausted'
   | 'deadline-exhausted'
+  | 'model-failed'
+  | 'verification-failed'
   | 'tool-failed'
   | 'unknown-effect';
 
@@ -426,7 +436,9 @@ interface PublicState {
   runId: string;
   goal: string;
   observations: string[];
+  version: number;
   step: number;
+  modelCalls: number;
   toolCalls: number;
 }
 
@@ -437,15 +449,25 @@ interface TraceEvent {
 }
 
 interface Dependencies {
-  propose(state: Readonly<PublicState>, allowedTools: readonly ToolName[]): Promise<Proposal>;
+  propose(
+    state: Readonly<PublicState>,
+    allowedTools: readonly ToolName[],
+    signal: AbortSignal,
+  ): Promise<Proposal>;
   invoke(proposal: ValidatedToolProposal, signal: AbortSignal): Promise<ToolResult>;
-  verifyCompletion(state: Readonly<PublicState>, answer: string): Promise<boolean>;
+  verifyCompletion(
+    state: Readonly<PublicState>,
+    answer: string,
+    signal: AbortSignal,
+  ): Promise<boolean>;
   now(): number;
 }
 
 interface RunOptions {
   maxSteps: number;
+  maxModelCalls: number;
   maxToolCalls: number;
+  modelTimeoutMs: number;
   toolTimeoutMs: number;
   deadlineMs: number;
   signal: AbortSignal;
@@ -459,42 +481,65 @@ interface RunOutcome {
 }
 
 const allowedTools = ['lookup', 'saveDraft'] as const;
+const toolPolicies: Record<ToolName, ToolPolicy> = {
+  lookup: { sideEffect: 'none', canQuery: false },
+  saveDraft: { sideEffect: 'write', canQuery: true },
+};
 
-function normalizeArguments(value: Record<string, unknown>): string {
-  return JSON.stringify(
-    Object.entries(value).sort(([left], [right]) => left.localeCompare(right)),
-  );
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nested]) => [key, canonicalize(nested)]);
+    return Object.fromEntries(entries);
+  }
+  return value;
 }
 
-function proposalFingerprint(proposal: ValidatedToolProposal): string {
-  return `${proposal.tool}:${normalizeArguments(proposal.arguments)}`;
+function normalizeArguments(value: Record<string, unknown>): string {
+  return JSON.stringify(canonicalize(value));
+}
+
+function proposalFingerprint(stateVersion: number, proposal: ValidatedToolProposal): string {
+  return `${stateVersion}:${proposal.tool}:${normalizeArguments(proposal.arguments)}`;
 }
 
 function isAllowedTool(value: string): value is ToolName {
   return allowedTools.some((tool) => tool === value);
 }
 
-class ToolTimeoutError extends Error {}
+class OperationTimeoutError extends Error {}
+class OperationCancelledError extends Error {}
 
 async function withTimeout<T>(
   timeoutMs: number,
   parentSignal: AbortSignal,
   operation: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
+  if (timeoutMs <= 0) throw new OperationTimeoutError('operation-timeout');
+  if (parentSignal.aborted) throw new OperationCancelledError('operation-cancelled');
+
   const controller = new AbortController();
-  const abortFromParent = () => controller.abort(parentSignal.reason);
-  if (parentSignal.aborted) controller.abort(parentSignal.reason);
-  else parentSignal.addEventListener('abort', abortFromParent, { once: true });
+  let rejectCancellation: (error: OperationCancelledError) => void = () => undefined;
+  const abortFromParent = () => {
+    controller.abort(parentSignal.reason);
+    rejectCancellation(new OperationCancelledError('operation-cancelled'));
+  };
+  parentSignal.addEventListener('abort', abortFromParent, { once: true });
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       controller.abort('timeout');
-      reject(new ToolTimeoutError('tool-timeout'));
+      reject(new OperationTimeoutError('operation-timeout'));
     }, timeoutMs);
   });
+  const cancellation = new Promise<never>((_, reject) => {
+    rejectCancellation = reject;
+  });
   try {
-    return await Promise.race([operation(controller.signal), timeout]);
+    return await Promise.race([operation(controller.signal), timeout, cancellation]);
   } finally {
     if (timer) clearTimeout(timer);
     parentSignal.removeEventListener('abort', abortFromParent);
@@ -510,34 +555,90 @@ export async function runControlledAgent(
     runId: 'run-demo',
     goal,
     observations: [],
+    version: 0,
     step: 0,
+    modelCalls: 0,
     toolCalls: 0,
   };
   const trace: TraceEvent[] = [];
   const seen = new Set<string>();
   const deadlineAt = dependencies.now() + options.deadlineMs;
-
-  const stop = (reason: StopReason, answer?: string): RunOutcome => ({
-    reason,
-    answer,
-    state: { ...state, observations: [...state.observations] },
-    trace: [...trace],
+  const remainingMs = () => deadlineAt - dependencies.now();
+  const snapshotState = (): PublicState => ({
+    ...state,
+    observations: [...state.observations],
   });
+
+  const stop = (reason: StopReason, answer?: string): RunOutcome => {
+    trace.push({
+      type: 'run.stopped',
+      step: state.step,
+      detail: {
+        reason,
+        stateVersion: state.version,
+        remainingModelCalls: Math.max(0, options.maxModelCalls - state.modelCalls),
+        remainingToolCalls: Math.max(0, options.maxToolCalls - state.toolCalls),
+      },
+    });
+    return { reason, answer, state: snapshotState(), trace: [...trace] };
+  };
 
   while (state.step < options.maxSteps) {
     if (options.signal.aborted) return stop('cancelled');
-    if (dependencies.now() >= deadlineAt) return stop('deadline-exhausted');
+    const modelRemainingMs = remainingMs();
+    if (modelRemainingMs <= 0) return stop('deadline-exhausted');
+    if (state.modelCalls >= options.maxModelCalls) return stop('model-call-budget-exhausted');
 
-    const proposal = await dependencies.propose(state, allowedTools);
-    trace.push({ type: 'proposal.received', step: state.step, detail: { kind: proposal.kind } });
+    const modelDeadlineBound = modelRemainingMs <= options.modelTimeoutMs;
+    const effectiveModelTimeoutMs = Math.min(options.modelTimeoutMs, modelRemainingMs);
+    state.modelCalls += 1;
 
-    if (proposal.kind === 'clarify') {
-      trace.push({ type: 'run.stopped', step: state.step, detail: { reason: 'clarification-required' } });
-      return stop('clarification-required');
+    let proposal: Proposal;
+    try {
+      proposal = await withTimeout(effectiveModelTimeoutMs, options.signal, (signal) =>
+        dependencies.propose(snapshotState(), allowedTools, signal),
+      );
+    } catch (error) {
+      const timedOut = error instanceof OperationTimeoutError;
+      trace.push({
+        type: 'model.failed',
+        step: state.step,
+        detail: { timedOut, cancelled: options.signal.aborted },
+      });
+      if (options.signal.aborted || error instanceof OperationCancelledError) return stop('cancelled');
+      if (timedOut && modelDeadlineBound) return stop('deadline-exhausted');
+      return stop('model-failed');
     }
+    trace.push({
+      type: 'proposal.received',
+      step: state.step,
+      detail: { kind: proposal.kind, modelCalls: state.modelCalls },
+    });
+
+    if (proposal.kind === 'clarify') return stop('clarification-required');
 
     if (proposal.kind === 'complete') {
-      const verified = await dependencies.verifyCompletion(state, proposal.answer);
+      const verificationRemainingMs = remainingMs();
+      if (verificationRemainingMs <= 0) return stop('deadline-exhausted');
+      const verificationDeadlineBound = verificationRemainingMs <= options.toolTimeoutMs;
+      let verified: boolean;
+      try {
+        verified = await withTimeout(
+          Math.min(options.toolTimeoutMs, verificationRemainingMs),
+          options.signal,
+          (signal) => dependencies.verifyCompletion(snapshotState(), proposal.answer, signal),
+        );
+      } catch (error) {
+        const timedOut = error instanceof OperationTimeoutError;
+        trace.push({
+          type: 'completion.failed',
+          step: state.step,
+          detail: { timedOut, cancelled: options.signal.aborted },
+        });
+        if (options.signal.aborted || error instanceof OperationCancelledError) return stop('cancelled');
+        if (timedOut && verificationDeadlineBound) return stop('deadline-exhausted');
+        return stop('verification-failed');
+      }
       trace.push({ type: 'completion.verified', step: state.step, detail: { verified } });
       if (verified) return stop('completed', proposal.answer);
       state.step += 1;
@@ -547,27 +648,54 @@ export async function runControlledAgent(
     if (!isAllowedTool(proposal.tool)) return stop('invalid-proposal');
     if (state.toolCalls >= options.maxToolCalls) return stop('tool-call-budget-exhausted');
 
-    const validatedProposal: ValidatedToolProposal = { ...proposal, tool: proposal.tool };
-
-    const fingerprint = proposalFingerprint(validatedProposal);
+    const validatedProposal: ValidatedToolProposal = {
+      ...proposal,
+      tool: proposal.tool,
+      arguments: canonicalize(proposal.arguments) as Record<string, unknown>,
+    };
+    const toolPolicy = toolPolicies[validatedProposal.tool];
+    const fingerprint = proposalFingerprint(state.version, validatedProposal);
     if (seen.has(fingerprint)) return stop('repeated-proposal');
     seen.add(fingerprint);
+
+    const toolRemainingMs = remainingMs();
+    if (toolRemainingMs <= 0) return stop('deadline-exhausted');
+    const toolDeadlineBound = toolRemainingMs <= options.toolTimeoutMs;
+    const effectiveToolTimeoutMs = Math.min(options.toolTimeoutMs, toolRemainingMs);
 
     state.toolCalls += 1;
     let result: ToolResult;
     try {
-      result = await withTimeout(options.toolTimeoutMs, options.signal, (signal) =>
+      result = await withTimeout(effectiveToolTimeoutMs, options.signal, (signal) =>
         dependencies.invoke(validatedProposal, signal),
       );
     } catch (error) {
-      const timedOut = error instanceof ToolTimeoutError;
+      const timedOut = error instanceof OperationTimeoutError;
       trace.push({
         type: 'tool.failed',
         step: state.step,
-        detail: { tool: validatedProposal.tool, timedOut, cancelled: options.signal.aborted },
+        detail: {
+          tool: validatedProposal.tool,
+          sideEffect: toolPolicy.sideEffect,
+          timedOut,
+          cancelled: options.signal.aborted,
+        },
       });
-      if (options.signal.aborted) return stop('cancelled');
-      if (timedOut && validatedProposal.tool === 'saveDraft') return stop('unknown-effect');
+      const cancelled = options.signal.aborted || error instanceof OperationCancelledError;
+      if (cancelled && toolPolicy.sideEffect === 'none') return stop('cancelled');
+      if (toolPolicy.sideEffect === 'write') {
+        trace.push({
+          type: 'effect.reconciliation-required',
+          step: state.step,
+          detail: {
+            tool: validatedProposal.tool,
+            trigger: cancelled ? 'cancellation' : timedOut ? 'timeout' : 'exception',
+            recovery: toolPolicy.canQuery ? 'query' : 'human',
+          },
+        });
+        return stop('unknown-effect');
+      }
+      if (timedOut && toolDeadlineBound) return stop('deadline-exhausted');
       return stop('tool-failed');
     }
     trace.push({
@@ -576,27 +704,239 @@ export async function runControlledAgent(
       detail: { tool: validatedProposal.tool, status: result.status },
     });
 
-    if (result.status === 'unknown') return stop('unknown-effect');
-    if (result.status === 'failed' && !result.retryable) return stop('tool-failed');
-    if (result.status === 'failed') {
-      state.step += 1;
-      continue;
+    if (result.status === 'unknown') {
+      if (toolPolicy.sideEffect === 'write') {
+        trace.push({
+          type: 'effect.reconciliation-required',
+          step: state.step,
+          detail: { tool: validatedProposal.tool, recovery: toolPolicy.canQuery ? 'query' : 'human' },
+        });
+        return stop('unknown-effect');
+      }
+      return stop('tool-failed');
     }
+    if (result.status === 'failed' && !result.retryable) return stop('tool-failed');
 
-    state.observations.push(result.observation);
+    const observation = result.status === 'success'
+      ? result.observation
+      : `tool:${validatedProposal.tool}:failed:${result.code}`;
+    const changed = !state.observations.includes(observation);
+    if (changed) {
+      state.observations.push(observation);
+      state.version += 1;
+    }
     state.step += 1;
     trace.push({
       type: 'state.transitioned',
       step: state.step,
-      detail: { observationCount: state.observations.length },
+      detail: {
+        changed,
+        stateVersion: state.version,
+        observationCount: state.observations.length,
+      },
     });
   }
 
   return stop('step-budget-exhausted');
 }
+
+function testOptions(overrides: Partial<RunOptions> = {}): RunOptions {
+  return {
+    maxSteps: 8,
+    maxModelCalls: 8,
+    maxToolCalls: 8,
+    modelTimeoutMs: 50,
+    toolTimeoutMs: 50,
+    deadlineMs: 500,
+    signal: new AbortController().signal,
+    ...overrides,
+  };
+}
+
+function scriptedDependencies(
+  proposals: Proposal[],
+  results: ToolResult[],
+): Dependencies {
+  let proposalIndex = 0;
+  let resultIndex = 0;
+  return {
+    async propose(_state, _allowedTools, signal) {
+      if (signal.aborted) throw new OperationCancelledError('model-cancelled');
+      const proposal = proposals[proposalIndex++];
+      if (!proposal) throw new Error('missing-scripted-proposal');
+      return proposal;
+    },
+    async invoke(_proposal, signal) {
+      if (signal.aborted) throw new OperationCancelledError('tool-cancelled');
+      const result = results[resultIndex++];
+      if (!result) throw new Error('missing-scripted-result');
+      return result;
+    },
+    async verifyCompletion(_state, _answer, signal) {
+      if (signal.aborted) throw new OperationCancelledError('verification-cancelled');
+      return true;
+    },
+    now: () => Date.now(),
+  };
+}
+
+async function runAcceptanceProbes(): Promise<void> {
+  assert.equal(
+    normalizeArguments({ z: { b: 2, a: 1 }, a: [{ d: 4, c: 3 }] }),
+    normalizeArguments({ a: [{ c: 3, d: 4 }], z: { a: 1, b: 2 } }),
+  );
+  assert.notEqual(normalizeArguments({ values: [1, 2] }), normalizeArguments({ values: [2, 1] }));
+
+  const lookup: ToolProposal = { kind: 'tool', tool: 'lookup', arguments: { query: { b: 2, a: 1 } } };
+  const completed = await runControlledAgent(
+    'collect two distinct observations',
+    scriptedDependencies(
+      [lookup, lookup, { kind: 'complete', answer: 'done' }],
+      [
+        { status: 'success', observation: 'observation-a' },
+        { status: 'success', observation: 'observation-b' },
+      ],
+    ),
+    testOptions(),
+  );
+  assert.equal(completed.reason, 'completed');
+  assert.equal(completed.state.version, 2);
+  assert.equal(completed.state.toolCalls, 2);
+
+  const repeated = await runControlledAgent(
+    'stop when an action no longer changes state',
+    scriptedDependencies(
+      [lookup, lookup, lookup],
+      [
+        { status: 'success', observation: 'same-observation' },
+        { status: 'success', observation: 'same-observation' },
+      ],
+    ),
+    testOptions(),
+  );
+  assert.equal(repeated.reason, 'repeated-proposal');
+  assert.equal(repeated.state.version, 1);
+  assert.equal(repeated.state.toolCalls, 2);
+
+  const modelFailureDependencies = scriptedDependencies([], []);
+  modelFailureDependencies.propose = async () => { throw new Error('provider-down'); };
+  const modelFailure = await runControlledAgent('classify model failure', modelFailureDependencies, testOptions());
+  assert.equal(modelFailure.reason, 'model-failed');
+  assert.equal(modelFailure.trace.at(-2)?.type, 'model.failed');
+  assert.equal(modelFailure.trace.at(-1)?.type, 'run.stopped');
+
+  const verificationFailureDependencies = scriptedDependencies(
+    [{ kind: 'complete', answer: 'unverified' }],
+    [],
+  );
+  verificationFailureDependencies.verifyCompletion = async () => {
+    throw new Error('verification-store-down');
+  };
+  const verificationFailure = await runControlledAgent(
+    'classify verification failure',
+    verificationFailureDependencies,
+    testOptions(),
+  );
+  assert.equal(verificationFailure.reason, 'verification-failed');
+
+  const modelBudget = await runControlledAgent(
+    'respect model budget',
+    scriptedDependencies([], []),
+    testOptions({ maxModelCalls: 0 }),
+  );
+  assert.equal(modelBudget.reason, 'model-call-budget-exhausted');
+
+  const uncertainRead = await runControlledAgent(
+    'do not invent a side effect for a read',
+    scriptedDependencies([lookup], [{ status: 'unknown', code: 'read-response-lost' }]),
+    testOptions(),
+  );
+  assert.equal(uncertainRead.reason, 'tool-failed');
+
+  const isolationDependencies = scriptedDependencies([], []);
+  isolationDependencies.propose = async (state) => {
+    (state as PublicState).observations.push('attempted-external-mutation');
+    return { kind: 'clarify', question: 'need input' };
+  };
+  const isolated = await runControlledAgent('isolate dependency input', isolationDependencies, testOptions());
+  assert.deepEqual(isolated.state.observations, []);
+
+  const deadlineDependencies = scriptedDependencies([lookup], []);
+  deadlineDependencies.invoke = async () => await new Promise<ToolResult>(() => undefined);
+  const deadline = await runControlledAgent(
+    'bound a read by remaining run time',
+    deadlineDependencies,
+    testOptions({ deadlineMs: 10, toolTimeoutMs: 100 }),
+  );
+  assert.equal(deadline.reason, 'deadline-exhausted');
+
+  const writeProposal: ToolProposal = { kind: 'tool', tool: 'saveDraft', arguments: { draftId: 'draft-1' } };
+  const uncertainWriteDependencies = scriptedDependencies([writeProposal], []);
+  uncertainWriteDependencies.invoke = async () => await new Promise<ToolResult>(() => undefined);
+  const uncertainWrite = await runControlledAgent(
+    'classify uncertain write by metadata',
+    uncertainWriteDependencies,
+    testOptions({ deadlineMs: 100, toolTimeoutMs: 5 }),
+  );
+  assert.equal(uncertainWrite.reason, 'unknown-effect');
+  assert.equal(
+    uncertainWrite.trace.some((event) => event.type === 'effect.reconciliation-required'),
+    true,
+  );
+
+  const writeCancellationController = new AbortController();
+  const cancelledWriteDependencies = scriptedDependencies([writeProposal], []);
+  cancelledWriteDependencies.invoke = async () => await new Promise<ToolResult>(() => {
+    setTimeout(() => writeCancellationController.abort('cancel-during-write'), 1);
+  });
+  const cancelledWrite = await runControlledAgent(
+    'reconcile a write cancelled in flight',
+    cancelledWriteDependencies,
+    testOptions({ signal: writeCancellationController.signal }),
+  );
+  assert.equal(cancelledWrite.reason, 'unknown-effect');
+  assert.equal(
+    cancelledWrite.trace.some(
+      (event) => event.type === 'effect.reconciliation-required' && event.detail.trigger === 'cancellation',
+    ),
+    true,
+  );
+
+  const readCancellationController = new AbortController();
+  const cancelledReadDependencies = scriptedDependencies([lookup], []);
+  cancelledReadDependencies.invoke = async () => await new Promise<ToolResult>(() => {
+    setTimeout(() => readCancellationController.abort('cancel-during-read'), 1);
+  });
+  const cancelledRead = await runControlledAgent(
+    'cancel a read in flight',
+    cancelledReadDependencies,
+    testOptions({ signal: readCancellationController.signal }),
+  );
+  assert.equal(cancelledRead.reason, 'cancelled');
+
+  const cancelledController = new AbortController();
+  cancelledController.abort('user-cancelled');
+  const cancelled = await runControlledAgent(
+    'stop before any new work',
+    scriptedDependencies([], []),
+    testOptions({ signal: cancelledController.signal }),
+  );
+  assert.equal(cancelled.reason, 'cancelled');
+  assert.equal(cancelled.state.modelCalls, 0);
+}
+
+await runAcceptanceProbes();
 ```
 
 这个接口把`Proposal`视为已经通过基础Schema解析的候选；真实模型Adapter必须先把原始输出当作`unknown`解析，拒绝缺字段、错类型和多余危险字段。Runner随后再用`isAllowedTool`把任意工具名收窄到当前Run允许的动作集合。
+
+参数规范化会递归排序对象键，但保留数组顺序，因为数组通常表达有序参数；如果某个数组在业务上是集合，应由该工具的Schema先定义去重和排序规则。模型与工具Adapter的一次调用必须对应一次可计费尝试，不能在内部隐藏不扣预算的重试。
+
+代码末尾的十三组Acceptance Probe会实际检查深层规范化、状态变化后的合法重复、无进展循环、模型错误、完成验证错误、模型调用预算、只读未知结果、依赖输入隔离、Run Deadline、未知写入、执行中取消写入、执行中取消读取与预先取消。仓库的Snippet Gate会先用TypeScript strict编译，再真正执行它：
+
+```bash
+pnpm verify:snippets
+```
 
 这个例子故意没有把所有生产问题都塞进一个文件。它仍需在下一章补上：工具输入输出Schema、权限Capability、稳定幂等身份、持久Run State、并发版本、长期记忆和副作用对账。
 

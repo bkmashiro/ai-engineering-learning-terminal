@@ -99,6 +99,13 @@ try {
     ], tempRoot);
   }
 
+  const runnableTypeScriptFiles = typeScriptFiles.filter((item) => basename(item.path).endsWith('.runnable.ts'));
+  if (runnableTypeScriptFiles.length > 0) {
+    const tsx = resolve(projectRoot, 'node_modules/tsx/dist/cli.mjs');
+    if (!existsSync(tsx)) throw new Error('tsx is unavailable; run pnpm install first');
+    for (const item of runnableTypeScriptFiles) run(process.execPath, [tsx, item.path], tempRoot);
+  }
+
   const pythonFiles = written.filter((item) => extname(item.path) === '.py');
   for (const item of pythonFiles) {
     if (!item.content.includes('# /// script') || !item.content.includes('# dependencies = [')) {
@@ -111,7 +118,7 @@ try {
   for (const item of jsonFiles) JSON.parse(item.content);
 
   console.log(
-    `Course snippets verified: ${typeScriptFiles.length} TypeScript, ${pythonFiles.length} Python, ${jsonFiles.length} JSON.`,
+    `Course snippets verified: ${typeScriptFiles.length} TypeScript (${runnableTypeScriptFiles.length} executed), ${pythonFiles.length} Python, ${jsonFiles.length} JSON.`,
   );
 } finally {
   await rm(tempRoot, { recursive: true, force: true });
