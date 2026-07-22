@@ -62,6 +62,7 @@ export default defineConfig({
             { label: '状态、事件与复杂度', slug: 'foundations/software-systems/state-and-events' },
             { label: '网络、流式与取消', slug: 'foundations/software-systems/network-streaming' },
             { label: '事务、缓存与队列', slug: 'foundations/software-systems/data-reliability' },
+            { label: '缓存工程：复用、失效与一致性', slug: 'foundations/software-systems/cache-reuse-consistency' },
             { label: '数据资产生命周期', slug: 'foundations/software-systems/data-asset-lifecycle' },
             { label: '机器学习与实验', slug: 'foundations/ml' },
           ],

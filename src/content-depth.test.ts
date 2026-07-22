@@ -13,6 +13,7 @@ interface CoreLessonContract {
   failureTable: string;
   experiment: string;
   canonicalTerm: string;
+  estimatedMinutes?: number;
   component?: string;
 }
 
@@ -49,6 +50,18 @@ const coreLessons: CoreLessonContract[] = [
     experiment: '故障注入实验',
     canonicalTerm: '<Term id="transactional-outbox" />',
     component: '<ReliabilityBoundaryDiagram />',
+  },
+  {
+    name: 'cache-reuse-consistency',
+    path: './content/docs/foundations/software-systems/cache-reuse-consistency.mdx',
+    moduleId: 'cache-reuse-consistency',
+    mechanism: 'Cache Identity：命中不是“Key存在”',
+    derivation: 'FillAmplification = \\frac{FillAttempts}{LogicalFillEpisodes}',
+    failureTable: '故障诊断矩阵',
+    experiment: '故障注入实验与验收标准',
+    canonicalTerm: '<Term id="cache-admission" />',
+    estimatedMinutes: 120,
+    component: '<CacheIdentityAndFillDiagram />',
   },
   {
     name: 'ml-experiments',
@@ -147,7 +160,7 @@ describe('core lesson depth contracts', () => {
 
       expect(lesson.length).toBeGreaterThan(12_000);
       expect(lesson).toContain(`moduleId: ${contract.moduleId}`);
-      expect(lesson).toContain('estimatedMinutes: 90');
+      expect(lesson).toContain(`estimatedMinutes: ${contract.estimatedMinutes ?? 90}`);
       expect(lesson).toContain('difficulty: core');
       expect(lesson).toContain('<ModuleProgress moduleId="');
       expect(lesson).toContain('<ModulePrerequisites moduleId="');
@@ -232,6 +245,7 @@ describe('teaching diagram contracts', () => {
     ['./components/content/EvidenceBundleDiagram.astro', 'evidence-bundle'],
     ['./components/content/StateTransitionDiagram.astro', 'state-transition'],
     ['./components/content/ReliabilityBoundaryDiagram.astro', 'reliability-boundary'],
+    ['./components/content/CacheIdentityAndFillDiagram.astro', 'cache-identity-fill'],
     ['./components/content/ExperimentSplitDiagram.astro', 'experiment-split'],
     ['./components/content/DataAssetLifecycleDiagram.astro', 'data-asset-lifecycle'],
     ['./components/content/RetrievalPipelineDiagram.astro', 'retrieval-pipeline'],

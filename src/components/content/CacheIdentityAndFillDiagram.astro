@@ -1,0 +1,193 @@
+---
+---
+
+<figure class="cache-identity-fill" aria-labelledby="cache-identity-fill-title cache-identity-fill-caption">
+  <header class="cache-identity-fill__header">
+    <p id="cache-identity-fill-title">一次安全命中要同时通过身份、时效和并发所有权检查</p>
+    <span>Cache is a rebuildable optimization layer</span>
+  </header>
+
+  <div class="cache-identity-fill__flow" aria-label="缓存请求、身份检查、命中和回填流程">
+    <section class="cache-identity-fill__request">
+      <span>REQUEST</span>
+      <strong>业务输入与安全作用域</strong>
+      <small>资源、租户、Principal Scope、Generation、Permission Revision、Variant</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section class="cache-identity-fill__identity">
+      <span>IDENTITY GATE</span>
+      <strong>Canonical Key + Serve Guard</strong>
+      <small>Key决定查哪一项；Serve Guard再次检查当前权威版本和权限。</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section class="cache-identity-fill__freshness">
+      <span>FRESHNESS GATE</span>
+      <strong>Fresh / SWR / SIE / Miss</strong>
+      <small>Stale只能在明确策略窗口内服务，不能绕过身份与权限。</small>
+    </section>
+    <b aria-hidden="true">→</b>
+    <section class="cache-identity-fill__result">
+      <span>RESULT</span>
+      <strong>Safe Hit 或受控 Miss</strong>
+      <small>记录命中类型、字节、节省计算、延迟和证据。</small>
+    </section>
+  </div>
+
+  <div class="cache-identity-fill__fill">
+    <section>
+      <span>MISS EPISODE</span>
+      <strong>Singleflight</strong>
+      <small>同一进程或同一协调域内合并重复 Fill；跨域仍可能放大。</small>
+    </section>
+    <section>
+      <span>OWNERSHIP</span>
+      <strong>Lease + Fencing Token</strong>
+      <small>Lease允许接管；Fencing Token拒绝旧Owner迟到写入。</small>
+    </section>
+    <section>
+      <span>ADMISSION</span>
+      <strong>价值判断</strong>
+      <small>先决定新对象是否值得进入，再决定需要淘汰谁。</small>
+    </section>
+    <section>
+      <span>INVALIDATION</span>
+      <strong>Versioned Key + Event + Reconciliation</strong>
+      <small>版本切换阻断旧命中；事件加快清理；对账修复丢失通知。</small>
+    </section>
+  </div>
+
+  <aside class="cache-identity-fill__failure" aria-label="缓存故障边界">
+    <strong>拒绝服务旧值的硬门槛</strong>
+    <p>Generation 或 Permission Revision 不匹配、跨租户 Salt 不匹配、Fill Token 过期、语义候选未通过领域评测时，都必须按 Miss 或明确错误处理。</p>
+  </aside>
+
+  <figcaption id="cache-identity-fill-caption">
+    “Key存在”不是命中充分条件。安全命中是一个带证据的判定：对象身份仍等价、时效策略允许复用、权限没有收紧，并发回填结果来自当前Owner。
+  </figcaption>
+</figure>
+
+<style>
+  .cache-identity-fill {
+    display: grid;
+    gap: 0.9rem;
+    margin-block: 1.5rem;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.875rem;
+    background: color-mix(in srgb, var(--sl-color-accent) 3%, var(--sl-color-bg));
+  }
+
+  .cache-identity-fill__header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .cache-identity-fill__header p {
+    margin: 0;
+    font-size: 1rem;
+    font-weight: 750;
+  }
+
+  .cache-identity-fill__header span,
+  .cache-identity-fill section > span {
+    color: var(--sl-color-accent-high);
+    font-family: var(--sl-font-mono);
+    font-size: 0.875rem;
+    font-weight: 750;
+  }
+
+  .cache-identity-fill__flow {
+    display: grid;
+    grid-template-columns: 1fr;
+    align-items: stretch;
+    gap: 0.45rem;
+  }
+
+  .cache-identity-fill section {
+    display: grid;
+    align-content: start;
+    gap: 0.3rem;
+    min-width: 0;
+    padding: 0.75rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.625rem;
+    background: var(--sl-color-bg);
+  }
+
+  .cache-identity-fill__identity,
+  .cache-identity-fill__freshness {
+    border-width: 2px !important;
+    border-color: var(--sl-color-accent) !important;
+  }
+
+  .cache-identity-fill__flow > b {
+    align-self: center;
+    justify-self: center;
+    transform: rotate(90deg);
+    color: var(--sl-color-accent-high);
+    font-size: 1.2rem;
+  }
+
+  .cache-identity-fill strong {
+    font-size: 0.9rem;
+  }
+
+  .cache-identity-fill small,
+  .cache-identity-fill p,
+  .cache-identity-fill figcaption {
+    color: var(--sl-color-gray-2);
+    font-size: 0.875rem;
+    line-height: 1.55;
+  }
+
+  .cache-identity-fill__fill {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.55rem;
+  }
+
+  .cache-identity-fill__failure {
+    display: grid;
+    gap: 0.25rem;
+    padding: 0.8rem;
+    border-inline-start: 4px solid var(--sl-color-red-high);
+    border-radius: 0.5rem;
+    background: color-mix(in srgb, var(--sl-color-red) 7%, var(--sl-color-bg));
+  }
+
+  .cache-identity-fill__failure p {
+    margin: 0;
+  }
+
+  .cache-identity-fill figcaption {
+    padding-top: 0.875rem;
+    border-top: 1px dashed var(--sl-color-gray-5);
+  }
+
+  @media (max-width: 68rem) {
+    .cache-identity-fill__flow {
+      grid-template-columns: 1fr;
+    }
+
+    .cache-identity-fill__flow > b {
+      justify-self: center;
+      transform: rotate(90deg);
+    }
+
+    .cache-identity-fill__fill {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 38rem) {
+    .cache-identity-fill__header {
+      display: grid;
+    }
+
+    .cache-identity-fill__fill {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

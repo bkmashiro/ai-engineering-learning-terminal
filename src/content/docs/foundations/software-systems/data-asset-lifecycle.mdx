@@ -4,7 +4,7 @@ description: 用来源身份、不可变版本、派生血缘、变更事件和G
 moduleId: data-asset-lifecycle
 stage: software-systems
 prerequisites:
-  - data-reliability
+  - cache-reuse-consistency
 outcomes:
   - 为来源、转换任务和派生资产设计稳定身份、不可变版本与数据契约
   - 从更新、删除和权限变化事件计算影响集并让索引、缓存和导出最终收敛
@@ -445,7 +445,7 @@ interface DataReadReceipt {
 缓存键示意：
 
 ```text
-hash(query, principalScopeDigest, generationId, policyRevision)
+hash(query, principalScopeDigest, generationId, permissionRevision)
 ```
 
 如果缓存键没有Generation，索引切换后旧答案仍可能命中。如果没有Principal Scope，受限用户与公开用户可能共享结果。若Generation被回滚，缓存也要跟随回到匹配版本，不能混用前后数据。

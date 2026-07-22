@@ -6,6 +6,7 @@ stage: llm-applications
 prerequisites:
   - llm-foundations
   - network-streaming
+  - cache-reuse-consistency
 outcomes:
   - 把端到端延迟拆成排队、Prefill、Decode和网络输出并选择正确分位数
   - 根据Deadline、Token预算、KV容量和健康度实施准入、路由、降级与负载保护

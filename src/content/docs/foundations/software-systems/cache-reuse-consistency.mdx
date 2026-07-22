@@ -1,0 +1,1866 @@
+---
+title: 缓存工程：复用、失效与一致性
+description: 用工作集、版本化身份、并发回填、Admission与故障证据判断何时复用，以及怎样拒绝陈旧、越权或错误命中。
+moduleId: cache-reuse-consistency
+stage: software-systems
+prerequisites:
+  - data-reliability
+outcomes:
+  - 用Break-even、Reuse Distance和多维命中指标判断缓存是否产生净收益
+  - 设计包含Generation、Permission Revision与Cache Salt的缓存身份和失效协议
+  - 实现可比较LRU、频率Admission、TTL、Singleflight、Lease与Fencing的确定性模拟器
+estimatedMinutes: 120
+difficulty: core
+careerDirections:
+  - ai-backend-reliability
+  - llm-search-retrieval
+  - edge-inference
+sourceIds:
+  - rfc-9111-http-caching
+  - rfc-5861-stale-content
+  - rfc-9211-cache-status
+  - redis-eviction
+  - redis-client-side-caching
+  - working-set-paper
+  - counter-stacks-paper
+  - mattson-storage-hierarchies
+  - tinylfu-paper
+  - caffeine-cache-design
+  - go-singleflight
+  - leases-paper
+  - optimal-stampede-prevention
+  - vllm-prefix-caching
+  - gptcache-paper
+  - meancache-paper
+  - vcache-paper
+sourceLocale: zh-CN
+lastReviewed: 2026-07-22
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import CacheIdentityAndFillDiagram from '../../../../components/content/CacheIdentityAndFillDiagram.astro';
+import ModulePrerequisites from '../../../../components/content/ModulePrerequisites.astro';
+import Term from '../../../../components/content/Term.astro';
+import { ModuleProgress } from '../../../../components/learning/ModuleProgress';
+
+<ModuleProgress moduleId="cache-reuse-consistency" client:load />
+
+<ModulePrerequisites moduleId="cache-reuse-consistency" />
+
+一个文档问答服务把结果缓存了十分钟。请求第一次到达时，资源处于：
+
+```text
+resourceId = document-7
+generation = 41
+principalScope = reader-group-a
+permissionRevision = 8
+```
+
+两分钟后，文档发布了新版本 `generation=42`；同时管理员收紧权限，`permissionRevision=9`。失效消息已经发出，但一个进程内 L1 没收到。随后同一主体再次请求，旧缓存项仍存在。
+
+如果系统只做下面的判断：
+
+```ts
+if (cache.has(resourceId)) return cache.get(resourceId);
+```
+
+它会返回旧内容。这个结果比一次普通 Miss 更难发现：延迟很低、HTTP 状态是成功、Origin 没有报错，甚至全局 Hit Rate 还会上升。真正的故障是缓存把“曾经可用”误判成“当前仍可复用”。
+
+本课把缓存视为**可重建的优化层**。默认规则是：删除全部缓存不能改变权威业务状态，只会增加回源成本。Write-Behind 等例外会在后文单独论证；只要系统已经向调用方确认写入，却把唯一新数据留在尚未持久化的缓存中，这一层就不再是普通缓存，而成为需要日志、复制和恢复协议的权威状态组件。
+
+课程产物不是一张架构图，而是一个确定性 TypeScript 实验：固定 Trace、虚拟时钟和 Seed，比较无缓存、Byte-LRU、频率/价值 Admission、TTL、Singleflight、Generation 切换与权限变化，并输出命中、字节、计算节省、Origin Calls、Fill Amplification、Unsafe Hit、Eviction 和延迟分位数。
+
+<CacheIdentityAndFillDiagram />
+
+## 一、定义安全命中
+
+### 1. 先固定四类证据
+
+本课使用四种标签。设计评审、Trace 和实验报告都要明确标注，不能把经验效果写成正确性保证。
+
+| 标签 | 含义 | 例子 |
+| --- | --- | --- |
+| Guarantee（G） | 在列出的前提、原子边界和运行时检查都成立时，可以由程序不变量验证 | Serve Guard 比较当前 Generation 与 Entry Generation，不相等就拒绝 |
+| Best Effort（B） | 降低概率、成本或恢复时间，但不能单独承担正确性 | TTL Jitter 减少同步过期，不保证没有 Stampede |
+| Unknown Outcome（U） | 超时、断线或进程崩溃后，调用方无法仅凭本地观察判断操作是否完成 | Fill Owner 向 Origin 发出请求后超时，不能断言 Origin 没有执行 |
+| Empirical（E） | 只对给定 Trace、容量、对象大小和成本模型成立 | 某个 Admission 策略在本实验中保住热点集合 |
+
+五条课程不变量：
+
+1. **Store 前先判断 Cacheability。** 不可重建、权限身份不清、变化太快或错误代价不可接受的结果默认 Bypass。
+2. **Hit 不是 Key 存在。** 必须同时通过 Identity、Authorization、Freshness 和 Policy Gate。
+3. **失效通知不是正确性证明。** 消息可能延迟、丢失、重复或乱序；Versioned Key 和 Serve Guard 阻断旧值，事件负责加快回收。
+4. **Unsafe Hit 比 Miss 更坏。** 受保护场景中 `unsafeServedHits` 必须为零，不能用命中率或成本节省抵扣。
+5. **缓存策略只对工作负载成立。** 所有算法比较必须绑定 Trace、时间窗口、容量单位、对象字节和 Origin 成本。
+
+<Aside type="caution" title="不要从缓存指标推导业务正确性">
+Request Hit Rate 很高，只能说明很多请求由缓存返回。它没有证明返回的是当前版本、当前权限范围或任务真值上的可替代答案。正确性 Gate 先于收益统计。
+</Aside>
+
+### 2. 具体工程问题：一次安全命中需要证明什么
+
+把一次请求写成：
+
+```text
+request = {
+  tenantId,
+  principalScope,
+  resourceId,
+  variant,
+  currentGeneration,
+  currentPermissionRevision,
+  policyRevision
+}
+```
+
+缓存项记录：
+
+```text
+entry = {
+  identity,
+  value,
+  insertedAt,
+  freshUntil,
+  staleWhileRevalidateUntil,
+  staleIfErrorUntil,
+  bytes,
+  originCompute,
+  fillToken
+}
+```
+
+一次安全命中至少满足：
+
+
+- `entry.identity` 与当前请求的结果等价身份一致；
+- 当前主体仍有权看到该值；
+- Freshness 策略允许复用；
+- Entry 不是旧 Fill Owner 的迟到写入；
+- 对近似缓存，还要满足任务真值上的可替代性门槛。
+
+可以把判定写成纯函数：
+
+```ts title="简化代码：Serve Guard"
+type ServeDecision =
+  | { kind: 'fresh-hit' }
+  | { kind: 'stale-hit'; policy: 'swr' | 'sie' }
+  | { kind: 'miss'; reason: string };
+
+function decideServe(
+  nowMs: number,
+  current: { generation: number; permissionRevision: number },
+  entry: {
+    generation: number;
+    permissionRevision: number;
+    freshUntilMs: number;
+    swrUntilMs: number;
+    sieUntilMs: number;
+  },
+  policy: { allowSWR: boolean; allowSIE: boolean; originFailed: boolean },
+): ServeDecision {
+  if (entry.generation !== current.generation) {
+    return { kind: 'miss', reason: 'generation-mismatch' };
+  }
+  if (entry.permissionRevision !== current.permissionRevision) {
+    return { kind: 'miss', reason: 'permission-revision-mismatch' };
+  }
+  if (nowMs <= entry.freshUntilMs) return { kind: 'fresh-hit' };
+  if (policy.allowSWR && nowMs <= entry.swrUntilMs) {
+    return { kind: 'stale-hit', policy: 'swr' };
+  }
+  if (policy.allowSIE && policy.originFailed && nowMs <= entry.sieUntilMs) {
+    return { kind: 'stale-hit', policy: 'sie' };
+  }
+  return { kind: 'miss', reason: 'freshness-policy-rejected' };
+}
+```
+
+这段代码仍是简化实现：租户、Principal Scope、Cache Salt、Variant 和 Policy Revision 也要进入身份；SIE 还要区分哪些错误允许回退；真实系统要防止权威 Revision 查询本身被旧缓存污染。
+
+### 3. Cacheability：不是所有昂贵结果都值得缓存
+
+缓存前先回答六个问题：
+
+| 检查 | 可以缓存的信号 | 默认Bypass的信号 |
+| --- | --- | --- |
+| 可重建性 | 删除缓存后可从权威数据重新计算 | 缓存保存唯一未持久化结果 |
+| 确定性 | 相同完整身份产生可替代结果 | 隐含依赖当前时间、外部状态或未记录随机性 |
+| 复用机会 | Trace 中存在足够短的复用距离 | 大量一次性扫描或高基数个性化输入 |
+| 计算/带宽成本 | Hit 可避免显著 Origin 工作或字节传输 | Lookup、序列化和失效成本接近回源成本 |
+| 时效边界 | 可以定义 Fresh、SWR、SIE 窗口 | 一旦变化就必须立即生效且无版本 Gate |
+| 安全作用域 | 租户、权限和PII边界可编码并复核 | 共享范围不清，Key 含原始敏感字段或可被攻击者控制 |
+
+Cacheability 不是静态布尔值。相同资源在不同结果类别下可能不同：
+
+- 公开、版本化文档摘要可以按 Generation 缓存；
+- 当前账号权限列表只能在严格 Scope 与短窗口内缓存；
+- 一次性写操作的成功响应不能仅因“返回相同 JSON”就共享；
+- `404 not found` 可能短期负缓存，但“无权限”通常不能跨主体共享；
+- 模型的 Exact Response 只有在完整执行身份和产品契约允许时才可复用。
+
+#### 3.1 权威状态例外：Write-Behind
+
+普通缓存满足：
+
+```text
+权威写入成功 → 缓存更新或失效
+缓存丢失 → 回源重建
+```
+
+Write-Behind 可能变成：
+
+```text
+缓存/本地日志接受写入并向调用方确认
+             ↓ 异步
+         权威存储提交
+```
+
+若确认发生在权威提交之前，缓存前的日志或队列必须承担：
+
+- 持久化；
+- 重放；
+- 顺序与幂等；
+- Unknown Outcome 对账；
+- 容量和背压；
+- 数据丢失目标。
+
+这已经接近写入缓冲系统，而不是“把 Redis 放在数据库前面”。本课不把 Write-Behind 当默认提速选项；只有在明确接受其确认语义并完成故障实验后才能使用。
+
+## 二、证明缓存是否值得
+
+### 4. 缓存收益与 Break-even 模型
+
+“Origin 很慢”不等于“加缓存一定划算”。缓存引入 Lookup、序列化、网络跳转、内存、Fill 放大、失效、观测和运维成本。先定义单次请求的成本：
+
+- `C_origin`：没有缓存时执行 Origin 的成本；
+- `C_hit`：安全 Hit 的 Lookup、解码和 Serve Guard 成本；
+- `C_miss`：Miss 时额外付出的缓存 Lookup 与协调成本，不含 Origin；
+- `F/N`：Fill、失效、内存和运维总成本摊到每个请求；
+- `p`：安全命中概率。
+
+缓存后的期望成本：
+
+```text title="公式"
+E[C_{cache}] = pC_{hit} + (1-p)(C_{miss}+C_{origin}) + \frac{F}{N}
+```
+
+无缓存成本为 `C_origin`。要产生净收益：
+
+```text title="公式"
+E[C_{cache}] < C_{origin}
+```
+
+整理得到：
+
+```text title="公式"
+p > \frac{C_{miss}+F/N}{C_{origin}-C_{hit}+C_{miss}}
+```
+
+前提是分母为正，即安全 Hit 确实比回源便宜。这个公式只做决策框架；生产数值必须从自己的 Trace 和环境测量，不能套用课程里的假设。
+
+#### 4.1 手算例子
+
+某确定性转换任务的单位成本定义为抽象计算点：
+
+```text
+C_origin = 100
+C_hit = 4
+C_miss = 2
+F/N = 6
+```
+
+Break-even：
+
+```text title="公式"
+p > \frac{2+6}{100-4+2} = \frac{8}{98} \approx 0.0816
+```
+
+安全命中率超过约 `8.16%` 才在这个成本模型下打平。注意四个边界：
+
+1. 这不是延迟百分比，也不是厂商性能数字；
+2. 若 Hit 需要跨Region网络且 `C_hit` 上升，门槛会变；
+3. 若对象很大，Byte 成本可能主导；
+4. 任何 Unsafe Hit 都不能按“节省100点计算”计为收益。
+
+更完整的净节省可写成：
+
+```text title="公式"
+NetSaved = \sum_i SafeHit_i(C_{origin,i}-C_{hit,i})
+- \sum_j Miss_jC_{miss,j}
+- C_{fill\ waste}
+- C_{memory}
+- C_{invalidation}
+- C_{operations}
+```
+
+#### 4.2 何时宁可不缓存
+
+下列情况经常使 Break-even 失败：
+
+- 复用距离远大于可用容量，Entry 在再次访问前已淘汰；
+- 每个主体都生成唯一结果，Key 基数接近请求数；
+- Lookup 跨网络，而 Origin 已在同进程或有自己的索引；
+- Entry 很大且 Origin 计算便宜；
+- 失效频率高于复用频率；
+- 大量并发 Miss 没有合并，Fill Amplification 抵消命中收益；
+- 安全 Gate 需要读取同一个昂贵 Origin，缓存没有绕开主要工作。
+
+缓存的第一项实验不是“加上以后多快”，而是“无缓存基线与完整成本分解”。
+
+### 5. 指标：Hit Rate 必须拆开
+
+#### 5.1 Request Hit Rate
+
+```text title="公式"
+RequestHitRate = \frac{FreshSafeHits + PolicyAllowedStaleHits}{CacheableRequests}
+```
+
+分母应排除明确 Bypass 的请求，并单独报告 Bypass 数量。Semantic False Hit、Generation 不匹配和权限不匹配不能算 Hit。
+
+#### 5.2 Byte Hit Rate
+
+```text title="公式"
+ByteHitRate = \frac{\sum BytesServedBySafeHits}{\sum BytesRequestedByCacheableRequests}
+```
+
+100 个 1 KB 小对象命中、1 个 100 MB 对象回源时，请求命中率很高，字节命中率却可能很低。CDN、对象存储和大 Context Pack 场景必须观察字节维度。
+
+#### 5.3 Compute Saved Ratio
+
+```text title="公式"
+ComputeSavedRatio = 1 - \frac{ExecutedOriginCompute}{BaselineOriginCompute}
+```
+
+`BaselineOriginCompute` 是同一 Trace 在无缓存下的总 Origin 计算。Singleflight 即使没有产生传统 Hit，也能让100个并发Miss只计算一次，因此它会显著提升 Compute Saved Ratio；只看 Request Hit Rate 会漏掉这部分收益。
+
+#### 5.4 Origin Calls 与 Fill Amplification
+
+```text title="公式"
+FillAmplification = \frac{FillAttempts}{LogicalFillEpisodes}
+```
+
+一个 Logical Fill Episode 指某个身份从无可服务 Entry 开始，到首次 Fill 结束的并发缺口。100个同刻 Miss 若启动100次 Origin，放大为100；合并成一次则为1。
+
+#### 5.5 Stale、Unsafe 与 Semantic False Hit
+
+<Term id="unsafe-cache-hit" /> 是物理上找到Entry、但当前请求并不具备安全复用资格的情况。
+
+这些是风险指标，不应并入普通 Hit：
+
+```text
+staleWhileRevalidateHits
+staleIfErrorHits
+unsafeCandidateHits
+unsafeServedHits
+semanticCandidateHits
+semanticFalseHits
+fencedFillWrites
+identityRejectedFillWrites
+unknownOutcomes
+```
+
+受保护测试的硬门槛：
+
+```text
+unsafeServedHits === 0
+```
+
+Semantic Cache 还要报告：
+
+```text title="公式"
+FalseHitRate_{candidate} = \frac{SemanticFalseHits}{SemanticCandidateHits}
+```
+
+同时给出全部请求分母，避免候选数量变化掩盖风险。
+
+#### 5.6 延迟分位数
+
+平均延迟会掩盖等待 Fill 的尾部。主实验输出 `p50/p95/p99/max`，使用固定的 nearest-rank 定义：对升序样本，取 `ceil(q×N)` 的位置。不同工具的分位数插值方法可能不同，比较前必须固定定义。
+
+#### 5.7 手算综合例子
+
+10个可缓存请求：
+
+- 6个 Fresh Hit，每个100 bytes；
+- 1个明确允许的 SWR Hit，100 bytes；
+- 3个 Miss，其中2个并发合并为1次Fill；
+- 无缓存基线每请求计算10点；实际执行2次Origin，共20点；
+- 总请求字节1000 bytes，7个安全缓存响应共700 bytes。
+
+则：
+
+```text title="公式"
+RequestHitRate = \frac{7}{10}=0.7
+```
+
+```text title="公式"
+ByteHitRate = \frac{700}{1000}=0.7
+```
+
+```text title="公式"
+ComputeSavedRatio = 1-\frac{20}{100}=0.8
+```
+
+若3个Miss属于2个Logical Episode、实际Fill 2次：
+
+```text title="公式"
+FillAmplification = \frac{2}{2}=1
+```
+
+这里 Compute Saved Ratio 高于 Request Hit Rate，原因是并发请求合并也节省计算。
+
+### 6. Working Set、Reuse Distance 与容量—命中曲线
+
+<Term id="working-set" /> 不是“系统里所有可能对象”，而是在某个时间窗口内仍可能竞争缓存容量的活动集合。容量规划若使用对象总数，会把大量冷数据也算进去；若只用平均 QPS，又看不到热点切换和对象大小。
+
+<Term id="reuse-distance" /> 定义为同一个对象两次访问之间出现的**不同对象数量**。首次出现记为 `∞`。对访问 Trace：
+
+```text
+A B A C A B
+```
+
+逐步计算：
+
+| 访问 | 上次访问后出现的不同对象 | Reuse Distance |
+| --- | --- | ---: |
+| A | 首次 | ∞ |
+| B | 首次 | ∞ |
+| A | B | 1 |
+| C | 首次 | ∞ |
+| A | C | 1 |
+| B | A、C | 2 |
+
+在对象等大、严格 LRU、容量按对象数计的简化前提下，若 `Reuse Distance < Capacity`，该次访问可命中：
+
+- 容量2：两次 `RD=1` 命中，`2/6`；
+- 容量3：再加 `RD=2`，`3/6`。
+
+这给出一个容量—命中曲线的最小手算方法。真实系统还要处理：
+
+- 对象字节不同；
+- TTL 在复用前到期；
+- Admission 可能拒绝一次性对象；
+- 多层缓存各有独立容量；
+- 分片改变每个节点看到的 Trace；
+- 热点随时间漂移；
+- Negative Entry 和元数据也占空间。
+
+#### 6.1 为什么平均热度不够
+
+两个对象都被访问10次，但 Trace 不同：
+
+```text
+Trace X: A A A A A A A A A A B B B B B B B B B B
+Trace Y: A B A B A B A B A B A B A B A B A B A B
+```
+
+在容量1下：
+
+- Trace X 除两个冷启动外几乎都命中；
+- Trace Y 每次都淘汰前一个对象，几乎不命中。
+
+频次相同，局部性不同。LRU主要利用近因；LFU类策略利用频率；W-TinyLFU尝试在新近访问与历史频率之间折中。算法选择必须看 Trace，不是看对象排行榜。
+
+#### 6.2 容量单位：对象数、字节还是成本
+
+若对象大小不同，只按对象数会得出错误结论：
+
+```text
+small-expensive: 50 KB, Origin Compute=500
+large-cheap:     50 MB, Origin Compute=20
+```
+
+在50 MB容量下，缓存一个 `large-cheap` 可能逐出许多 `small-expensive`。因此实验至少要记录：
+
+```text
+entry.bytes
+entry.originCompute
+entry.frequencyEstimate
+entry.lastAccess
+```
+
+一个可解释的教学评分可以是：
+
+```text title="公式"
+Value(entry)=\frac{FrequencyEstimate\times OriginCompute}{Bytes}
+```
+
+它不是通用最优公式：延迟、带宽、序列化和公平性也可能进入价值。但它迫使系统显式回答“为什么这个对象值得占用这些字节”。
+
+#### 6.3 Miss Ratio Curve 的使用边界
+
+对固定 Trace 计算多个容量下的 Miss Ratio，可以寻找拐点：继续增加容量后，Miss 改善很小。拐点只对以下身份成立：
+
+```text
+trace version
+sampling window
+key canonicalization version
+tenant/shard scope
+object size accounting
+TTL policy
+replacement/admission policy
+```
+
+工作负载改变后要重新测量。课程不提供“某命中率对应某内存”的经验表，因为那会把 Trace 特性误写成基础设施保证。
+
+## 三、设计多层缓存与一致性
+
+### 7. 多层缓存：每一层都有自己的身份与失败
+
+典型读取路径可能包含：
+
+```text
+Browser HTTP Cache
+      ↓
+CDN / Shared HTTP Cache
+      ↓
+Service Process L1
+      ↓
+Distributed L2
+      ↓
+Database / Search Index / Model Runtime
+```
+
+多层不是“同一份缓存放很多地方”。每层的信任范围、Key、容量、时钟和失效通道不同。
+
+| 层 | 主要节省 | 常见边界 | 典型失败 |
+| --- | --- | --- | --- |
+| Browser/Private HTTP Cache | 网络往返和响应字节 | 单用户、HTTP语义 | 用户切换后错误复用；Header配置错误 |
+| CDN/Shared HTTP Cache | Origin带宽和跨地域延迟 | 公共或显式共享响应 | 忽略 `Vary` 或授权范围，跨主体泄漏 |
+| 进程内L1 | 网络Lookup和序列化 | 单进程、生命周期短 | 发布后旧进程未失效；每实例各自Stampede |
+| 分布式L2 | 跨实例共享和容量 | 网络服务、分片、淘汰 | 热键、网络分区、失效延迟 |
+| Origin内部缓存 | 数据库页、索引、模型中间状态 | 具体引擎实现 | 被上层误认为应用级一致性保证 |
+
+#### 7.1 HTTP缓存不是通用对象缓存的别名
+
+RFC 9111定义 HTTP 缓存和相关 Header 语义。应用至少要理解：
+
+- 什么响应可由 shared cache 保存；
+- `Cache-Control` 中 freshness 与禁止存储的指令；
+- `Vary` 如何把请求Header纳入选择；
+- Validation 与条件请求；
+- 授权响应的共享限制；
+- Age 和 Freshness 的计算。
+
+不要把应用内部 TTL 直接称作 HTTP Cache-Control，也不要假设“CDN默认不会缓存私有响应”。具体行为必须由响应Header、平台配置和端到端测试确认。
+
+RFC 9211 的 `Cache-Status` 提供 HTTP 层的可观测语义。内部缓存也应保留类似证据，但字段名和含义要单独定义，例如：
+
+```json
+{
+  "cacheLayer": "process-l1",
+  "decision": "miss",
+  "reason": "permission-revision-mismatch",
+  "entryGeneration": 41,
+  "currentGeneration": 42,
+  "fillState": "joined",
+  "fencingToken": 17
+}
+```
+
+#### 7.2 L1与L2不能互相假设
+
+一种常见错误：L2 使用版本化 Key，但 L1 只使用 `resourceId`。L2 正确阻断旧值，L1仍返回旧Entry。每层都要么：
+
+- 使用完整身份；
+- 要么在Serve前读取并检查当前版本；
+- 要么明确不缓存受保护结果。
+
+失效事件应携带稳定身份和版本，而不是只广播“某类数据变了”：
+
+```ts
+interface InvalidationEvent {
+  eventId: string;
+  resourceId: string;
+  newGeneration: number;
+  newPermissionRevision?: number;
+  occurredAt: string;
+}
+```
+
+消费者要处理重复、乱序和漏收。收到旧事件不能把 Generation 回退；漏收由 Serve Guard 与 Reconciliation兜底。
+
+### 8. Cache-Aside、Read/Write-Through 与 Write-Behind
+
+这些名称描述读写路径，不自动提供一致性保证。
+
+#### 8.1 Cache-Aside
+
+<Term id="cache-aside" />：应用先查缓存，Miss 后读取 Origin 并回填；写入 Origin 后失效或更新缓存。
+
+```text
+read:  cache → miss → origin → cache fill → return
+write: origin commit → invalidate/version switch
+```
+
+优点是应用能明确控制身份和错误路径。主要窗口：
+
+```text
+T1读Origin旧值
+T2提交新值并失效
+T1把旧值回填
+```
+
+仅“DB提交后DEL Key”不能阻止这个迟到 Fill。Versioned Key、Generation 检查或写入前比较 Revision 才能拒绝。
+
+#### 8.2 Read-Through
+
+Read-Through把Miss加载封装在缓存层：调用方只调用 `cache.getOrLoad(key)`。它减少重复代码，但 Loader 仍需知道：
+
+- 当前身份；
+- Deadline和Cancellation；
+- 错误分类；
+- 是否可负缓存；
+- Fill并发控制；
+- 版本在Fill期间是否变化。
+
+“由缓存库自动加载”不是业务正确性边界。
+
+#### 8.3 Write-Through
+
+Write-Through在写路径同步更新缓存和权威存储。必须明确确认点：
+
+```text
+cache write succeeded, DB write failed
+DB write succeeded, cache write failed
+client timeout after both succeeded
+```
+
+若两个资源不共享事务，仍然存在部分失败。通常应让权威存储提交决定业务成功，缓存更新失败通过失效、重试或对账恢复；不能因为缓存写失败就盲目回滚一个已提交且可能被观察的业务写。
+
+#### 8.4 Write-Behind
+
+Write-Behind先接受到缓存/日志，再异步写Origin。其收益是降低前台写延迟和合并写，但代价包括：
+
+- 已确认数据的耐久性责任；
+- 顺序和冲突；
+- 缓冲积压；
+- Crash Recovery；
+- 重放幂等；
+- 数据丢失窗口。
+
+若系统没有持久化日志和恢复Evidence，就不能声称写入成功。把“异步写数据库”放到普通内存Map后面不是缓存优化，而是未经论证的数据丢失设计。
+
+#### 8.5 模式决策表
+
+| 模式 | 权威写入确认点 | 适合 | 必须验证的故障 |
+| --- | --- | --- | --- |
+| Cache-Aside | Origin提交 | 大多数派生读模型 | 迟到Fill、失效丢失、Cold Miss |
+| Read-Through | 仍由Loader/Origin协议定义 | 统一加载逻辑 | Loader超时、错误共享、版本切换 |
+| Write-Through | 通常以Origin提交为准 | 需要写后读加速 | 双写部分失败、超时Unknown |
+| Write-Behind | 持久缓冲层接管确认语义 | 可合并且允许异步落地的写 | 缓冲崩溃、重放、顺序、背压 |
+
+### 9. Cache Identity：命中不是“Key存在”
+
+<Term id="cache-key" /> 必须包含所有会改变结果等价性的字段。一个通用 Identity Envelope：
+
+```ts title="完整代码片段：Canonical Cache Identity"
+interface CacheIdentity {
+  namespace: string;
+  schemaVersion: string;
+  tenantId: string;
+  principalScopeHash: string;
+  permissionRevision: number;
+  generation: number;
+  resourceId: string;
+  variant: string;
+  policyRevision: string;
+  cacheSalt: string;
+}
+
+function canonicalCacheKey(identity: CacheIdentity): string {
+  const fields: Array<[string, string | number]> = [
+    ['ns', identity.namespace],
+    ['schema', identity.schemaVersion],
+    ['tenant', identity.tenantId],
+    ['scope', identity.principalScopeHash],
+    ['permission', identity.permissionRevision],
+    ['generation', identity.generation],
+    ['resource', identity.resourceId],
+    ['variant', identity.variant],
+    ['policy', identity.policyRevision],
+    ['salt', identity.cacheSalt],
+  ];
+  return fields
+    .map(([name, value]) => `${name}=${encodeURIComponent(String(value))}`)
+    .join('|');
+}
+```
+
+主实验中的完整实现位于：
+
+```text
+examples/cache-reuse-consistency/cache-reuse-simulator.ts
+```
+
+#### 9.1 Canonicalization必须稳定
+
+错误Key：
+
+```ts
+JSON.stringify(requestBody)
+```
+
+如果对象字段顺序、Unicode规范化、默认值、省略字段或浮点表示不同，语义相同请求会Miss；更危险的是，不同语义可能因遗漏字段而碰撞。
+
+Canonicalization协议应固定：
+
+- 字段集合与顺序；
+- 缺省值；
+- 字符编码和Unicode处理；
+- 数字表示；
+- Hash算法与命名空间；
+- Schema版本；
+- 对不可信输入的长度上限。
+
+Hash只压缩身份，不创造身份。漏掉 `permissionRevision` 后再换更强Hash，仍然会错误复用。
+
+#### 9.2 Versioned Key与Generation
+
+<Term id="cache-generation" /> 适合整体切换：
+
+```text
+cache:v1:tenant-a:g41:document-7
+cache:v1:tenant-a:g42:document-7
+```
+
+Generation切换后，新请求天然查新Key。旧Entry可以稍后清理，不再承担“必须在所有节点立即DEL”的正确性压力。
+
+正确流程：
+
+<Steps>
+1. 在权威存储提交新数据与新Generation。
+2. 新请求读取或携带当前Generation，构造新Key。
+3. 发布失效事件，加快L1/L2旧Entry清理。
+4. Reconciliation扫描旧Generation，处理漏收、进程休眠和分片迁移。
+5. 在保留窗口后批量回收旧Namespace；回收前确认没有合法旧读者。
+</Steps>
+
+Generation不是时间戳比较的替代品。它必须由权威系统单调推进，且不能被旧事件回退。
+
+#### 9.3 Permission Revision与Principal Scope
+
+权限过滤必须发生在结果可能进入共享缓存、Prompt或Trace之前。两种安全策略：
+
+1. 缓存权限无关的公共对象，在Serve时执行权威权限检查；
+2. 缓存权限裁剪后的对象，把Principal Scope Hash和Permission Revision纳入身份。
+
+第二种会增加Key基数，但不能为了命中率删除安全身份。<Term id="cache-salt" /> 可限制某些实现中的跨租户复用和侧信道范围，但Salt不是授权：知道Salt的请求仍需权限检查。
+
+不要把原始邮箱、姓名、Token或完整权限列表放进Key和Trace。应使用稳定、不可逆且有命名空间的作用域身份，并控制碰撞与轮换。
+
+#### 9.4 Variant与Policy Revision
+
+以下字段常被漏掉：
+
+- 语言、格式、压缩和内容协商；
+- Prompt/Template Revision；
+- 业务策略版本；
+- 模型、Tokenizer、Adapter；
+- 检索Index Generation；
+- 生成参数和工具可用性；
+- 是否包含敏感字段。
+
+只要字段改变会使旧结果不再可替代，就属于身份或Cacheability Gate。
+
+### 10. 失效：Version Guard负责阻断，事件负责收敛
+
+“更新后发一条失效消息”是Best Effort机制。事件可能：
+
+- 在DB提交前被观察；
+- 提交后丢失；
+- 重复；
+- 乱序；
+- 某实例重启期间漏收；
+- 跨Region延迟；
+- 因分片迁移发到旧Owner。
+
+因此三层职责要分开：
+
+| 机制 | 负责什么 | 不负责什么 |
+| --- | --- | --- |
+| Versioned Key / Serve Guard | 新请求不能服务旧Generation/权限结果 | 自动释放旧内存 |
+| 失效事件 | 尽快删除或标记旧Entry | 证明所有副本都已处理 |
+| Reconciliation | 找到孤儿、漏收和长期漂移 | 提供零延迟切换 |
+
+#### 10.1 删除、撤回与权限收紧
+
+这些事件的错误代价通常高于普通更新。建议：
+
+```text
+权威Revision先提交
+  ↓
+Serve Guard立即按新Revision拒绝旧Entry
+  ↓
+高优先级失效广播
+  ↓
+对所有缓存层和索引执行Reconciliation
+  ↓
+留下完成证据
+```
+
+不要用长TTL等待旧值自然消失。对必须立即生效的撤回，如果请求无法可靠获得当前Revision，应 Fail Closed，而不是继续服务缓存。
+
+#### 10.2 Fill期间发生版本切换
+
+时间线：
+
+```text
+t0  request(g41) Miss，Owner开始Fill
+t1  权威切换到g42
+t2  g41 Fill返回
+```
+
+在`t2`写缓存前必须再次检查当前Generation。否则旧值会在失效之后重新进入缓存。主实验把这种写入计为：
+
+```text
+identityRejectedFillWrites += 1
+```
+
+它不是普通Eviction，也不是Origin Error；Trace要保留Fill身份和当前身份。
+
+### 11. Fresh、Stale-While-Revalidate 与 Stale-If-Error
+
+<Term id="stale-while-revalidate" />（SWR）和 <Term id="stale-if-error" />（SIE）都允许特定Stale，但触发条件不同。
+
+```text
+inserted ─── freshUntil ─── swrUntil ─── sieUntil
+   Fresh          SWR区域        可能的SIE区域
+```
+
+#### 11.1 SWR
+
+SWR在明确窗口内立即返回旧值，同时触发后台再验证。适合：
+
+- 可容忍短暂陈旧的公共内容；
+- 刷新成本高且热点明显；
+- 后台Fill有Singleflight和预算；
+- 客户端能观察Age或Stale标记。
+
+不适合用来绕过：
+
+- 权限收紧；
+- 删除和撤回；
+- 高风险实时状态；
+- Generation不匹配。
+
+#### 11.2 SIE
+
+SIE只在符合策略的Origin错误后回退旧值。必须定义错误分类：
+
+| Origin结果 | 是否可SIE | 原因 |
+| --- | --- | --- |
+| 临时连接失败/明确5xx | 可能允许 | 可用性与陈旧风险取舍 |
+| 认证失败/403 | 通常禁止 | 可能表示权限已变化 |
+| 404 | 取决于资源协议 | 可能表示删除，旧值不能恢复 |
+| Schema校验失败 | 禁止 | 旧值可能与新协议不兼容 |
+| Deadline超时 | 可能是Unknown | 先区分读取是否有副作用，并记录风险 |
+
+SIE不是“Origin有任何问题就返回旧缓存”。
+
+#### 11.3 Stale决策表
+
+| Identity | Freshness | Origin | 决策 |
+| --- | --- | --- | --- |
+| 一致 | Fresh | 未调用 | Fresh Hit |
+| 一致 | SWR窗口 | 未调用 | 明确允许时Stale Hit + Background Fill |
+| 一致 | SIE窗口 | 允许类别错误 | 明确允许时Stale Hit |
+| Generation不一致 | 任意 | 任意 | Miss/拒绝，不得Stale |
+| Permission Revision不一致 | 任意 | 任意 | Fail Closed，不得Stale |
+| 一致 | 超出所有窗口 | 错误 | 错误或降级，不得隐式Stale |
+
+#### 11.4 Age必须可观察
+
+响应或Trace至少记录：
+
+```text
+entryInsertedAt
+entryAgeMs
+freshUntil
+stalePolicy
+revalidationStarted
+originErrorClass
+currentGeneration
+entryGeneration
+```
+
+否则故障排查只看到“cache hit”，无法知道用户拿到的是Fresh还是SIE回退。
+
+## 四、控制并发、容量与安全
+
+### 12. Singleflight：并发Miss不是100次独立工作
+
+<Term id="cache-stampede" /> 常发生在热门Key刚好不存在或过期时：大量请求同时看到Miss，再一起访问Origin。<Term id="request-coalescing" /> 的目标是把同一身份上的并发Fill合并。
+
+```text
+100 requests ── same safe cache identity ──┐
+                                           ├── one Fill Owner ── Origin
+                                           └── 99 waiters
+```
+
+基本状态：
+
+```text
+ABSENT
+  └─ first miss → FILLING(owner, lease, token)
+                     ├─ same-key miss → WAITING
+                     ├─ success → READY
+                     ├─ known error → FAILED
+                     ├─ timeout → UNKNOWN
+                     └─ owner crash + lease expiry → replacement owner
+```
+
+#### 12.1 Singleflight的作用域
+
+一个进程内Map只能合并单实例请求。部署10个实例时，热门Key仍可能产生10次Fill。要明确：
+
+```text
+coordinationScope = process | host | shard | region | global
+```
+
+作用域越大，减少的重复Fill越多，但协调延迟、可用性和故障复杂度也上升。不要为了“全局只计算一次”引入比Origin更脆弱的协调服务。
+
+#### 12.2 Waiter的Deadline与Cancellation
+
+等待者不是Owner的复制品：
+
+- 某个Waiter取消，不应自动取消仍被其他请求需要的共享Fill；
+- 所有Waiter都取消时，若Origin支持取消，可停止Fill；
+- Owner自己的客户端断线，不代表共享Fill必须终止；
+- 每个Waiter应按自己的Deadline停止等待；
+- Fill结果写缓存前仍要验证Generation和Fencing Token。
+
+简化伪代码：
+
+```ts
+async function getOrFill(key: string, signal: AbortSignal): Promise<Value> {
+  const hit = safeLookup(key);
+  if (hit) return hit;
+
+  const shared = inFlight.get(key) ?? startFill(key);
+  const waiter = shared.addWaiter(signal);
+  try {
+    return await waiter.result;
+  } finally {
+    shared.removeWaiter(waiter.id);
+    if (shared.waiterCount === 0) shared.cancelOriginIfSafe();
+  }
+}
+```
+
+#### 12.3 错误是否共享
+
+同一个Fill失败时，等待者可以共享同一已知错误，但要避免长时间缓存临时故障：
+
+- Schema非法：可作为稳定负结果，按请求身份短期缓存；
+- Origin 503：通常不做长期Negative Cache；
+- Deadline：可能是局部等待者超时，不代表Owner失败；
+- Unknown Outcome：不能伪装成确定的Not Found；
+- 权限错误：必须按主体作用域，通常不跨主体共享。
+
+#### 12.4 Singleflight不等于缓存
+
+100个并发请求在冷启动时：
+
+- Request Hit Rate可能仍是0，因为所有请求都等了Origin；
+- Origin Calls可从100降为1；
+- Compute Saved Ratio接近99%；
+- Fill Amplification从100降为1。
+
+因此主实验同时报告命中和回源工作。
+
+### 13. Stampede、雪崩、热键、TTL Jitter与Early Refresh
+
+这些故障相关但不是同一个问题。
+
+| 故障 | 形态 | 主要机制 | 不能只靠什么 |
+| --- | --- | --- | --- |
+| 单Key Stampede | 一个热门对象并发Miss | Singleflight、Lease、Origin限流 | TTL Jitter |
+| 缓存雪崩 | 大量Key同时过期或缓存层整体不可用 | TTL分散、分批预热、降级、容量隔离 | 单Key锁 |
+| 热键 | 一个Key持续占用网络/CPU/锁 | 分层复制、本地L1、请求合并、分片策略 | 增大总容量 |
+| 扫描污染 | 一次性Key逐出热点 | Admission、分区、扫描Bypass | 更长TTL |
+
+#### 13.1 TTL Jitter
+
+固定TTL会让同一批写入在相近时间过期。可对基础TTL做确定范围内的随机扰动：
+
+```ts
+const jitter = (seededRandom() * 2 - 1) * ttlMs * jitterRatio;
+const effectiveTtl = Math.max(minTtlMs, ttlMs + jitter);
+```
+
+Jitter是Best Effort：
+
+- 它分散过期时间；
+- 不阻止同一个热门Key上的并发Fill；
+- 不能修复Generation或权限错误；
+- 随机源和范围要可测试，避免生成零或负TTL；
+- 测试应固定Seed，生产可使用适合的随机源。
+
+#### 13.2 Early Refresh
+
+在Entry接近过期时提前刷新，可降低硬Miss概率。一个概率式思路：随着剩余TTL变小，提高触发刷新概率；具体函数要通过Trace验证。
+
+确定性版本可以使用阈值：
+
+```text
+if remainingTtl < refreshWindow
+and no fill in progress
+and request is eligible
+then start background fill
+```
+
+风险：
+
+- 低访问Key可能永远没有请求触发刷新；
+- 全量定时刷新会制造新的雪崩；
+- 错误配置可能让每个请求都刷新；
+- Background Fill仍需Singleflight、预算和Fencing；
+- 权限或Generation变化时不得延长旧Entry寿命。
+
+#### 13.3 热点隔离
+
+对极热Key，单个分布式缓存节点可能成为瓶颈。可考虑：
+
+- 每实例L1复制，但每层都使用安全身份；
+- 读副本或一致性Hash上的受控复制；
+- 对超大对象分块或Bypass；
+- 对热门公共结果预计算；
+- 对Fill设Origin并发上限和队列Deadline；
+- 对单租户设置配额，避免一个主体占满缓存。
+
+这些是容量与公平性策略，不改变授权规则。
+
+### 14. Lease、Fencing Token与Fill Owner崩溃
+
+<Term id="lease" /> 给Owner一段有限时间。Lease到期后，其他参与者可以接管；但旧Owner可能只是暂停、网络分区或GC停顿，之后仍会继续执行。仅有Lease会产生两个Owner：
+
+```text
+Owner A token=17 获得Lease
+A暂停
+Lease到期
+Owner B token=18接管并完成
+A恢复，迟到写入旧值
+```
+
+<Term id="fencing-token" /> 是单调递增编号。缓存写入端或权威协调层只接受当前Token：
+
+```ts
+function acceptFillWrite(currentToken: number, incomingToken: number): boolean {
+  return incomingToken === currentToken;
+}
+```
+
+真实持久化存储通常使用条件写：
+
+```sql
+UPDATE cache_fill_state
+SET value_hash = $1,
+    owner_token = $2,
+    state = 'ready'
+WHERE cache_key = $3
+  AND owner_token = $2
+  AND generation = $4;
+```
+
+检查影响行数。若为0，迟到Owner必须丢弃结果，不能“最后写入者获胜”。
+
+#### 14.1 Lease时钟边界
+
+Lease依赖时间。必须说明：
+
+- 谁的时钟决定过期；
+- 是否使用单调时钟计算本地时长；
+- 网络延迟和时钟偏差如何影响接管；
+- Lease续约失败意味着什么；
+- 超时后是已知失败还是Unknown Outcome。
+
+Fencing减少对完美时钟同步的依赖：即使旧Owner误以为Lease仍有效，存储端也能按Token拒绝。
+
+#### 14.2 Fill Owner崩溃的恢复路径
+
+<Steps>
+1. 首个Miss创建 `FILLING(key, token=17, leaseUntil=30)`。
+2. 其他请求加入Waiter集合，不再启动Origin。
+3. Owner在`t=10`崩溃，结果未知。
+4. `t=30` Lease到期，恢复器申请 `token=18`。
+5. 新Owner重新读取当前Generation与Permission Revision，再启动Fill。
+6. 旧Owner结果在`t=100`迟到；写入端看到Token 17，小于当前18，拒绝。
+7. 新Owner完成，写入前再检查身份，然后唤醒Waiter。
+8. Trace记录Owner崩溃、接管、拒绝旧写和最终结果。
+</Steps>
+
+#### 14.3 Unknown Outcome不是Error的别名
+
+Origin请求超时后：
+
+- 对纯读取，可能只是不知道结果，重新读取通常安全；
+- 对会触发副作用的加载器，Origin可能已执行，重试要使用幂等键和副作用账本；
+- 对模型推理，计算可能仍在后台消耗资源；取消是否生效要以运行时证据判断；
+- 对Write-Behind，超时可能发生在持久化之前或之后，必须查询确认状态。
+
+主实验将 `timeout-unknown` 单独计数，不把它映射成Not Found或可负缓存错误。
+
+### 15. Admission与Eviction是两个决策
+
+<Term id="cache-admission" /> 回答：**新对象是否值得进入缓存？**
+
+<Term id="cache-eviction" /> 回答：**容量不足时从居民集合移除谁？**
+
+只讨论LRU/LFU而不讨论Admission，会默认每个新对象都值得占空间。一次性扫描正是利用这个默认。
+
+#### 15.1 LRU
+
+Least Recently Used淘汰最久未访问对象。
+
+优点：
+
+- 简单；
+- 适合强时间局部性；
+- 命中时更新成本可控。
+
+失败：
+
+- 大扫描把热点逐出；
+- 不区分对象大小和Origin成本；
+- 周期大于容量的循环访问可能持续Miss。
+
+#### 15.2 LFU
+
+Least Frequently Used保留高频对象。必须处理老化：旧热点若永久保留高计数，新热点无法进入。实现常使用近似计数、周期衰减或窗口统计。
+
+失败：
+
+- 新热点冷启动；
+- 长期历史压过近期变化；
+- 精确全量计数成本高。
+
+#### 15.3 SLRU
+
+Segmented LRU把Entry分为 probation 与 protected：新Entry先进入观察区，被再次访问后晋升，降低一次性对象污染主热点区。分区比例需要按Trace调节。
+
+#### 15.4 TinyLFU与W-TinyLFU
+
+TinyLFU是Admission思想：用紧凑的近似频率结构比较候选与Eviction Victim，决定是否接纳。W-TinyLFU再给新对象一个小的Window以适应突发热点，并把通过比较的对象送入主区。
+
+课程只要求理解：
+
+```text
+candidate arrives
+  ↓
+window gives recent items a chance
+  ↓
+frequency sketch compares candidate and victim
+  ↓
+admit candidate or retain resident victim
+```
+
+主实验的 `frequency-admission-safe` 使用**精确计数 + 周期衰减 + Cost/Byte评分 + LRU居民集合**，目的是隔离Admission与Eviction。它没有Count-Min Sketch、Doorkeeper、Window分区或Hill Climbing，因此不能称为TinyLFU/W-TinyLFU实现。
+
+#### 15.5 Size/Cost-aware
+
+策略要回答“缓存1个50 MB便宜对象，还是1000个50 KB昂贵对象”。可把以下特征输入Admission：
+
+```text
+frequency estimate
+recency
+entry bytes
+origin compute
+origin latency
+network bytes saved
+tenant quota
+freshness horizon
+```
+
+教学评分：
+
+```text title="公式"
+Score = \frac{FrequencyEstimate \times OriginCompute}{Bytes}
+```
+
+边界：
+
+- 高计算但结果很快过期，实际收益可能低；
+- 极小但恶意高频Key可能污染频率统计；
+- 不同租户需要公平配额；
+- Admission计算本身不能比Origin节省还贵。
+
+#### 15.6 策略决策表
+
+| 工作负载 | 基线 | 候选改进 | 需要观察 |
+| --- | --- | --- | --- |
+| 强近期局部性 | LRU | 无或SLRU | Reuse Distance、Eviction |
+| 大量一次性扫描 | LRU | Admission/TinyLFU类 | 热点存活率、Admission Reject |
+| 长期稳定热点 | LFU类 | 衰减与Window | 热点切换速度 |
+| 对象大小差异大 | 对象数LRU | Byte Capacity、Size-aware | Byte Hit Rate、内存占用 |
+| Origin成本差异大 | 只看频次 | Cost-aware | Compute Saved Ratio |
+| 多租户 | 全局共享 | 分区/配额/公平Admission | 每租户命中与占用 |
+
+### 16. Negative Cache：失败结果也需要身份和TTL
+
+<Term id="negative-cache" /> 保存“不存在”“空结果”或某类错误，减少重复无效回源。它的风险是把临时状态冻结成长期事实。
+
+可考虑负缓存：
+
+- 稳定不存在的公开资源；
+- 对相同完整请求的Schema校验失败；
+- 防止攻击者持续查询同一不存在Key；
+- 检索中当前Index Generation内确定无候选的结果。
+
+默认不应共享：
+
+- 临时503、连接失败；
+- Deadline或Unknown Outcome；
+- 权限拒绝跨主体；
+- 即将创建的资源使用长TTL 404；
+- 依赖实时外部系统的空结果。
+
+#### 16.1 创建后如何打破负缓存
+
+时间线：
+
+```text
+t0 GET object-9 → 404，负缓存10分钟
+t1 POST object-9 → 创建成功
+t2 GET object-9 → 仍命中404
+```
+
+写路径必须切换Generation或失效负Entry。Negative Entry要记录结果类别，不要与正常Value共用无类型JSON。
+
+```ts
+type CacheValue<T> =
+  | { kind: 'positive'; value: T }
+  | { kind: 'not-found'; observedGeneration: number }
+  | { kind: 'validation-error'; code: string };
+```
+
+#### 16.2 错误TTL分层
+
+| 类别 | TTL倾向 | 原因 |
+| --- | --- | --- |
+| 确定404 | 短，且创建事件失效 | 可能随后创建 |
+| 空检索结果 | 绑定Index Generation | 语料更新会改变答案 |
+| Schema错误 | 可稍长，绑定Schema版本 | 输入不变时稳定 |
+| 429/503 | 通常不做普通负缓存 | 需要Retry-After、退避和容量控制 |
+| 403 | 绑定主体和Permission Revision，通常不共享 | 权限变化与泄漏风险 |
+| Unknown | 不负缓存 | 真值未知 |
+
+### 17. 缓存投毒、多租户、PII与Cache Salt
+
+缓存投毒不只发生在CDN。只要攻击者能控制写入内容或Key的一部分，并让其他请求命中，就可能污染共享结果。
+
+#### 17.1 常见投毒路径
+
+- 忽略影响响应的Header或Variant；
+- Canonicalization把不同输入合并；
+- 使用未验证的Host、语言或格式字段；
+- Key中省略Tenant或Principal Scope；
+- 将Origin错误页面按成功结果缓存；
+- Semantic Cache把对抗性相似输入映射到高价值Entry；
+- Hash碰撞处理不当，只比较Hash不比较必要身份；
+- 不可信用户能预热公共Key并控制内容。
+
+#### 17.2 安全写入协议
+
+```text
+validate request
+  ↓
+resolve authoritative tenant/scope/version
+  ↓
+compute canonical identity from trusted fields
+  ↓
+load origin
+  ↓
+validate result schema and classification
+  ↓
+re-check generation / permission / fencing token
+  ↓
+admission decision
+  ↓
+store typed entry
+```
+
+不要直接使用客户端声称的 `tenantId` 或 `permissionRevision`；它们应来自已认证上下文和权威版本源。
+
+#### 17.3 PII边界
+
+缓存Key、Trace、Metric Label和Artifact不得暴露原始PII或Token。风险包括：
+
+- Key出现在日志、管理界面和内存Dump；
+- 高基数Label泄露用户行为；
+- Trace长期保留了查询原文；
+- Semantic向量仍可能包含敏感信息；
+- Cache Snapshot被复制到低权限环境。
+
+使用受控作用域Hash、数据最小化、保留期和访问审计。Hash不是匿名化保证；低熵标识可能被枚举。
+
+#### 17.4 Cache Salt
+
+<Term id="cache-salt" /> 把复用限制在信任组。典型用途：
+
+```text
+public salt       → 仅公开、可共享内容
+organization salt → 同组织内允许复用
+request salt      → 禁止跨请求复用
+```
+
+Salt的边界：
+
+- 不是授权凭证；
+- 不替代Tenant与Permission Revision；
+- 轮换会造成Miss和旧Entry清理；
+- Salt本身不应包含原始秘密；
+- 推理Prefix Cache中还要考虑Timing侧信道和实现是否使用安全Hash。
+
+#### 17.5 多租户容量公平
+
+即使身份完全隔离，一个租户仍可能用大量Key挤掉其他租户热点。需要：
+
+- 每租户Byte配额；
+- Admission预算；
+- 热键和Key基数限制；
+- 分租户命中与Eviction指标；
+- 对高风险主体Bypass或独立Namespace。
+
+这属于资源隔离，不是权限隔离的替代品。
+
+## 五、处理LLM与RAG复用
+
+### 18. KV Cache、Prefix Cache 与 Exact Response Cache 不是一回事
+
+LLM 系统常把不同对象都叫作“缓存”，但它们保存的状态、节省的工作和错误模式并不相同。把三者混在一起，会得到错误的容量指标和错误的身份边界。
+
+| 类型 | 保存对象 | 主要节省 | 命中条件 | 主要失败 |
+| --- | --- | --- | --- | --- |
+| <Term id="kv-cache" /> | 当前活跃生成请求各层历史 Token 的 K/V 张量或 Block | Decode 阶段重复计算历史前缀 | 同一活跃请求、兼容的执行状态和位置 | 容量耗尽、回收错误、调度饥饿；通常不是跨请求答案缓存 |
+| <Term id="prefix-cache" /> | 已处理的 Exact Token Prefix 对应的中间推理状态 | 跨请求重复 Prefill | Exact Token IDs、父 Block、模型执行身份全部兼容 | Tokenizer、模型、Adapter、多模态输入或 Salt 漏入身份 |
+| <Term id="response-cache" /> | 已完成的文本或结构化响应 | 整个模型、工具或 RAG 调用 | 完整输入与全部依赖身份一致，而且产品契约允许复用 | 旧工具结果、旧引用、权限泄漏、随机采样契约改变 |
+
+#### 18.1 Prefix Cache 的身份必须落到 Token 和执行配置
+
+“文本相同”不等于“前缀状态可复用”。至少检查：
+
+```ts
+interface PrefixExecutionIdentity {
+  tokenIds: readonly number[];
+  parentBlockHash: string;
+  modelRevision: string;
+  tokenizerRevision: string;
+  chatTemplateRevision: string;
+  adapterRevision: string;
+  positionEncodingRevision: string;
+  quantizationRevision: string;
+  multimodalInputHash: string;
+  multimodalProcessorRevision: string;
+  cacheSalt: string;
+}
+```
+
+这里不是要求所有引擎把字段序列化成同一个字符串，而是要求系统能回答：**哪些变化会使旧 Block 不再兼容？**
+
+- 模型权重变化：旧中间状态通常不能用于新权重；
+- Tokenizer 或 Chat Template 变化：可见文本可能映射为不同 Token 序列；
+- LoRA/Adapter 变化：相同 Token 在不同适配器下产生不同状态；
+- 多模态输入变化：图片、音频及其预处理版本必须进入身份；
+- Position/RoPE、量化或执行内核变化：是否兼容由具体引擎定义，不能猜；
+- Cache Salt 变化：即使计算兼容，也可能为了隔离租户或降低侧信道风险而强制 Miss。
+
+vLLM 的 Automatic Prefix Caching 文档是一个实现实例：它描述该实现如何组成 Block Hash，以及 LoRA、多模态输入与 Salt 等字段如何参与身份。它不能证明另一引擎、另一版本或跨引擎持久缓存具有相同保证。
+
+#### 18.2 Exact Response Cache 会改变生成契约
+
+假设请求参数完全相同，但模型使用随机 Sampling。重新执行可能产生不同样本，直接返回旧答案则固定了第一次样本。两者不是数学等价。
+
+产品必须在缓存前明确选择：
+
+1. 请求本来就是确定性的，例如固定模型、固定 Seed、固定温度和无外部可变依赖；
+2. 产品允许把“一次可接受样本”复用为后续答案，并在用户契约中承认这种行为；
+3. 产品要求每次重新采样，此时不得用 Exact Response Cache 替代执行。
+
+如果调用链包含工具或 RAG，Response Identity 还要加入工具版本、数据 Generation、权限、检索参数、引用身份、政策版本与输出 Schema。只用 Prompt 文本做 Key 会把不同世界状态错误合并。
+
+### 19. RAG 的缓存不是一个层，而是五个不同失效边界
+
+在线 RAG 数据流可写成：
+
+```text
+Request
+  → Authorization / Tenant Gate
+  → Query normalization
+  → Query Embedding
+  → Retrieval
+  → Permission-aware filtering
+  → Rerank
+  → Context Pack
+  → Model / Tool execution
+  → Citation verification
+  → Answer
+```
+
+权限过滤必须发生在私有候选可能进入 Prompt、Trace、共享缓存或答案之前。缓存不能成为绕过这一边界的旁路。
+
+| 缓存层 | Identity 至少包含 | 主要失效触发 | 命中证明不了什么 |
+| --- | --- | --- | --- |
+| Query Embedding Cache | 规范化 Query、Embedding Model/Revision、预处理版本 | 模型或预处理变化 | 不证明检索结果正确 |
+| Retrieval Cache | Query/Embedding Identity、Index Generation、ACL/Filter、Retriever 参数 | 索引、过滤器、权限、语料变化 | 不证明候选包含答案 |
+| Rerank Cache | 有序候选 ID/Content Hash、Reranker Revision、参数 | 候选或模型变化 | 不弥补召回阶段漏项 |
+| Context Pack Cache | 有序 Chunk Identity、预算、Packing Policy、Prompt Template | 文档、顺序、预算、模板变化 | 不证明最终答案可复用 |
+| Answer Cache | 上述 Evidence Identity、模型、生成参数、工具、政策、主体和 Freshness | 任一上游依赖变化 | 风险最大，必须重新验证引用与授权 |
+
+#### 19.1 一个旧 Answer 为什么会“看起来完全正常”
+
+假设 Query、模型和 Prompt Template 都没变，但索引从 `generation=17` 切换到 `18`，旧文档已经撤回。若 Answer Cache Key 没有 Corpus/Index Generation，系统会：
+
+1. 命中旧答案；
+2. 跳过 Retrieval 和权限过滤；
+3. 返回已经失效的引用；
+4. Trace 只记录 `cache_hit=true`，看不到被跳过的安全检查。
+
+安全实现至少要在 Serve Guard 中检查：
+
+```text
+currentCorpusGeneration == entry.corpusGeneration
+currentPermissionRevision == entry.permissionRevision
+currentPolicyRevision == entry.policyRevision
+allCitationHashesStillValid == true
+```
+
+任何一项无法验证时，结果是 Miss 或显式降级，不是“先返回再说”。
+
+#### 19.2 分层缓存要分别计量节省
+
+Query Embedding Cache 节省的是 Embedding Compute；Retrieval Cache 节省的是索引查询；Rerank Cache 节省的是重排；Context Pack Cache 节省打包；Answer Cache 才可能节省整条流水线。
+
+因此不要把五层的 Hit 混成一个 `rag_cache_hit_rate`。至少输出：
+
+```text
+embedding_compute_saved
+retrieval_calls_saved
+rerank_compute_saved
+context_pack_calls_saved
+answer_pipeline_compute_saved
+unsafe_answer_hits
+stale_citation_rejections
+```
+
+### 20. Semantic Cache 是近似替代判定器，不是“模糊 Key”
+
+<Term id="semantic-cache" /> 的实际问题不是“两个 Query 的向量近不近”，而是：
+
+```text
+在当前租户、主体、权限、数据Generation、时间、政策、对话状态和工具状态下，
+缓存中的旧答案是否可以替代对当前请求重新执行完整流水线？
+```
+
+余弦相似度只是候选特征。高相似度仍可能对应完全不同的正确答案：
+
+| Hard Negative 类型 | 例子 | 失败原因 |
+| --- | --- | --- |
+| 否定 | “允许重试吗” vs “不允许重试吗” | 关键词高度重合，语义方向相反 |
+| 数字 | “最多3次” vs “最多5次” | Embedding 可能弱化数字差异 |
+| 时间 | “今天的状态” vs “上周的状态” | 答案依赖实时事实 |
+| 主体 | “租户A的文档” vs “租户B的文档” | 相似度不能承担授权 |
+| 地域 | “区域X规则” vs “区域Y规则” | 同主题、不同政策 |
+| 多轮指代 | “它现在可用吗” | `它` 依赖对话状态 |
+| 数据代次 | 文档更新前后的同一问题 | Query 不变，证据已经变化 |
+| 工具状态 | “任务是否完成” | 必须读取当前外部状态 |
+
+这些错误命中应进入 <Term id="false-hit-rate" />，不能藏进普通 Hit Rate。
+
+#### 20.1 正确执行顺序
+
+<Steps>
+1. 判断请求类别是否允许语义复用；实时状态、财务动作、权限敏感结果默认不允许。
+2. 先执行 Tenant、Principal、Permission Revision、Generation、Freshness 和政策 Gate。
+3. 只在同一安全作用域内检索候选近邻。
+4. 使用经验证的 Substitutability 判定，而不是单一固定阈值。
+5. 不确定时 Fail Closed 为 Miss。
+6. 命中后仍验证引用、输出 Schema、政策与当前权限。
+</Steps>
+
+Cache Salt、向量数据库 Namespace 或高阈值都不能替代第 2 步。
+
+#### 20.2 阈值必须用错误预算校准
+
+把候选对 `(q, cachedAnswer)` 标为：
+
+- `substitutable=true`：旧答案在当前任务真值上可接受；
+- `substitutable=false`：必须重新执行。
+
+对阈值 `t`，报告：
+
+```text title="公式"
+SemanticPrecision(t)=\frac{CorrectSemanticHits(t)}{AllSemanticHits(t)}
+```
+
+```text title="公式"
+FalseHitRate(t)=\frac{IncorrectSemanticHits(t)}{AllSemanticHits(t)}
+```
+
+```text title="公式"
+SemanticCoverage(t)=\frac{AllSemanticHits(t)}{EligibleRequests}
+```
+
+一个阈值只有在预先声明的错误预算下才有意义。例如“False Hit 不得超过某上限”仍然需要说明：
+
+- 标签由什么任务真值生成；
+- 数据如何按时间、租户或版本切分；
+- Hard Negative 是否覆盖数字、否定、权限和实时性；
+- 未标注与 Judge 不一致样本如何处理；
+- 上线后漂移如何触发回退。
+
+随机切分普通 Paraphrase 数据，往往会让 Train 与 Test 的表达模式过于相似。更可信的检查使用时间 Holdout、版本 Holdout、主体隔离和人工复核的 Hard Negative。
+
+#### 20.3 核心课程只承担边界，不承担完整产品方案
+
+本课要求主实验注入一个 `semantic-hard-negative`，并验证错误候选被单独计数。完整 Embedding 模型选择、向量索引、在线校准和大规模标注应留在 RAG 领域课程，因为它们需要机器学习实验、召回评测和领域标签。
+
+<Aside type="caution" title="Semantic Cache 的默认动作是 Miss">
+当替代关系无法验证时，Miss 只增加成本；False Hit 可能静默返回错误、过时或越权答案。风险不对称意味着“多命中一点”不能作为默认优化目标。
+</Aside>
+
+## 六、运行实验并完成验收
+
+### 21. 主实验：确定性 Cache Simulator
+
+仓库提供一个可直接执行的 TypeScript 主实验：
+
+```text
+examples/cache-reuse-consistency/
+├── cache-reuse-simulator.ts
+├── cache-reuse-simulator.test.ts
+├── cache-workload.json
+└── README.md
+```
+
+运行：
+
+```bash
+pnpm lab:cache
+```
+
+Node.js 22+ 也可以不安装额外运行器直接自检：
+
+```bash
+node --experimental-strip-types \
+  examples/cache-reuse-consistency/cache-reuse-simulator.ts \
+  --manifest examples/cache-reuse-consistency/cache-workload.json \
+  --out artifacts/cache-reuse/report.json \
+  --markdown artifacts/cache-reuse/report.md \
+  --self-test
+```
+
+实验不访问真实网络、数据库、Redis、Embedding 或模型。所有字节、Compute Unit、延迟和时钟都由 Manifest 声明；结果只用于比较同一合成 Trace 下的策略，不能外推为吞吐或厂商性能。
+
+#### 21.1 Manifest：固定输入、策略和故障
+
+核心结构如下；完整可运行定义在实验文件中：
+
+```ts
+interface ResourceState {
+  id: string;
+  generation: number;
+  permissionRevision: number;
+  modelRevision: string;
+  tokenizerRevision: string;
+  adapterRevision: string;
+  multimodalHash: string;
+  cacheSalt: string;
+  bytes: number;
+  computeUnits: number;
+  originLatencyMs: number;
+  answerId: string;
+  exists: boolean;
+}
+
+interface CacheConfig {
+  id: string;
+  policy: 'none' | 'lru' | 'frequency-admission';
+  capacityBytes: number;
+  ttlMs: number;
+  staleWhileRevalidateMs: number;
+  staleIfErrorMs: number;
+  singleflight: boolean;
+  completeIdentity: boolean;
+  validateOnRead: boolean;
+  validatePayload: boolean;
+  leaseFencing: boolean;
+  semanticMode: 'off' | 'unsafe';
+}
+
+type ManifestEvent =
+  | { kind: 'request'; at: number; id: string; cohortId: string; resourceId: string; count: number; tenantId: string; principalScope: string }
+  | { kind: 'mutate'; at: number; resourceId: string; patch: Partial<ResourceState> }
+  | { kind: 'outage-start'; at: number }
+  | { kind: 'outage-end'; at: number }
+  | { kind: 'crash-next-fill'; at: number; resourceId: string }
+  | { kind: 'poison'; at: number; resourceId: string; tenantId: string; principalScope: string };
+```
+
+确定性来自：
+
+- 固定 Manifest；
+- 虚拟时钟，不读取墙上时间；
+- 同一时间事件用稳定 `order` 排序；
+- 无随机网络和真实线程调度；
+- 每个策略重放同一事件序列；
+- 结构化 Report 与内置断言共同决定 Exit Code。
+
+#### 21.2 Cache Entry 与 Fill 所有权
+
+```ts
+interface CacheEntry {
+  key: string;
+  sourceResourceId: string;
+  answerId: string;
+  exists: boolean;
+  sizeBytes: number;
+  computeUnits: number;
+  createdAt: number;
+  freshUntil: number;
+  staleUntil: number;
+  generation: number;
+  permissionRevision: number;
+  modelRevision: string;
+  tokenizerRevision: string;
+  adapterRevision: string;
+  multimodalHash: string;
+  cacheSalt: string;
+  integrityHash: string;
+  fence: number;
+}
+
+interface InFlight {
+  key: string;
+  fence: number;
+  waiters: RequestWaiter[];
+  sourceSnapshot: ResourceState;
+  startedAt: number;
+  background: boolean;
+  recovering: boolean;
+}
+```
+
+`CacheEntry` 保存 Store 时的身份快照；Serve 时与当前权威状态比较。`InFlight` 保存 Fill Owner、Fencing Token 和 Waiter。Owner 崩溃后，新 Owner 获得更大的 Fence；旧 Owner 的晚到 Store 在提交点被拒绝。
+
+#### 21.3 输出指标
+
+```ts
+interface PublicMetrics {
+  requests: number;
+  requestHitRate: number;
+  safeRequestHitRate: number;
+  byteHitRate: number;
+  safeByteHitRate: number;
+  computeSavedRatio: number;
+  originCalls: number;
+  fillAmplification: number;
+  staleHits: {
+    staleWhileRevalidate: number;
+    staleIfError: number;
+  };
+  unsafeHits: number;
+  semanticFalseHits: number;
+  evictions: number;
+  admissionRejects: number;
+  coalescedWaiters: number;
+  fencedWritesRejected: number;
+  staleFillRejected: number;
+  latencyMs: { p50: number; p95: number; p99: number };
+}
+```
+
+实验同时输出 Raw Hit 和 Safe Hit，因为负对照可以故意把 Unsafe Hit 计入 Raw Hit。验收时以 `safeRequestHitRate`、`unsafeHits` 和逐请求断言为准。
+
+#### 21.4 六组策略
+
+| Config | 目的 | 预期学习点 |
+| --- | --- | --- |
+| `no-cache` | 基线 | 所有请求回源；计算和 Origin Calls 基准 |
+| `lru-naive` | 故意不完整的负对照 | Raw Hit 可能被旧 Generation、旧权限和投毒结果虚高 |
+| `lru-ttl` | 只有 TTL 和 LRU | TTL 不解决并发 Fill、版本身份或扫描污染 |
+| `lru-singleflight-safe` | 完整身份、Serve Guard、Singleflight、Lease/Fence | 正确性与并发合并如何改变 Origin Calls |
+| `frequency-admission-safe` | 在安全配置上增加频率 Admission | Admission 如何保护热点免受一次性扫描污染 |
+| `semantic-negative-control` | 故意允许近似错误候选 | Semantic False Hit 必须单独统计并使安全 Gate 失败 |
+
+`frequency-admission` 是教学用的精确频率简化策略，不是 TinyLFU/W-TinyLFU 的复刻。课程比较的是 Admission 与 Eviction 的职责，不声称复现论文性能。
+
+#### 21.5 真实执行后的合成报告
+
+仓库中的固定 Manifest 当前产生以下结果：
+
+| Config | Request Hit | Safe Hit | Byte Hit | Compute Saved | Origin Calls | Fill Amp | Unsafe | Semantic False | Evictions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| no-cache | 0.000 | 0.000 | 0.000 | 0.000 | 155 | 4.189 | 0 | 0 | 0 |
+| lru-naive | 0.084 | 0.052 | 0.060 | 0.026 | 142 | 5.917 | 5 | 0 | 20 |
+| lru-ttl | 0.039 | 0.039 | 0.022 | 0.008 | 149 | 4.806 | 0 | 0 | 14 |
+| lru-singleflight-safe | 0.052 | 0.052 | 0.032 | 0.930 | 32 | 1.032 | 0 | 0 | 17 |
+| frequency-admission-safe | 0.065 | 0.065 | 0.038 | 0.934 | 29 | 1.036 | 0 | 0 | 2 |
+| semantic-negative-control | 0.071 | 0.065 | 0.041 | 0.938 | 28 | 1.037 | 1 | 1 | 2 |
+
+这些数字是固定教学 Trace 的执行结果。它们不表示 LRU、Singleflight、TinyLFU、Redis、Caffeine 或任何模型服务在生产环境中的通用命中率。
+
+这里最重要的观察不是“哪个百分比最高”，而是：
+
+- `lru-naive` 的 Raw Request Hit 高于安全配置，但含 5 次 Unsafe Hit；
+- Singleflight 让100个并发Miss共享一次Fill，因此 Compute Saved 高，但传统 Hit Rate 不会完整表达这部分收益；
+- 简化频率 Admission 在该扫描 Trace 中减少 Eviction；这只是 Empirical 结果；
+- Semantic 负对照增加 Raw Hit，同时制造1次 False Hit，必须被单独报告。
+
+### 22. 故障注入实验与验收标准
+
+主实验内置17条断言。下面至少前8条应作为最小发布 Gate；安全配置任何一次 `unsafeHits > 0` 都应使自检失败。
+
+| # | 故障注入 | 观测 | 验收标准 | 证据等级 |
+| ---: | --- | --- | --- | --- |
+| 1 | 100个同一Key并发Miss | `burst-100` Cohort | 开启Singleflight时 `originCalls=1`；关闭时负对照为100 | G（模拟器边界内） |
+| 2 | Generation从41切到42，旧Entry仍在 | 切换后首次请求 | 安全配置Miss并回源，`unsafeHits=0`；负对照出现Unsafe Hit | G |
+| 3 | Permission Revision收紧 | 旧权限Entry仍可物理读取 | Serve Guard立即阻断；不得等待TTL或失效事件 | G |
+| 4 | 一次性扫描流量超过容量 | 扫描后再次访问3个热点 | 该固定Trace中频率Admission保住热点，LRU负对照被污染 | E |
+| 5 | Fill Owner取得Lease后崩溃，旧结果晚到 | 两次Fill和Fence | 新Owner恢复；旧Fence Store被拒绝；所有Waiter得到安全结果 | G/U |
+| 6 | Entry过期后请求；Origin正常或失败 | SWR、SIE、普通TTL三配置 | 只有显式策略窗口内服务Stale；身份或权限变化时一律不得Stale | G |
+| 7 | Tokenizer或Adapter变更 | Prefix请求文本不变 | 完整执行身份配置Miss；省略身份的负对照出现Unsafe Hit | G |
+| 8 | Semantic Hard Negative | 高相似、Answer Oracle不同 | `semanticFalseHits=1`，不得算作Safe Hit | G（Fixture真值内） |
+| 9 | 先缓存“对象不存在”，随后创建对象并切Generation | Negative Entry仍在 | 新代次必须Miss；负对照继续返回旧不存在结果 | G |
+| 10 | 注入损坏或投毒Payload | `integrityHash`不匹配 | 安全配置拒绝并回源；负对照出现Unsafe Hit | G |
+| 11 | 失效事件丢失 | 旧Entry未被清理 | Version/Permission Guard仍阻断；Reconciliation最终回收 | G+B |
+| 12 | 失效事件重复或乱序 | 同一Generation多次到达 | 处理幂等；较旧事件不得覆盖较新状态 | G |
+| 13 | 热Key在多个进程各自Singleflight | 每进程一次回源 | 明确报告协调作用域；不得声称全局一次Fill | B |
+| 14 | L1保存g41，L2保存g42 | L1物理Hit | L1先做Serve Guard并拒绝g41，再查L2或Origin | G |
+| 15 | Origin超时且是否完成未知 | Fill到达Deadline | 记录Unknown Outcome；不得断言Origin未执行 | U |
+| 16 | Canonicalization漏掉Variant或Scope | 两个不同请求碰撞 | 负对照出现Unsafe Hit；安全Key加入字段后为0 | G |
+| 17 | 容量不足且候选大而便宜 | Admission与Eviction计数 | 能观察候选被拒绝还是居民被逐出，不把两者合并 | E |
+
+#### 22.1 实验一：并发Fill放大
+
+<Steps>
+1. 在Manifest中保留100个同一 `cohortId`、同一Key、同一虚拟时刻的请求。
+2. 运行 `lru-ttl`，确认每个Miss都启动Origin，`originCalls=100`。
+3. 运行 `lru-singleflight-safe`，确认同一协调域内只有1次Origin，99个Waiter共享结果。
+4. 比较Request Hit Rate和Compute Saved Ratio，解释为什么前者没有完整记录合并收益。
+5. 把请求分到两个独立Simulator实例，证明进程内Singleflight不能自动跨实例合并。
+</Steps>
+
+验收：同一实例安全配置 `FillAmplification≈1`；跨实例场景只允许声称“每协调域一次”，不能写“全局Exactly Once”。
+
+#### 22.2 实验二：版本与权限切换
+
+<Steps>
+1. 先填充 `generation=41`、`permissionRevision=8` 的Entry。
+2. 注入资源更新，把Generation改为42。
+3. 不删除旧Entry，直接发起同资源请求。
+4. 再注入权限收紧，把Permission Revision改为9。
+5. 比较完整Identity配置与省略字段的负对照。
+</Steps>
+
+验收：安全配置两次都Miss且 `unsafeHits=0`；负对照至少显示对应Unsafe Hit。事件驱动失效可以缺席，正确性仍由Version Guard承担。
+
+#### 22.3 实验三：扫描污染与Admission
+
+<Steps>
+1. 预热三个高频小对象。
+2. 注入一串只访问一次、总字节超过容量的扫描对象。
+3. 扫描后重新访问三个热点。
+4. 比较纯LRU与频率Admission + LRU Eviction。
+5. 修改Trace，使扫描对象随后被重复访问，观察原结论是否改变。
+</Steps>
+
+验收：只对原始固定Trace报告Admission保留热点；Trace改变后重新计算，不把一次结果外推为“频率策略总是更好”。
+
+#### 22.4 实验四：Owner崩溃与Fencing
+
+1. 第一个Owner获得Fence 1并开始Fill；
+2. 在提交前注入崩溃，Lease到期；
+3. 新Owner获得Fence 2并完成Store；
+4. 让旧Owner的结果迟到；
+5. 存储端比较Fence并拒绝1。
+
+验收：`fencedWritesRejected>=1`，最终Entry来自Fence 2，Waiter无Unsafe Hit。若只能用Lease、不能在Store点检查Fence，结论必须标为Best Effort，而不是正确性保证。
+
+#### 22.5 实验五：Semantic False Hit
+
+1. 构造主题相同但答案不同的Hard Negative；
+2. 让不安全配置只按Semantic Group命中；
+3. 用独立 `answerId` 作为Fixture真值；
+4. 确认错误命中进入 `semanticFalseHits` 与 `unsafeHits`；
+5. 安全默认配置应把该请求视为Miss。
+
+验收：报告不能只增加普通Hit；必须能按请求ID定位候选、真值和拒绝原因。
+
+### 23. 故障诊断矩阵
+
+| 现象 | 先检查的证据 | 常见根因 | 恢复动作 | 不能直接下的结论 |
+| --- | --- | --- | --- | --- |
+| Hit Rate高但用户看到旧值 | Entry/Current Generation、Permission Revision、Age、Hit Reason | Key缺字段、Serve Guard缺失、SWR越界 | Fail Closed、切Generation、禁用危险Stale、对账清理 | “缓存服务正常” |
+| Origin Calls远高于Miss Cohort | `cohortId`、InFlight范围、Owner状态 | Singleflight未启用、作用域太小、错误不合并 | 同Key合并、限流、Early Refresh、容量保护 | “TTL太短” |
+| P99上升但平均值正常 | Waiter时长、Fill延迟、Lease接管、队列长度 | 热Key、慢Fill、Owner崩溃、跨层回源 | 限制Waiter、Deadline、异步刷新、隔离热点 | “缓存命中率没变，所以无关” |
+| 扫描后热点全部Miss | Admission Reject、Eviction、Reuse Distance | 所有候选都进入LRU，扫描污染 | Admission、分区、容量或Bypass扫描 | “LRU实现有Bug” |
+| Eviction很少但内存仍高 | Entry Bytes、元数据、外部分配、未计量对象 | 容量单位错误、资源泄漏 | Byte预算、完整内存核算、强制上限 | “对象数没超限” |
+| Stale Hit在权限收紧后出现 | Stale Policy、当前权限、Entry Scope | Stale判断先于授权，或权限未进Identity | 立即阻断、轮换Generation/Salt、审计 | “SIE保证可用性” |
+| Prefix命中后输出异常 | Token IDs、模型/Tokenizer/Adapter/多模态Revision | 执行身份不完整 | Namespace切换、全量Miss、修复Identity | “文本看起来一样” |
+| Semantic命中错误增加 | Hard Negative类别、阈值、时间切分、False Hit | 固定阈值、分布漂移、漏安全Gate | Fail Closed、降覆盖、重标、重新校准 | “Embedding模型不够大” |
+| 失效事件已发送但旧Entry仍在 | Consumer Offset、连接状态、Generation、Reconciliation | 消息丢失/延迟/乱序、L1断连 | Version Guard继续阻断，重连后全量/分段清理 | “事件发布成功等于已失效” |
+| Fill超时后出现重复写 | Fill ID、幂等身份、Fence、Origin状态 | Unknown Outcome被当确定失败重试 | 查询状态、稳定ID、Fencing、对账 | “超时说明没执行” |
+
+### 24. 架构决策表
+
+| 问题 | 选择 | 适用前提 | 必须保留的证据 |
+| --- | --- | --- | --- |
+| 是否缓存 | Store / Bypass | 确定性、可重建、可隔离、收益为正 | Cacheability Reason、Break-even输入 |
+| Key如何组成 | Versioned Canonical Identity | 能列出所有影响输出与安全的字段 | Canonical字段、Policy Revision、Hash版本 |
+| 如何失效 | Generation + Event + Reconciliation | 权威侧能提供单调Revision | Current/Entry Revision、事件Offset、对账结果 |
+| 是否允许Stale | Fresh only / SWR / SIE | 数据类别与错误预算允许，身份仍有效 | Age、窗口、错误分类、授权结果 |
+| 如何处理并发Miss | Singleflight / 分布式协调 / Bypass | 能定义协调作用域和Waiter行为 | Cohort、Owner、Waiter、Origin Calls |
+| Owner崩溃 | Lease + Fencing | Store点可原子拒绝旧Fence | Lease期限、Fence、被拒绝晚到写 |
+| 是否接纳新Entry | Always / Frequency / Size-Cost-aware | 有Trace和容量指标 | Admission Reason、估计频率/价值 |
+| 淘汰谁 | LRU/LFU/SLRU等 | 与工作负载局部性假设匹配 | Victim Reason、Entry Bytes、Age/Frequency |
+| 是否缓存404 | 短TTL Negative Cache或Bypass | 不存在结果确定且可被Generation打破 | Error Class、TTL、Generation |
+| 是否做Semantic Cache | 默认Bypass；满足错误预算后有限启用 | 有标签、Hard Negative、安全Gate和回退 | 候选、阈值、真值、False Hit、Coverage |
+
+### 25. 验收清单
+
+完成课程产物后，应能逐项给出机器证据：
+
+- 删除全部缓存不会改变权威业务状态；若使用Write-Behind，已单独证明日志、复制、恢复和确认边界。
+- Manifest固定Trace、容量、字节、Compute、延迟、时钟和策略配置。
+- 同一Manifest重复运行生成相同结构化Report。
+- 报告同时包含Request Hit、Safe Hit、Byte Hit、Safe Byte Hit、Compute Saved、Origin Calls和Fill Amplification。
+- 安全配置 `unsafeHits=0`；负对照能稳定制造并定位Unsafe Hit。
+- 100个并发Miss在声明的Singleflight作用域内只产生一次Fill。
+- Generation与Permission Revision变化立即使旧Entry失去服务资格。
+- Stale只在明确SWR/SIE窗口和允许的数据类别中服务。
+- Fill Owner崩溃后可接管，旧Fence写被拒绝。
+- Admission Reject与Eviction分开计数；扫描Trace能验证污染边界。
+- Negative Cache在对象创建或Generation切换后失效。
+- Prefix Cache在模型、Tokenizer、Adapter或多模态身份变化后Miss。
+- Semantic Hard Negative被计入False Hit，不被普通命中率掩盖。
+- 结构化Report、Markdown摘要和测试断言均落到Artifact目录。
+
+#### 学完后应该能回答什么
+
+1. 命中率达到多少才值得缓存？为什么没有Break-even输入就不能回答？
+2. Request Hit Rate、Byte Hit Rate和Compute Saved Ratio可能怎样互相矛盾？
+3. Reuse Distance如何帮助估计容量—命中曲线？它不能解释哪些非LRU行为？
+4. Cache-Aside、Write-Through和Write-Behind的权威状态边界分别在哪里？
+5. 为什么“失效消息已发布”不是旧值不可达的证明？
+6. SWR和SIE什么时候可用，什么时候必须Fail Closed？
+7. Singleflight、TTL Jitter、Early Refresh、Lease和Fencing分别解决什么问题？
+8. Admission与Eviction为什么必须拆成两个决策？
+9. LRU、LFU、SLRU和TinyLFU各自依赖什么工作负载假设？
+10. Prefix Cache为什么必须包含Token、模型、Tokenizer、Adapter和多模态身份？
+11. RAG的Embedding、Retrieval、Rerank、Context Pack和Answer Cache各自如何失效？
+12. 为什么Semantic Cache是带非对称代价的分类器，而不是余弦阈值技巧？
+13. Unknown Outcome与确定失败有什么区别？怎样避免超时后重复Fill或旧Owner写回？
+14. 怎样用一个确定性Trace证明缓存减少了工作，同时没有服务旧值、越权值或错误答案？
+
+### 26. 来源边界
+
+- RFC 9111定义HTTP缓存语义，不自动为应用内对象缓存提供实现保证。
+- RFC 5861定义SWR/SIE扩展语义；具体客户端、代理和应用是否支持，必须按实现验证。
+- Redis官方文档说明Redis的Eviction和Client-side Caching行为；不应把近似LRU/LFU实现结果外推为所有缓存系统性能。
+- Working Set、Reuse Distance、TinyLFU、Lease和Stampede论文提供模型与实验方法；论文结论只在其假设和Workload内成立。
+- Caffeine和Go singleflight是实现文档，适合展示成熟API与工程选择，不是跨语言协议标准。
+- vLLM Prefix Caching文档只描述对应版本的实现身份；跨引擎、持久化或升级兼容性必须自行定义。
+- Semantic Cache研究用于理解架构、测试、静态阈值和校准问题；它们不能替代当前系统的授权、实时性、撤回和工具状态检查。
+
+本课不提供生产吞吐、命中率、成本节省或Exactly-once承诺。所有实验数字均来自仓库内固定合成Manifest，必须保留数据、版本和运行命令才能解释。

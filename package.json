@@ -14,6 +14,7 @@
     "test:e2e": "playwright test",
     "audit:public": "tsx scripts/audit-public-content.ts",
     "verify:snippets": "tsx scripts/verify-course-snippets.ts",
+    "lab:cache": "tsx examples/cache-reuse-consistency/cache-reuse-simulator.ts --manifest examples/cache-reuse-consistency/cache-workload.json --out artifacts/cache-reuse/report.json --markdown artifacts/cache-reuse/report.md --self-test",
     "gate": "pnpm check && pnpm test && pnpm verify:snippets && pnpm build && pnpm audit:public && pnpm test:e2e",
     "astro": "astro"
   },

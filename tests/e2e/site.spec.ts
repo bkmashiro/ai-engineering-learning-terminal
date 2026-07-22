@@ -86,6 +86,16 @@ test('table of contents groups the expanded agent lesson into six learning phase
   await expect(toc.getByRole('link')).toHaveCount(7);
 });
 
+test('cache lesson keeps its deep material inside six navigable phases', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'the right-side table of contents is desktop-only');
+  await page.goto('/foundations/software-systems/cache-reuse-consistency/');
+  const toc = page.getByRole('navigation', { name: '本页内容' });
+  await expect(toc.getByRole('link', { name: '一、定义安全命中' })).toBeVisible();
+  await expect(toc.getByRole('link', { name: '六、运行实验并完成验收' })).toBeVisible();
+  await expect(toc.getByRole('link', { name: '4. 缓存收益与 Break-even 模型' })).toHaveCount(0);
+  await expect(toc.getByRole('link')).toHaveCount(7);
+});
+
 test('lesson prerequisites use reader-facing Chinese actions', async ({ page }) => {
   await page.goto('/agent/workflow-vs-agent/');
   const prerequisites = page.getByRole('complementary', { name: '开始前需要掌握' });
@@ -189,6 +199,7 @@ test('core pages have no automatic WCAG A/AA violations', async ({ page }) => {
     '/foundations/software-systems/state-and-events/',
     '/foundations/software-systems/network-streaming/',
     '/foundations/software-systems/data-reliability/',
+    '/foundations/software-systems/cache-reuse-consistency/',
     '/foundations/software-systems/data-asset-lifecycle/',
     '/foundations/ml/',
     '/foundations/llm/',
@@ -230,6 +241,11 @@ test('new core modules expose mechanisms, diagrams and mobile-safe layouts', asy
       path: '/foundations/software-systems/data-reliability/',
       heading: 'Transactional Outbox：让数据库状态与待发布事件一起提交',
       component: '.reliability-boundary',
+    },
+    {
+      path: '/foundations/software-systems/cache-reuse-consistency/',
+      heading: '4. 缓存收益与 Break-even 模型',
+      component: '.cache-identity-fill',
     },
     {
       path: '/foundations/software-systems/data-asset-lifecycle/',
@@ -300,6 +316,7 @@ test('new teaching diagrams stay inside the desktop course column', async ({ pag
   await page.setViewportSize({ width: 1280, height: 900 });
 
   for (const [path, selector] of [
+    ['/foundations/software-systems/cache-reuse-consistency/', '.cache-identity-fill'],
     ['/foundations/llm/model-serving-governance/', '.model-serving-control'],
     ['/foundations/software-systems/data-asset-lifecycle/', '.data-asset-lifecycle'],
   ] as const) {
@@ -348,6 +365,12 @@ test('new course prerequisites resolve through canonical roadmap links', async (
     '/foundations/reproducibility/',
   );
 
+  await page.goto('/foundations/software-systems/cache-reuse-consistency/');
+  await expect(page.locator('.module-prerequisites').getByRole('link', { name: /事务、缓存与队列/ })).toHaveAttribute(
+    'href',
+    '/foundations/software-systems/data-reliability/',
+  );
+
   await page.goto('/foundations/llm/retrieval/');
   await expect(page.locator('.module-prerequisites').getByRole('link', { name: /Token、Attention 与上下文/ })).toHaveAttribute(
     'href',
@@ -359,9 +382,9 @@ test('new course prerequisites resolve through canonical roadmap links', async (
   );
 
   await page.goto('/foundations/software-systems/data-asset-lifecycle/');
-  await expect(page.locator('.module-prerequisites').getByRole('link', { name: /事务、缓存与队列/ })).toHaveAttribute(
+  await expect(page.locator('.module-prerequisites').getByRole('link', { name: /缓存工程：复用、失效与一致性/ })).toHaveAttribute(
     'href',
-    '/foundations/software-systems/data-reliability/',
+    '/foundations/software-systems/cache-reuse-consistency/',
   );
 
   await page.goto('/foundations/llm/model-serving-governance/');
@@ -372,5 +395,9 @@ test('new course prerequisites resolve through canonical roadmap links', async (
   await expect(page.locator('.module-prerequisites').getByRole('link', { name: /网络、流式与取消/ })).toHaveAttribute(
     'href',
     '/foundations/software-systems/network-streaming/',
+  );
+  await expect(page.locator('.module-prerequisites').getByRole('link', { name: /缓存工程：复用、失效与一致性/ })).toHaveAttribute(
+    'href',
+    '/foundations/software-systems/cache-reuse-consistency/',
   );
 });
