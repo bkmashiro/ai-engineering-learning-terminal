@@ -281,13 +281,19 @@ body {
   background: var(--sl-color-accent-low);
 }
 
-@media (max-width: 52rem) {
-  .expressive-code pre {
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    word-break: break-word;
-  }
+.expressive-code pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 
+.sl-markdown-content table[tabindex='0']:focus-visible {
+  border-radius: 0.35rem;
+  outline: 3px solid var(--sl-color-accent-low);
+  outline-offset: 3px;
+}
+
+@media (max-width: 52rem) {
   .learning-cycle {
     grid-template-columns: 1fr;
   }

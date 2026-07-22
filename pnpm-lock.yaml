@@ -27,6 +27,9 @@ importers:
       '@astrojs/check':
         specifier: ^0.9.9
         version: 0.9.9(prettier@3.9.6)(typescript@6.0.3)
+      '@astrojs/markdown-remark':
+        specifier: 7.2.1
+        version: 7.2.1
       '@axe-core/playwright':
         specifier: ^4.12.1
         version: 4.12.1(playwright-core@1.61.1)
@@ -36,6 +39,9 @@ importers:
       '@testing-library/preact':
         specifier: ^3.2.4
         version: 3.2.4(preact@10.29.7)
+      '@types/node':
+        specifier: 24.13.3
+        version: 24.13.3
       jsdom:
         specifier: ^27.0.0
         version: 27.4.0

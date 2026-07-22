@@ -87,13 +87,142 @@ test('core pages have no automatic WCAG A/AA violations', async ({ page }) => {
   for (const path of [
     '/',
     '/roadmap/',
+    '/foundations/reproducibility/',
+    '/foundations/software-systems/state-and-events/',
     '/foundations/software-systems/network-streaming/',
+    '/foundations/software-systems/data-reliability/',
+    '/foundations/ml/',
     '/foundations/llm/',
+    '/foundations/llm/retrieval/',
     '/agent/workflow-vs-agent/',
+    '/agent/state-tools-memory/',
+    '/safety-evaluation/',
+    '/capstone/',
     '/directions/',
+    '/directions/agent-applications/',
+    '/directions/agent-runtime-evaluation/',
+    '/directions/ai-backend-reliability/',
+    '/directions/llm-search-retrieval/',
+    '/directions/gui-multimodal-agents/',
+    '/directions/game-ai-interactive-narrative/',
+    '/directions/edge-inference/',
   ]) {
     await page.goto(path);
     const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa']).analyze();
     expect(results.violations, `${path}: ${results.violations.map((item) => item.id).join(', ')}`).toEqual([]);
   }
+});
+
+test('new core modules expose mechanisms, diagrams and mobile-safe layouts', async ({ page }) => {
+  const modules = [
+    {
+      path: '/foundations/reproducibility/',
+      heading: 'Structured Result：成功和失败必须是不同数据形状',
+      component: '.evidence-bundle',
+      hasPrerequisites: false,
+    },
+    {
+      path: '/foundations/software-systems/state-and-events/',
+      heading: '状态转换函数：保持纯函数边界',
+      component: '.state-transition',
+    },
+    {
+      path: '/foundations/software-systems/data-reliability/',
+      heading: 'Transactional Outbox：让数据库状态与待发布事件一起提交',
+      component: '.reliability-boundary',
+    },
+    {
+      path: '/foundations/ml/',
+      heading: '混淆矩阵与手算',
+      component: '.experiment-split',
+    },
+    {
+      path: '/foundations/llm/retrieval/',
+      heading: 'Citation 与 Grounding',
+      component: '.retrieval-pipeline',
+    },
+    {
+      path: '/agent/state-tools-memory/',
+      heading: 'Runner 状态机',
+      component: '.agent-boundary',
+    },
+    {
+      path: '/safety-evaluation/',
+      heading: 'Verdict：Pass、Fail 与 Invalid 分开',
+      component: '.evaluation-replay',
+    },
+    {
+      path: '/capstone/',
+      heading: '质量、延迟、成本与可靠性预算',
+      component: '.capstone-system',
+    },
+  ];
+
+  await page.setViewportSize({ width: 360, height: 800 });
+  for (const module of modules) {
+    await page.goto(module.path);
+    await expect(page.getByRole('heading', { name: module.heading })).toBeVisible();
+    await expect(page.locator(module.component)).toBeVisible();
+    await expect(page.locator('.module-progress')).toBeVisible();
+    const tableTabIndexes = await page.locator('table').evaluateAll((tables) => tables.map((table) => table.tabIndex));
+    expect(tableTabIndexes.every((tabIndex) => tabIndex === 0), module.path).toBe(true);
+    if (module.hasPrerequisites !== false) {
+      await expect(page.locator('.module-prerequisites')).toBeVisible();
+    } else {
+      await expect(page.locator('.module-prerequisites')).toHaveCount(0);
+    }
+
+    const widths = await page.evaluate(() => ({
+      viewport: window.innerWidth,
+      document: document.documentElement.scrollWidth,
+    }));
+    expect(widths.document, module.path).toBeLessThanOrEqual(widths.viewport + 1);
+  }
+});
+
+test('direction pages expose system boundaries, evidence and learning order', async ({ page }) => {
+  const paths = [
+    '/directions/agent-applications/',
+    '/directions/agent-runtime-evaluation/',
+    '/directions/ai-backend-reliability/',
+    '/directions/llm-search-retrieval/',
+    '/directions/gui-multimodal-agents/',
+    '/directions/game-ai-interactive-narrative/',
+    '/directions/edge-inference/',
+  ];
+
+  await page.setViewportSize({ width: 360, height: 800 });
+  for (const path of paths) {
+    await page.goto(path);
+    await expect(page.getByRole('heading', { name: '这条方向实际解决什么问题', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '可验证作品建议', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '作品需要留下哪些 Evidence', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '学习顺序', exact: true })).toBeVisible();
+    await expect(page.locator('.module-progress')).toBeVisible();
+    await expect(page.locator('.module-prerequisites')).toBeVisible();
+
+    const widths = await page.evaluate(() => ({
+      viewport: window.innerWidth,
+      document: document.documentElement.scrollWidth,
+    }));
+    expect(widths.document, path).toBeLessThanOrEqual(widths.viewport + 1);
+  }
+});
+
+test('new course prerequisites resolve through canonical roadmap links', async ({ page }) => {
+  await page.goto('/foundations/software-systems/state-and-events/');
+  await expect(page.locator('.module-prerequisites').getByRole('link', { name: /可复现与证据/ })).toHaveAttribute(
+    'href',
+    '/foundations/reproducibility/',
+  );
+
+  await page.goto('/foundations/llm/retrieval/');
+  await expect(page.locator('.module-prerequisites').getByRole('link', { name: /Token、Attention 与上下文/ })).toHaveAttribute(
+    'href',
+    '/foundations/llm/',
+  );
+  await expect(page.locator('.module-prerequisites').getByRole('link', { name: /事务、缓存与队列/ })).toHaveAttribute(
+    'href',
+    '/foundations/software-systems/data-reliability/',
+  );
 });
